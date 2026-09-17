@@ -13,7 +13,7 @@ TUN=sbtun
 MARK=0x2d0           # routing mark on sing-box's own connections: they bypass the tunnel and the kill switch
 [ -r "$CONF" ] && . "$CONF"
 ENABLE=${ENABLE:-0}; KILL_SWITCH=${KILL_SWITCH:-1}; REMOTE_DNS=${REMOTE_DNS:-1.1.1.1}
-BOOTSTRAP_DNS=${BOOTSTRAP_DNS:-1.1.1.1}; LAN_CIDRS=${LAN_CIDRS:-192.168.77.0/24}
+BOOTSTRAP_DNS=${BOOTSTRAP_DNS:-1.1.1.1}; LAN_CIDRS=${LAN_CIDRS:-192.168.77.0/24}; IPV6=${IPV6:-0}
 
 # json_str VALUE : JSON string literal
 json_str() { printf '"%s"' "$(printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g')"; }
@@ -95,8 +95,12 @@ gen() {
     else
         printf '{"type":"udp","tag":"bootstrap","server":%s}],' "$(json_str "$BOOTSTRAP_DNS")"
     fi
-    printf '"final":"remote","strategy":"prefer_ipv4"},\n'
-    printf '"inbounds":[{"type":"tun","tag":"tun-in","interface_name":"%s","address":["172.19.0.1/30","fdfe:dcba:9876::1/126"],"mtu":1400,' "$TUN"
+    # IPv6 through the tunnel only when the server side has it: otherwise programs prefer the (dead) IPv6 route and
+    # every connection to a dual-stack host fails first, so DNS answers only A records and the TUN gets no IPv6 address
+    if [ "$IPV6" = 1 ]; then strategy=prefer_ipv4; addrs='"172.19.0.1/30","fdfe:dcba:9876::1/126"'
+    else strategy=ipv4_only; addrs='"172.19.0.1/30"'; fi
+    printf '"final":"remote","strategy":"%s"},\n' "$strategy"
+    printf '"inbounds":[{"type":"tun","tag":"tun-in","interface_name":"%s","address":[%s],"mtu":1400,' "$TUN" "$addrs"
     printf '"auto_route":true,"strict_route":true,"route_exclude_address":%s}],\n' "$excl"
     printf '"outbounds":['; outbound_json
     [ -n "$UPSTREAM_HTTP_PROXY" ] && printf ',{"type":"http","tag":"upstream","server":%s,"server_port":%s}' "$(json_str "${UPSTREAM_HTTP_PROXY%:*}")" "${UPSTREAM_HTTP_PROXY##*:}"

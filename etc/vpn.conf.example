@@ -11,5 +11,7 @@ REMOTE_DNS=1.1.1.1
 BOOTSTRAP_DNS=1.1.1.1
 # networks that stay local (USB/Wi-Fi LAN)
 LAN_CIDRS=192.168.77.0/24
+# 1: also carry IPv6 (only if the server has IPv6 connectivity; 0 keeps DNS and the tunnel IPv4-only)
+IPV6=0
 # optional: reach the VPN server through an HTTP proxy (host:port), e.g. for testing over a PC's connection
 UPSTREAM_HTTP_PROXY=
