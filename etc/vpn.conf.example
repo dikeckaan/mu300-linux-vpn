@@ -1,0 +1,15 @@
+# MU300 VPN (VLESS through sing-box). Copy to /etc/mu300/vpn.conf, edit, then: mu300-vpn gen && restart the service
+#   Ubuntu:  sudo systemctl restart mu300-vpn        OpenWrt: /etc/init.d/mu300-vpn restart
+ENABLE=1
+# the share link from your server/panel (vless://uuid@host:port?type=...&security=...#name)
+VLESS_URI=""
+# 1: nothing leaves through the cellular interface except the tunnel itself (also while the tunnel is down)
+KILL_SWITCH=1
+# DNS for the device and its clients, resolved through the tunnel
+REMOTE_DNS=1.1.1.1
+# only used to look up the VPN server's own name (sent directly, outside the tunnel)
+BOOTSTRAP_DNS=1.1.1.1
+# networks that stay local (USB/Wi-Fi LAN)
+LAN_CIDRS=192.168.77.0/24
+# optional: reach the VPN server through an HTTP proxy (host:port), e.g. for testing over a PC's connection
+UPSTREAM_HTTP_PROXY=

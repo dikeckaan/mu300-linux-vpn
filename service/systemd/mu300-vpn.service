@@ -1,0 +1,13 @@
+[Unit]
+Description=MU300 VPN (VLESS via sing-box, TUN + kill switch)
+After=mu300-firewall.service mu300-mobile-data.service
+Wants=mu300-mobile-data.service
+ConditionPathExists=/etc/mu300/vpn.conf
+
+[Service]
+ExecStart=/opt/mu300/bin/mu300-vpn run
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

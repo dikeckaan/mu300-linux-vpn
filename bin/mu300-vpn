@@ -1,0 +1,146 @@
+#!/bin/sh
+# VLESS client for the MU300 (Ubuntu and OpenWrt): sing-box with a TUN device and policy routing, so the device's
+# own traffic and USB/Wi-Fi clients all leave through the tunnel. Settings: /etc/mu300/vpn.conf
+#   mu300-vpn gen       build /run/mu300-vpn/config.json from vpn.conf and check it
+#   mu300-vpn run       gen + kill switch + run sing-box in the foreground (used by the service)
+#   mu300-vpn off       remove the kill switch (the service stop does not, so a crash never leaks)
+#   mu300-vpn status    service, tunnel, exit IP
+set -e
+CONF=${MU300_VPN_CONF:-/etc/mu300/vpn.conf}
+RUN=/run/mu300-vpn
+BIN=${SING_BOX:-/opt/mu300/bin/sing-box}
+TUN=sbtun
+MARK=0x2d0           # routing mark on sing-box's own connections: they bypass the tunnel and the kill switch
+[ -r "$CONF" ] && . "$CONF"
+ENABLE=${ENABLE:-0}; KILL_SWITCH=${KILL_SWITCH:-1}; REMOTE_DNS=${REMOTE_DNS:-1.1.1.1}
+BOOTSTRAP_DNS=${BOOTSTRAP_DNS:-1.1.1.1}; LAN_CIDRS=${LAN_CIDRS:-192.168.77.0/24}
+
+# json_str VALUE : JSON string literal
+json_str() { printf '"%s"' "$(printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g')"; }
+# json_list "a,b,c" : JSON array of strings
+json_list() { printf '%s' "$1" | awk -F, '{printf "["; for (i = 1; i <= NF; i++) { gsub(/"/, "\\\"", $i); printf "%s\"%s\"", (i > 1 ? "," : ""), $i } printf "]"}'; }
+hex2dec() { printf '%d' "0x$1"; }
+# busybox awk has no hex string conversion: decode %XX with printf instead
+urldecode() {
+    rest=$1; out=
+    while :; do
+        case "$rest" in
+            *%[0-9A-Fa-f][0-9A-Fa-f]*)
+                pre=${rest%%%*}; tail=${rest#*%}; hh=$(printf '%s' "$tail" | cut -c1-2); rest=$(printf '%s' "$tail" | cut -c3-)
+                out="$out$pre$(printf "\\$(printf '%03o' "$(hex2dec "$hh")")")" ;;
+            *) out="$out$rest"; break ;;
+        esac
+    done
+    printf '%s' "$out"
+}
+param() { printf '%s' "$QUERY" | tr '&' '\n' | sed -n "s/^$1=//p" | head -n1; }
+
+parse_uri() {
+    u=$VLESS_URI
+    case "$u" in vless://*) ;; *) echo "VLESS_URI must start with vless://" >&2; exit 1 ;; esac
+    u=${u#vless://}; u=${u%%#*}
+    case "$u" in *\?*) QUERY=${u#*\?}; u=${u%%\?*} ;; *) QUERY= ;; esac
+    UUID=$(urldecode "${u%%@*}"); hp=${u#*@}; hp=${hp%/}
+    case "$hp" in
+        \[*\]:*) HOST=${hp#\[}; HOST=${HOST%%\]*}; PORT=${hp##*:} ;;
+        *:*) HOST=${hp%:*}; PORT=${hp##*:} ;;
+        *) HOST=$hp; PORT=443 ;;
+    esac
+    TYPE=$(param type); TYPE=${TYPE:-tcp}
+    SECURITY=$(param security); SECURITY=${SECURITY:-none}
+    SNI=$(urldecode "$(param sni)"); [ -n "$SNI" ] || SNI=$(urldecode "$(param peer)")
+    FP=$(param fp); ALPN=$(urldecode "$(param alpn)"); FLOW=$(param flow)
+    INSECURE=$(param allowInsecure); PBK=$(param pbk); SID=$(param sid)
+    WSPATH=$(urldecode "$(param path)"); WSHOST=$(urldecode "$(param host)"); SVC=$(urldecode "$(param serviceName)")
+    [ -n "$UUID" ] && [ -n "$HOST" ] || { echo "cannot parse VLESS_URI" >&2; exit 1; }
+}
+
+outbound_json() {
+    printf '{"type":"vless","tag":"proxy","server":%s,"server_port":%s,"uuid":%s' "$(json_str "$HOST")" "$PORT" "$(json_str "$UUID")"
+    [ -n "$FLOW" ] && printf ',"flow":%s' "$(json_str "$FLOW")"
+    printf ',"packet_encoding":"xudp","domain_resolver":"bootstrap"'
+    [ -n "$UPSTREAM_HTTP_PROXY" ] && printf ',"detour":"upstream"'
+    case "$SECURITY" in
+        tls|reality)
+            printf ',"tls":{"enabled":true,"server_name":%s' "$(json_str "${SNI:-$HOST}")"
+            case "$INSECURE" in 1|true) printf ',"insecure":true' ;; esac
+            # h3 (QUIC) does not apply to VLESS over TCP
+            ALPN=$(printf '%s' "$ALPN" | awk -F, '{n = 0; for (i = 1; i <= NF; i++) if ($i != "h3") printf "%s%s", (n++ ? "," : ""), $i}')
+            [ -n "$ALPN" ] && printf ',"alpn":%s' "$(json_list "$ALPN")"
+            [ -n "$FP" ] && printf ',"utls":{"enabled":true,"fingerprint":%s}' "$(json_str "$FP")"
+            [ "$SECURITY" = reality ] && printf ',"reality":{"enabled":true,"public_key":%s,"short_id":%s}' "$(json_str "$PBK")" "$(json_str "$SID")"
+            printf '}' ;;
+    esac
+    case "$TYPE" in
+        ws) printf ',"transport":{"type":"ws","path":%s' "$(json_str "${WSPATH:-/}")"; [ -n "$WSHOST" ] && printf ',"headers":{"Host":%s}' "$(json_str "$WSHOST")"; printf '}' ;;
+        grpc) printf ',"transport":{"type":"grpc","service_name":%s}' "$(json_str "$SVC")" ;;
+        httpupgrade) printf ',"transport":{"type":"httpupgrade","path":%s' "$(json_str "${WSPATH:-/}")"; [ -n "$WSHOST" ] && printf ',"host":%s' "$(json_str "$WSHOST")"; printf '}' ;;
+        tcp|raw) ;;
+        *) echo "transport type '$TYPE' is not supported by this helper" >&2; exit 1 ;;
+    esac
+    printf '}'
+}
+
+gen() {
+    [ -n "$VLESS_URI" ] || { echo "VLESS_URI is not set in $CONF" >&2; exit 1; }
+    parse_uri
+    mkdir -p "$RUN"; chmod 700 "$RUN"
+    excl=$(json_list "$LAN_CIDRS")
+    {
+    printf '{"log":{"level":"warn","timestamp":false},\n'
+    printf '"dns":{"servers":[{"type":"tcp","tag":"remote","server":%s,"detour":"proxy"},' "$(json_str "$REMOTE_DNS")"
+    # the VPN server name is looked up via BOOTSTRAP_DNS (directly, or over TCP through UPSTREAM_HTTP_PROXY)
+    if [ -n "$UPSTREAM_HTTP_PROXY" ]; then
+        printf '{"type":"tcp","tag":"bootstrap","server":%s,"detour":"upstream"}],' "$(json_str "$BOOTSTRAP_DNS")"
+    else
+        printf '{"type":"udp","tag":"bootstrap","server":%s}],' "$(json_str "$BOOTSTRAP_DNS")"
+    fi
+    printf '"final":"remote","strategy":"prefer_ipv4"},\n'
+    printf '"inbounds":[{"type":"tun","tag":"tun-in","interface_name":"%s","address":["172.19.0.1/30","fdfe:dcba:9876::1/126"],"mtu":1400,' "$TUN"
+    printf '"auto_route":true,"strict_route":true,"route_exclude_address":%s}],\n' "$excl"
+    printf '"outbounds":['; outbound_json
+    [ -n "$UPSTREAM_HTTP_PROXY" ] && printf ',{"type":"http","tag":"upstream","server":%s,"server_port":%s}' "$(json_str "${UPSTREAM_HTTP_PROXY%:*}")" "${UPSTREAM_HTTP_PROXY##*:}"
+    printf ',{"type":"direct","tag":"direct"}],\n'
+    printf '"route":{"rules":[{"action":"sniff"},{"protocol":"dns","action":"hijack-dns"},{"ip_is_private":true,"outbound":"direct"}],'
+    printf '"final":"proxy","auto_detect_interface":true,"default_mark":%d,"default_domain_resolver":"bootstrap"}}\n' "$MARK"
+    } > "$RUN/config.json"
+    chmod 600 "$RUN/config.json"
+    "$BIN" check -c "$RUN/config.json"
+}
+
+killswitch_on() {
+    nft -f - <<NFT
+table inet mu300_vpn
+delete table inet mu300_vpn
+table inet mu300_vpn {
+    chain output {
+        type filter hook output priority filter - 5; policy accept;
+        oifname "sipa_eth*" meta mark $MARK accept
+        oifname "sipa_eth*" udp dport 123 accept
+        oifname "sipa_eth*" counter drop
+    }
+    chain forward {
+        type filter hook forward priority filter - 5; policy accept;
+        oifname "sipa_eth*" counter drop
+    }
+}
+NFT
+}
+killswitch_off() { nft delete table inet mu300_vpn 2>/dev/null || true; }
+
+case "${1:-status}" in
+    gen) gen ;;
+    run)
+        [ "$ENABLE" = 1 ] || { echo "VPN disabled (ENABLE=0 in $CONF)"; killswitch_off; exit 0; }
+        gen >/dev/null
+        if [ "$KILL_SWITCH" = 1 ]; then killswitch_on; else killswitch_off; fi
+        exec "$BIN" run -c "$RUN/config.json" ;;
+    off) killswitch_off; echo "kill switch removed" ;;
+    status)
+        echo "enabled: $ENABLE  kill switch: $KILL_SWITCH ($(nft list table inet mu300_vpn >/dev/null 2>&1 && echo active || echo inactive))"
+        ip -br addr show "$TUN" 2>/dev/null || echo "$TUN: down"
+        if ip link show "$TUN" >/dev/null 2>&1; then
+            printf 'exit IP: '; (wget -qO- -T 8 http://api.ipify.org 2>/dev/null || curl -s -m 8 http://api.ipify.org 2>/dev/null || echo unreachable); echo
+        fi ;;
+    *) echo "usage: $0 gen|run|off|status" >&2; exit 2 ;;
+esac
