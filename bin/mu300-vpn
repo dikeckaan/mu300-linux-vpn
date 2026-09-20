@@ -101,7 +101,14 @@ gen() {
     if [ "$IPV6" = 1 ]; then strategy=prefer_ipv4; addrs='"172.19.0.1/30","fdfe:dcba:9876::1/126"'
     else strategy=ipv4_only; addrs='"172.19.0.1/30"'; fi
     printf '"final":"remote","strategy":"%s"},\n' "$strategy"
-    printf '"inbounds":[{"type":"tun","tag":"tun-in","interface_name":"%s","address":[%s],"mtu":1400,' "$TUN" "$addrs"
+    # "stack":"gvisor", not the default system stack. On this device's 5.4 vendor kernel the system stack
+    # takes the connection off the tun and then drops it: sing-box logs one "router: pre-match => sniff" and
+    # nothing more, the client gets an RST ("Connection refused", or uclient-fetch's "Operation not permitted")
+    # and not a single packet reaches an outbound. DNS still worked, which is what made it look like a routing
+    # or firewall problem for so long. The warning it prints on startup is the same story from the other end:
+    # "inbound/tun[tun-in]: enable offload: set udp offload: TUNSETOFFLOAD: invalid argument" - the kernel does
+    # not have what that stack expects. gvisor carries its own TCP/IP and does not care.
+    printf '"inbounds":[{"type":"tun","tag":"tun-in","stack":"gvisor","interface_name":"%s","address":[%s],"mtu":1400,' "$TUN" "$addrs"
     printf '"auto_route":true,"strict_route":true,"route_exclude_address":%s}],\n' "$excl"
     printf '"outbounds":['; outbound_json
     [ -n "$UPSTREAM_HTTP_PROXY" ] && printf ',{"type":"http","tag":"upstream","server":%s,"server_port":%s}' "$(json_str "${UPSTREAM_HTTP_PROXY%:*}")" "${UPSTREAM_HTTP_PROXY##*:}"
