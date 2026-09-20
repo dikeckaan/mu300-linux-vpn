@@ -3,7 +3,8 @@
 # own traffic and USB/Wi-Fi clients all leave through the tunnel. Settings: /etc/mu300/vpn.conf
 #   mu300-vpn gen       build /run/mu300-vpn/config.json from vpn.conf and check it
 #   mu300-vpn run       gen + kill switch + run sing-box in the foreground (used by the service)
-#   mu300-vpn off       remove the kill switch (the service stop does not, so a crash never leaks)
+#   mu300-vpn off       remove the kill switch (the service stop does not, so a crash never leaks),
+#                       and any routing sing-box left behind if it is no longer running
 #   mu300-vpn status    service, tunnel, exit IP
 set -e
 CONF=${MU300_VPN_CONF:-/etc/mu300/vpn.conf}
@@ -132,6 +133,25 @@ NFT
 }
 killswitch_off() { nft delete table inet mu300_vpn 2>/dev/null || true; }
 
+# sing-box installs the policy routing for its tun itself (auto_route: rule prefs 9000-9010 and table 2022) and
+# removes it when it exits cleanly. It cannot when it is killed or crashes, and what it leaves behind is worse
+# than no VPN at all: every packet the device sends is still directed into a tunnel with nothing at the other
+# end, so the whole system reports "Operation not permitted" and looks like it has lost the modem. That cost an
+# evening once - the data path was fine and every test was being answered by a routing rule.
+#
+# Only when nothing is running, so this never takes the rules away from a live tunnel.
+routing_cleanup() {
+    pgrep -f '[s]ing-box' >/dev/null 2>&1 && return 0
+    ip link show "$TUN" >/dev/null 2>&1 && return 0
+    n=0
+    for pref in 9000 9001 9002 9003 9010; do
+        while ip rule del pref "$pref" 2>/dev/null; do n=$((n + 1)); done
+    done
+    ip route flush table 2022 2>/dev/null || true
+    [ "$n" -gt 0 ] && echo "removed $n stale routing rule(s) left by sing-box"
+    return 0
+}
+
 case "${1:-status}" in
     gen) gen ;;
     run)
@@ -139,7 +159,7 @@ case "${1:-status}" in
         gen >/dev/null
         if [ "$KILL_SWITCH" = 1 ]; then killswitch_on; else killswitch_off; fi
         exec "$BIN" run -c "$RUN/config.json" ;;
-    off) killswitch_off; echo "kill switch removed" ;;
+    off) killswitch_off; echo "kill switch removed"; routing_cleanup ;;
     status)
         echo "enabled: $ENABLE  kill switch: $KILL_SWITCH ($(nft list table inet mu300_vpn >/dev/null 2>&1 && echo active || echo inactive))"
         ip -br addr show "$TUN" 2>/dev/null || echo "$TUN: down"
