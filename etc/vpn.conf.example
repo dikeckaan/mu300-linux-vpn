@@ -3,11 +3,12 @@
 ENABLE=1
 # the share link from your server/panel (vless://uuid@host:port?type=...&security=...#name)
 VLESS_URI=""
-# xray: Xray-core behind hev-socks5-tunnel on a kernel TUN (default)
-# sing-box: sing-box's own TUN (the engine this device used before; FINDINGS 26b)
+# xray: Xray-core behind hev-socks5-tunnel on a kernel TUN
+# sing-box: sing-box's own TUN (FINDINGS 26b)
+# unset: xray, or sing-box when KILL_SWITCH=1
 ENGINE=xray
 # 1: nothing leaves through the cellular interface except the tunnel itself (also while the tunnel is down).
-# Off by default for now: it was written and measured with sing-box, and has not been re-tested with xray.
+# Only works with ENGINE=sing-box for now; with xray it is ignored, with a warning.
 KILL_SWITCH=0
 # DNS for the device and its clients, resolved through the tunnel
 REMOTE_DNS=1.1.1.1

@@ -16,7 +16,11 @@ MARK=0x2d0           # routing mark on the engine's own connections: they bypass
 [ -r "$CONF" ] && . "$CONF"
 ENABLE=${ENABLE:-0}; KILL_SWITCH=${KILL_SWITCH:-1}; REMOTE_DNS=${REMOTE_DNS:-1.1.1.1}
 BOOTSTRAP_DNS=${BOOTSTRAP_DNS:-1.1.1.1}; LAN_CIDRS=${LAN_CIDRS:-192.168.77.0/24}; IPV6=${IPV6:-0}
-ENGINE=${ENGINE:-xray}
+# Xray is the default, except with the kill switch on. The kill switch drops everything unmarked on the cellular
+# interface, and before the tunnel exists the server's name is looked up through dnsmasq and its certificate
+# fetched with openssl - both unmarked. sing-box does its bootstrap lookup on its own marked socket, so it works
+# there. An update keeps vpn.conf, and older ones say KILL_SWITCH=1: they stay on sing-box, which is what they ran.
+if [ -z "${ENGINE:-}" ]; then [ "$KILL_SWITCH" = 1 ] && ENGINE=sing-box || ENGINE=xray; fi
 XRAY=${XRAY:-/opt/mu300/bin/xray}; HEV=${HEV:-/opt/mu300/bin/hev-socks5-tunnel}
 BIN=${SING_BOX:-/opt/mu300/bin/sing-box}
 SOCKS_PORT=10808
@@ -408,7 +412,12 @@ case "${1:-status}" in
         [ "$ENABLE" = 1 ] || { echo "VPN disabled (ENABLE=0 in $CONF)"; killswitch_off; exit 0; }
         [ "$ENGINE" = xray ] || gen >/dev/null
         ensure_firewall_zone
-        if [ "$KILL_SWITCH" = 1 ]; then killswitch_on; else killswitch_off; fi
+        if [ "$ENGINE" = xray ] && [ "$KILL_SWITCH" = 1 ]; then
+            # see ENGINE above: with the kill switch on, this engine could never come up, and the device would be
+            # left with no connection at all
+            echo "the kill switch is not supported with ENGINE=xray yet: running without it (ENGINE=sing-box has it)" >&2
+            killswitch_off
+        elif [ "$KILL_SWITCH" = 1 ]; then killswitch_on; else killswitch_off; fi
         [ "$ENGINE" = xray ] && run_xray
         exec "$BIN" run -c "$RUN/config.json" ;;
     off) killswitch_off; echo "kill switch removed"; routing_cleanup ;;
