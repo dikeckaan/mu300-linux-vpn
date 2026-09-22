@@ -1,5 +1,5 @@
 [Unit]
-Description=MU300 VPN (VLESS via sing-box, TUN + kill switch)
+Description=MU300 VPN (VLESS via Xray or sing-box, TUN)
 After=mu300-firewall.service mu300-mobile-data.service
 Wants=mu300-mobile-data.service
 ConditionPathExists=/etc/mu300/vpn.conf
@@ -7,8 +7,9 @@ StartLimitIntervalSec=0
 
 [Service]
 ExecStart=/opt/mu300/bin/mu300-vpn run
-# sing-box exits with "missing default interface" when it starts before the modem has a default route;
-# keep retrying instead of hitting the start limit and giving up
+# the engine exits when it starts before the modem has a route to the server (sing-box: "missing default
+# interface"; xray: the server name does not resolve yet), and on a renewed server certificate; keep retrying
+# instead of hitting the start limit and giving up
 Restart=always
 RestartSec=10
 

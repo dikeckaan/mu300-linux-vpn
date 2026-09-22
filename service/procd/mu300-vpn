@@ -1,5 +1,5 @@
 #!/bin/sh /etc/rc.common
-# VLESS via sing-box (TUN + kill switch); settings in /etc/mu300/vpn.conf, see /opt/mu300/bin/mu300-vpn
+# VLESS via Xray (default) or sing-box, on a TUN; settings in /etc/mu300/vpn.conf, see /opt/mu300/bin/mu300-vpn
 START=95
 USE_PROCD=1
 export PATH="$PATH:/opt/mu300/busybox-bin"

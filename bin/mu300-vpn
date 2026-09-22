@@ -1,20 +1,30 @@
 #!/bin/sh
-# VLESS client for the MU300 (Ubuntu and OpenWrt): sing-box with a TUN device and policy routing, so the device's
-# own traffic and USB/Wi-Fi clients all leave through the tunnel. Settings: /etc/mu300/vpn.conf
-#   mu300-vpn gen       build /run/mu300-vpn/config.json from vpn.conf and check it
-#   mu300-vpn run       gen + kill switch + run sing-box in the foreground (used by the service)
+# VLESS client for the MU300 (Ubuntu and OpenWrt): a TUN device and policy routing, so the device's own traffic
+# and USB/Wi-Fi clients all leave through the tunnel. Settings: /etc/mu300/vpn.conf
+#   ENGINE=xray      Xray-core (the VLESS reference client) behind hev-socks5-tunnel, a small C program on a
+#                    plain kernel TUN - the default
+#   ENGINE=sing-box  sing-box with its own TUN inbound (gvisor stack, see FINDINGS 26b)
+#   mu300-vpn gen       build the engine's config under /run/mu300-vpn from vpn.conf and check it
+#   mu300-vpn run       gen + kill switch + run the engine in the foreground (used by the service)
 #   mu300-vpn off       remove the kill switch (the service stop does not, so a crash never leaks),
-#                       and any routing sing-box left behind if it is no longer running
+#                       and any routing an engine left behind if it is no longer running
 #   mu300-vpn status    service, tunnel, exit IP
 set -e
 CONF=${MU300_VPN_CONF:-/etc/mu300/vpn.conf}
 RUN=/run/mu300-vpn
-BIN=${SING_BOX:-/opt/mu300/bin/sing-box}
-TUN=sbtun
-MARK=0x2d0           # routing mark on sing-box's own connections: they bypass the tunnel and the kill switch
+MARK=0x2d0           # routing mark on the engine's own connections: they bypass the tunnel and the kill switch
 [ -r "$CONF" ] && . "$CONF"
 ENABLE=${ENABLE:-0}; KILL_SWITCH=${KILL_SWITCH:-1}; REMOTE_DNS=${REMOTE_DNS:-1.1.1.1}
 BOOTSTRAP_DNS=${BOOTSTRAP_DNS:-1.1.1.1}; LAN_CIDRS=${LAN_CIDRS:-192.168.77.0/24}; IPV6=${IPV6:-0}
+ENGINE=${ENGINE:-xray}
+XRAY=${XRAY:-/opt/mu300/bin/xray}; HEV=${HEV:-/opt/mu300/bin/hev-socks5-tunnel}
+BIN=${SING_BOX:-/opt/mu300/bin/sing-box}
+SOCKS_PORT=10808
+# an image built before the xray engine existed has only sing-box: keep working with what is there
+if [ "$ENGINE" = xray ] && { [ ! -x "$XRAY" ] || [ ! -x "$HEV" ]; }; then
+    [ -x "$BIN" ] && { echo "xray engine not installed, using sing-box" >&2; ENGINE=sing-box; }
+fi
+case "$ENGINE" in xray) TUN=xtun ;; *) TUN=sbtun ;; esac
 
 # json_str VALUE : JSON string literal
 json_str() { printf '"%s"' "$(printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g')"; }
@@ -82,7 +92,7 @@ outbound_json() {
     printf '}'
 }
 
-gen() {
+gen_singbox() {
     [ -n "$VLESS_URI" ] || { echo "VLESS_URI is not set in $CONF" >&2; exit 1; }
     parse_uri
     mkdir -p "$RUN"; chmod 700 "$RUN"
@@ -119,6 +129,217 @@ gen() {
     chmod 600 "$RUN/config.json"
     "$BIN" check -c "$RUN/config.json"
 }
+
+# ---- xray engine ----------------------------------------------------------------------------------------------
+# Xray does VLESS and nothing else here; hev-socks5-tunnel owns the TUN and hands every TCP/UDP flow to Xray's
+# SOCKS port on loopback. Neither installs routes, so this script does, with the same rule prefs and table as
+# sing-box's auto_route - which is what lets routing_cleanup and the kill switch serve both engines.
+
+# first IPv4 address for a name, from the system resolver. Runs before any rule points into the tunnel, so the
+# answer comes over the plain bearer.
+resolve4() {
+    case "$1" in *[!0-9.]*) ;; *) printf '%s' "$1"; return 0 ;; esac
+    # glibc's getent on Ubuntu; OpenWrt has no getent but its busybox has nslookup (Ubuntu's image does not)
+    if command -v getent >/dev/null 2>&1; then
+        getent ahostsv4 "$1" 2>/dev/null | awk '{print $1; exit}'
+    else
+        nslookup "$1" 2>/dev/null | awk '/^Name:/ {n = 1} n && /^Address/ {sub(/^Address( [0-9]+)?: */, ""); if ($0 ~ /^[0-9.]+$/) {print; exit}}'
+    fi
+}
+listening() { { ss -ltn 2>/dev/null || netstat -ltn 2>/dev/null; } | grep -q "127.0.0.1:$1 "; }
+
+xray_stream_json() {
+    case "$TYPE" in tcp|raw) net=raw ;; ws|grpc|httpupgrade|xhttp) net=$TYPE ;;
+        *) echo "transport type '$TYPE' is not supported by this helper" >&2; exit 1 ;; esac
+    printf '"streamSettings":{"network":"%s"' "$net"
+    case "$TYPE" in
+        ws) printf ',"wsSettings":{"path":%s' "$(json_str "${WSPATH:-/}")"; [ -n "$WSHOST" ] && printf ',"host":%s' "$(json_str "$WSHOST")"; printf '}' ;;
+        grpc) printf ',"grpcSettings":{"serviceName":%s}' "$(json_str "$SVC")" ;;
+        httpupgrade) printf ',"httpupgradeSettings":{"path":%s' "$(json_str "${WSPATH:-/}")"; [ -n "$WSHOST" ] && printf ',"host":%s' "$(json_str "$WSHOST")"; printf '}' ;;
+        xhttp) printf ',"xhttpSettings":{"path":%s' "$(json_str "${WSPATH:-/}")"; [ -n "$WSHOST" ] && printf ',"host":%s' "$(json_str "$WSHOST")"
+               [ -n "$XMODE" ] && printf ',"mode":%s' "$(json_str "$XMODE")"; printf '}' ;;
+    esac
+    case "$SECURITY" in
+        tls)
+            printf ',"security":"tls","tlsSettings":{"serverName":%s' "$(json_str "${SNI:-$HOST}")"
+            # Xray 26 removed allowInsecure. Its replacement pins the one certificate the server presents,
+            # which is stricter: anything else is refused, including a correctly signed certificate for a
+            # different host. It also skips the expiry check, so an expired certificate keeps working until
+            # the server renews it - and then the pin has to change with it.
+            [ -n "$PIN" ] && printf ',"pinnedPeerCertSha256":%s' "$(json_str "$PIN")"
+            [ -n "$VCN" ] && printf ',"verifyPeerCertByName":%s' "$(json_str "$VCN")"
+            [ -n "$ALPN" ] && printf ',"alpn":%s' "$(json_list "$ALPN")"
+            [ -n "$FP" ] && printf ',"fingerprint":%s' "$(json_str "$FP")"
+            printf '}' ;;
+        reality)
+            printf ',"security":"reality","realitySettings":{"serverName":%s,"fingerprint":%s,"publicKey":%s,"shortId":%s' \
+                "$(json_str "${SNI:-$HOST}")" "$(json_str "${FP:-chrome}")" "$(json_str "$PBK")" "$(json_str "$SID")"
+            [ -n "$SPX" ] && printf ',"spiderX":%s' "$(json_str "$SPX")"
+            printf '}' ;;
+    esac
+    printf ',"sockopt":{"mark":%d}}' "$((MARK))"
+}
+
+# Xray 26 has no allowInsecure; pinnedPeerCertSha256 is its replacement. For a link that asks for allowInsecure the
+# pin is managed here: fetched once when there is none, kept in vpn.conf, and fetched again only when Xray reports
+# that the server's certificate no longer matches (a renewal). A pin that came from the link (pcs) or was written
+# by hand without allowInsecure is left alone.
+pin_managed() { [ "$SECURITY" = tls ] && case "$INSECURE" in 1|true) true ;; *) false ;; esac; }
+
+# SHA-256 of the leaf certificate the server presents, in the form Xray expects. Goes out directly: at start the
+# tunnel's rules are not in place yet, and while it runs rule 9002 keeps the server's address off the tunnel.
+fetch_pin() {
+    command -v openssl >/dev/null 2>&1 || { echo "fetching the server certificate needs openssl (OpenWrt: apk add openssl-util)" >&2; return 1; }
+    t=; command -v timeout >/dev/null 2>&1 && t="timeout 20"
+    h=$($t openssl s_client -connect "$SERVER_IP:$PORT" -servername "${SNI:-$HOST}" </dev/null 2>/dev/null |
+        openssl x509 -outform DER 2>/dev/null | sha256sum | cut -d' ' -f1)
+    # the hash of nothing is what an empty pipe produces when the handshake failed
+    case "$h" in ""|e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855) return 1 ;; esac
+    printf '%s' "$h"
+}
+
+save_pin() {
+    if grep -q '^TLS_PIN_SHA256=' "$CONF"; then sed -i "s/^TLS_PIN_SHA256=.*/TLS_PIN_SHA256=$1/" "$CONF"
+    else printf '# fetched by mu300-vpn: the VPN server certificate, standing in for allowInsecure (Xray 26)\nTLS_PIN_SHA256=%s\n' "$1" >> "$CONF"; fi
+}
+
+gen_xray() {
+    [ -n "$VLESS_URI" ] || { echo "VLESS_URI is not set in $CONF" >&2; exit 1; }
+    parse_uri
+    XMODE=$(param mode); SPX=$(urldecode "$(param spx)"); ENC=$(urldecode "$(param encryption)")
+    # pcs/vcn are the share-link spellings of pinnedPeerCertSha256/verifyPeerCertByName; TLS_PIN_SHA256 in
+    # vpn.conf is for links written before those existed
+    PIN=${TLS_PIN_SHA256:-$(urldecode "$(param pcs)")}; VCN=$(urldecode "$(param vcn)")
+    # the name is looked up now and Xray is given the address, so it never has to resolve anything itself - the
+    # resolver it would use sits behind the tunnel it is trying to build. The name stays as the SNI.
+    SERVER_IP=$(resolve4 "$HOST")
+    [ -n "$SERVER_IP" ] || { echo "cannot resolve the VPN server $HOST" >&2; exit 1; }
+    # allowInsecure with nothing pinned yet: take whatever certificate the server presents now and keep it
+    if pin_managed && [ -z "$PIN" ]; then
+        PIN=$(fetch_pin) || { echo "the link asks for allowInsecure, which Xray no longer has, and the server's" \
+            "certificate could not be fetched to pin instead. Set TLS_PIN_SHA256 in $CONF, or ENGINE=sing-box." >&2; exit 1; }
+        save_pin "$PIN"
+        echo "pinned the server's current certificate ($PIN)"
+    fi
+    mkdir -p "$RUN"; chmod 700 "$RUN"
+    {
+    # info, not warning: a failed outbound - including a pin mismatch - is only reported at info. run_xray's
+    # reader scans every line and passes on only warnings and worse, so the system log does not fill up.
+    printf '{"log":{"loglevel":"info","access":"none"},\n'
+    printf '"inbounds":[{"tag":"socks-in","listen":"127.0.0.1","port":%d,"protocol":"socks","settings":{"auth":"noauth","udp":true,"ip":"127.0.0.1"}}],\n' "$SOCKS_PORT"
+    printf '"outbounds":[{"tag":"proxy","protocol":"vless","settings":{"vnext":[{"address":%s,"port":%s,"users":[{"id":%s,"encryption":%s' \
+        "$(json_str "$SERVER_IP")" "$PORT" "$(json_str "$UUID")" "$(json_str "${ENC:-none}")"
+    [ -n "$FLOW" ] && printf ',"flow":%s' "$(json_str "$FLOW")"
+    printf '}]}]},'; xray_stream_json; printf '},\n'
+    printf '{"tag":"direct","protocol":"freedom","streamSettings":{"sockopt":{"mark":%d}}}]}\n' "$((MARK))"
+    } > "$RUN/xray.json"
+    chmod 600 "$RUN/xray.json"
+    cat > "$RUN/hev.yml" <<YML
+tunnel:
+  name: $TUN
+  mtu: 8500
+  multi-queue: false
+  ipv4: 198.18.0.1
+socks5:
+  port: $SOCKS_PORT
+  address: 127.0.0.1
+  udp: 'udp'
+misc:
+  log-level: warn
+YML
+    printf '%s\n' "$SERVER_IP" > "$RUN/server-ip"
+    "$XRAY" run -test -c "$RUN/xray.json" >/dev/null || { "$XRAY" run -test -c "$RUN/xray.json" >&2; exit 1; }
+    echo "xray config OK ($RUN/xray.json), server $HOST -> $SERVER_IP"
+}
+
+xray_routes_up() {
+    ip rule add pref 9000 fwmark "$MARK" lookup main
+    for c in $(printf '%s' "$LAN_CIDRS" | tr ',' ' '); do ip rule add pref 9001 to "$c" lookup main; done
+    ip rule add pref 9002 to "$(cat "$RUN/server-ip")" lookup main
+    ip route replace default dev "$TUN" table 2022
+    ip rule add pref 9010 lookup 2022
+    # the device's own lookups: dnsmasq forwards to whatever the bearer handed out, and the carrier's resolver
+    # does not answer from the far end of the tunnel. Send them to REMOTE_DNS instead, which the routing above
+    # then carries through the tunnel. Clients that use their own DNS are already going through it.
+    nft -f - <<NFT
+table ip mu300_vpn_dns
+delete table ip mu300_vpn_dns
+table ip mu300_vpn_dns {
+    chain output {
+        type nat hook output priority -100; policy accept;
+        meta mark $MARK return
+        ip daddr 127.0.0.0/8 return
+        udp dport 53 dnat to $REMOTE_DNS
+        tcp dport 53 dnat to $REMOTE_DNS
+    }
+}
+NFT
+}
+
+xray_routes_down() {
+    nft delete table ip mu300_vpn_dns 2>/dev/null || true
+    for pref in 9000 9001 9002 9003 9010; do
+        while ip rule del pref "$pref" 2>/dev/null; do :; done
+    done
+    ip route flush table 2022 2>/dev/null || true
+}
+
+# Two processes and the routing between them, torn down together: if either dies the service exits, the routes
+# go with it and procd starts the whole thing again. Leaving rules behind with nothing at the other end is what
+# made sing-box's crashes look like a dead modem (routing_cleanup), so every way out of here goes through down().
+run_xray() {
+    xray_routes_down
+    gen_xray
+    # Xray's output goes through a reader that passes it on and notes a pin mismatch, so a renewed server
+    # certificate is noticed without polling the server
+    rm -f "$RUN/pin-mismatch" "$RUN/xray.out"; mkfifo "$RUN/xray.out"
+    while IFS= read -r l; do
+        case "$l" in *"peer cert is unrecognized (against pinnedPeerCertSha256)"*) : > "$RUN/pin-mismatch" ;; esac
+        case "$l" in *"[Info]"*|*"[Debug]"*) ;; *) printf '%s\n' "$l" ;; esac
+    done < "$RUN/xray.out" &
+    "$XRAY" run -c "$RUN/xray.json" > "$RUN/xray.out" 2>&1 & xpid=$!
+    hpid=
+    down() {
+        trap - EXIT INT TERM
+        [ -n "$hpid" ] && kill "$hpid" 2>/dev/null
+        kill "$xpid" 2>/dev/null
+        wait 2>/dev/null
+        xray_routes_down
+    }
+    trap 'down; exit 0' INT TERM
+    trap down EXIT
+    n=0
+    until listening "$SOCKS_PORT"; do
+        kill -0 "$xpid" 2>/dev/null || { echo "xray exited during start" >&2; exit 1; }
+        n=$((n + 1)); [ "$n" -lt 15 ] || { echo "xray did not open its SOCKS port" >&2; exit 1; }
+        sleep 1
+    done
+    "$HEV" "$RUN/hev.yml" & hpid=$!
+    n=0
+    until ip link show "$TUN" >/dev/null 2>&1; do
+        kill -0 "$hpid" 2>/dev/null || { echo "hev-socks5-tunnel exited during start" >&2; exit 1; }
+        n=$((n + 1)); [ "$n" -lt 15 ] || { echo "$TUN did not appear" >&2; exit 1; }
+        sleep 1
+    done
+    ip link set "$TUN" up
+    xray_routes_up
+    echo "tunnel up on $TUN (xray $xpid, hev $hpid)"
+    # whichever exits first ends the service
+    while kill -0 "$xpid" 2>/dev/null && kill -0 "$hpid" 2>/dev/null; do
+        sleep 2
+        [ -e "$RUN/pin-mismatch" ] && pin_managed || continue
+        rm -f "$RUN/pin-mismatch"
+        new=$(fetch_pin) || { sleep 30; continue; }
+        [ "$new" = "$PIN" ] && { sleep 30; continue; }
+        save_pin "$new"
+        echo "the server's certificate changed; pinned the new one and restarting" >&2
+        exit 1
+    done
+    echo "$( kill -0 "$xpid" 2>/dev/null && echo hev-socks5-tunnel || echo xray ) exited, tearing the tunnel down" >&2
+    exit 1
+}
+
+gen() { case "$ENGINE" in xray) gen_xray ;; *) gen_singbox ;; esac; }
 
 killswitch_on() {
     nft -f - <<NFT
@@ -169,14 +390,15 @@ ensure_firewall_zone() {
 #
 # Only when nothing is running, so this never takes the rules away from a live tunnel.
 routing_cleanup() {
-    pgrep -f '[s]ing-box' >/dev/null 2>&1 && return 0
+    pgrep -f '[s]ing-box run|[x]ray run|[h]ev-socks5-tunnel' >/dev/null 2>&1 && return 0
     ip link show "$TUN" >/dev/null 2>&1 && return 0
     n=0
     for pref in 9000 9001 9002 9003 9010; do
         while ip rule del pref "$pref" 2>/dev/null; do n=$((n + 1)); done
     done
     ip route flush table 2022 2>/dev/null || true
-    [ "$n" -gt 0 ] && echo "removed $n stale routing rule(s) left by sing-box"
+    nft delete table ip mu300_vpn_dns 2>/dev/null || true
+    [ "$n" -gt 0 ] && echo "removed $n stale routing rule(s) left by a VPN engine"
     return 0
 }
 
@@ -184,13 +406,14 @@ case "${1:-status}" in
     gen) gen ;;
     run)
         [ "$ENABLE" = 1 ] || { echo "VPN disabled (ENABLE=0 in $CONF)"; killswitch_off; exit 0; }
-        gen >/dev/null
+        [ "$ENGINE" = xray ] || gen >/dev/null
         ensure_firewall_zone
         if [ "$KILL_SWITCH" = 1 ]; then killswitch_on; else killswitch_off; fi
+        [ "$ENGINE" = xray ] && run_xray
         exec "$BIN" run -c "$RUN/config.json" ;;
     off) killswitch_off; echo "kill switch removed"; routing_cleanup ;;
     status)
-        echo "enabled: $ENABLE  kill switch: $KILL_SWITCH ($(nft list table inet mu300_vpn >/dev/null 2>&1 && echo active || echo inactive))"
+        echo "engine: $ENGINE  enabled: $ENABLE  kill switch: $KILL_SWITCH ($(nft list table inet mu300_vpn >/dev/null 2>&1 && echo active || echo inactive))"
         ip -br addr show "$TUN" 2>/dev/null || echo "$TUN: down"
         if ip link show "$TUN" >/dev/null 2>&1; then
             printf 'exit IP: '; (wget -qO- -T 8 http://api.ipify.org 2>/dev/null || curl -s -m 8 http://api.ipify.org 2>/dev/null || echo unreachable); echo
