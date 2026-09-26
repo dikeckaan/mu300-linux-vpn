@@ -15,7 +15,7 @@ RUN=/run/mu300-vpn
 MARK=0x2d0           # routing mark on the engine's own connections: they bypass the tunnel and the kill switch
 [ -r "$CONF" ] && . "$CONF"
 ENABLE=${ENABLE:-0}; KILL_SWITCH=${KILL_SWITCH:-1}; REMOTE_DNS=${REMOTE_DNS:-1.1.1.1}
-BOOTSTRAP_DNS=${BOOTSTRAP_DNS:-1.1.1.1}; LAN_CIDRS=${LAN_CIDRS:-192.168.77.0/24}; IPV6=${IPV6:-0}
+BOOTSTRAP_DNS=${BOOTSTRAP_DNS:-1.1.1.1}; LAN_CIDRS=${LAN_CIDRS:-$(. /etc/mu300/lan.conf 2>/dev/null; l=${LAN_IP:-192.168.77.1}; echo "${l%.*}.0/24")}; IPV6=${IPV6:-0}
 # Xray is the default, except with the kill switch on. The kill switch drops everything unmarked on the cellular
 # interface, and before the tunnel exists the server's name is looked up through dnsmasq and its certificate
 # fetched with openssl - both unmarked. sing-box does its bootstrap lookup on its own marked socket, so it works
