@@ -14,8 +14,8 @@ KILL_SWITCH=0
 REMOTE_DNS=1.1.1.1
 # sing-box only: used to look up the VPN server's own name (sent directly, outside the tunnel)
 BOOTSTRAP_DNS=1.1.1.1
-# networks that stay local (USB/Wi-Fi LAN)
-LAN_CIDRS=192.168.77.0/24
+# more networks that stay local, comma-separated (the device's own USB/Wi-Fi LAN always does)
+#LAN_CIDRS=192.168.1.0/24
 # 1: also carry IPv6 (sing-box only, and only if the server has IPv6 connectivity)
 IPV6=0
 # sing-box only, optional: reach the VPN server through an HTTP proxy (host:port)

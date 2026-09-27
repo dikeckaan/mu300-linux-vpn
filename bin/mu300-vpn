@@ -15,7 +15,15 @@ RUN=/run/mu300-vpn
 MARK=0x2d0           # routing mark on the engine's own connections: they bypass the tunnel and the kill switch
 [ -r "$CONF" ] && . "$CONF"
 ENABLE=${ENABLE:-0}; KILL_SWITCH=${KILL_SWITCH:-1}; REMOTE_DNS=${REMOTE_DNS:-1.1.1.1}
-BOOTSTRAP_DNS=${BOOTSTRAP_DNS:-1.1.1.1}; LAN_CIDRS=${LAN_CIDRS:-$(. /etc/mu300/lan.conf 2>/dev/null; l=${LAN_IP:-192.168.77.1}; echo "${l%.*}.0/24")}; IPV6=${IPV6:-0}
+BOOTSTRAP_DNS=${BOOTSTRAP_DNS:-1.1.1.1}; IPV6=${IPV6:-0}
+# The device's own LAN always stays local, whatever LAN_CIDRS says: a vpn.conf copied from another device, or one
+# written before the LAN address changed (the U30 Air is on 192.168.78.0/24), would send the replies to its USB
+# and Wi-Fi clients into the tunnel. The address br-lan has is the truth (lan.conf or UCI); before it is up, the
+# configured one.
+own=$(ip -4 -o addr show br-lan 2>/dev/null | awk '{print $4; exit}')
+own=${own%/*}; [ -n "$own" ] || own=$(. /etc/mu300/lan.conf 2>/dev/null; echo "${LAN_IP:-$(/opt/mu300/bin/mu300-lan-ip)}")
+own=${own%.*}.0/24
+case ",${LAN_CIDRS:-}," in *",$own,"*) ;; *) LAN_CIDRS=${LAN_CIDRS:+$LAN_CIDRS,}$own ;; esac
 # Xray is the default, except with the kill switch on. The kill switch drops everything unmarked on the cellular
 # interface, and before the tunnel exists the server's name is looked up through dnsmasq and its certificate
 # fetched with openssl - both unmarked. sing-box does its bootstrap lookup on its own marked socket, so it works
