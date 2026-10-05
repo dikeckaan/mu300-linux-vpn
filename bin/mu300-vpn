@@ -6,6 +6,7 @@
 #   ENGINE=sing-box  sing-box with its own TUN inbound (gvisor stack, see FINDINGS 26b)
 #   mu300-vpn gen       build the engine's config under /run/mu300-vpn from vpn.conf and check it
 #   mu300-vpn run       gen + kill switch + run the engine in the foreground (used by the service)
+#   mu300-vpn guard     put the kill switch up if the VPN is on with it (mobile-data, before the bearer is up)
 #   mu300-vpn off       remove the kill switch (the service stop does not, so a crash never leaks),
 #                       and any routing an engine left behind if it is no longer running
 #   mu300-vpn status    service, tunnel, exit IP
@@ -16,6 +17,8 @@ RUN=${MU300_VPN_RUN:-/run/mu300-vpn}   # (MU300_VPN_RUN, MU300_LAN_CONF, MU300_B
 MARK=0x2d0           # routing mark on the engine's own connections: they bypass the tunnel and the kill switch
 [ -r "$CONF" ] && . "$CONF"
 ENABLE=${ENABLE:-0}; KILL_SWITCH=${KILL_SWITCH:-1}; REMOTE_DNS=${REMOTE_DNS:-1.1.1.1}
+# only 0 turns the kill switch off: a value that is not understood (yes, true, a typo) leaves it on
+[ "$KILL_SWITCH" = 0 ] || KILL_SWITCH=1
 BOOTSTRAP_DNS=${BOOTSTRAP_DNS:-1.1.1.1}; IPV6=${IPV6:-0}
 # The device's own LAN always stays local, whatever LAN_CIDRS says: a vpn.conf copied from another device, or one
 # written before the LAN address changed (the U30 Air is on 192.168.78.0/24), would send the replies to its USB
@@ -52,6 +55,9 @@ pick_engines() {
     if [ "$ENGINE" = xray ] && { [ ! -x "$XRAY" ] || [ ! -x "$HEV" ]; }; then
         [ -x "$BIN" ] && { echo "xray engine not installed, using sing-box" >&2; ENGINE=sing-box; }
     fi
+    # xray cannot start behind the kill switch (see ENGINE above): sing-box, which can, is what runs then. It is
+    # never run without it.
+    if [ "$ENGINE" = xray ] && [ "$KILL_SWITCH" = 1 ] && [ -x "$BIN" ]; then ENGINE=sing-box; fi
     case "$ENGINE" in xray) TUN=xtun ;; *) TUN=sbtun ;; esac
 }
 engines_ok() { case "$ENGINE" in xray) [ -x "$XRAY" ] && [ -x "$HEV" ] ;; *) [ -x "$BIN" ] ;; esac; }
@@ -61,19 +67,123 @@ pick_engines
 # bring the vpn extra along (an older updater or installer). Take the engines of the image it replaced, or download
 # the extra. A configured VPN comes back by itself.
 #
-# The full kill switch would stop that download (the device's own traffic to the modem is dropped), and no kill
-# switch at all would let the clients out unprotected while it runs. So with KILL_SWITCH=1 the clients stay blocked
-# (killswitch_clients) and only the device itself goes out, to fetch the engines; when that fails the full kill
-# switch goes up, and the next start (the service restarts it) lowers it to the clients' part again for its try.
+# With KILL_SWITCH=1 the full kill switch is already up when this runs (run puts it up first), and it would stop
+# the download. It is not taken down for it: adopting needs no network, and the download gets a narrow window
+# (fetch_engines) - the device's own connections to the release hosts, nothing forwarded, for FETCH_TIME seconds at
+# most - which closes back to the full kill switch on every way out, success or not.
 ensure_engines() {
     engines_ok && return 0
     echo "the VPN engines are not installed; getting the vpn extra" >&2
-    if [ "$KILL_SWITCH" = 1 ]; then killswitch_clients; else killswitch_off; fi
     "$EXTRA_CMD" adopt vpn >&2 && pick_engines && engines_ok && return 0
-    "$EXTRA_CMD" install vpn >&2 && pick_engines && engines_ok && return 0
+    if [ "$KILL_SWITCH" = 1 ]; then
+        fetch_engines && pick_engines && engines_ok && return 0
+    else
+        "$EXTRA_CMD" install vpn >&2 && pick_engines && engines_ok && return 0
+    fi
     echo "$MISSING" >&2
-    if [ "$KILL_SWITCH" = 1 ]; then killswitch_on; fi
     return 1
+}
+
+# ---- the download window --------------------------------------------------------------------------------------
+# What the kill switch lets through while the engines are downloaded: DNS from the device itself to its own
+# resolvers, and HTTP(S) to the addresses the release hosts have (looked up when the window opens, and again while it is open: GitHub's
+# names have short lifetimes and the download is redirected to a CDN). Clients get nothing - the forward chain
+# drops everything to the modem as always, and their DNS queries to the device are dropped too, so dnsmasq does
+# not carry them out. Every allowance is an nft set element with a timeout, so the window closes by itself after
+# FETCH_TIME seconds even if this script is killed with SIGKILL and never gets to close it.
+FETCH_TIME=${FETCH_TIME:-900}
+FETCH_REFRESH=${FETCH_REFRESH:-10}
+case $FETCH_TIME in ''|*[!0-9]*|0) FETCH_TIME=900 ;; esac
+case $FETCH_REFRESH in ''|*[!0-9]*|0) FETCH_REFRESH=10 ;; esac
+FETCH_HOSTS=${FETCH_HOSTS:-github.com api.github.com objects.githubusercontent.com release-assets.githubusercontent.com}
+fetch_hosts() {
+    _u=${MU300_RELEASE_URL:-}; _u=${_u#*://}; _u=${_u%%/*}; _u=${_u##*@}; _u=${_u%:*}
+    for _h in $FETCH_HOSTS $_u; do case $_h in *[!A-Za-z0-9.-]*|'') ;; *) echo "$_h" ;; esac; done
+}
+# every address of a name, IPv4 and IPv6 (getent on Ubuntu, busybox nslookup on OpenWrt)
+resolve_all() {
+    if command -v getent >/dev/null 2>&1; then
+        getent ahosts "$1" 2>/dev/null | awk '{print $1}'
+    else
+        nslookup "$1" 2>/dev/null | awk '/^Name:/ {n = 1} n && /^Address/ {sub(/^Address( [0-9]+)?: */, ""); print $1}'
+    fi
+}
+# the resolvers the device's own lookups go out to (systemd-resolved on Ubuntu, dnsmasq's on OpenWrt): DNS in the
+# window goes to these and nowhere else
+RESOLV_FILES=${MU300_RESOLV_FILES:-/run/systemd/resolve/resolv.conf /tmp/resolv.conf.d/resolv.conf.auto /tmp/resolv.conf.auto /etc/resolv.conf}
+fetch_resolvers() {
+    for _f in $RESOLV_FILES; do [ -r "$_f" ] && awk '$1 == "nameserver" {print $2}' "$_f"; done |
+        grep -v -e '^127\.' -e '^::1$' -e '^0\.' | sort -u
+}
+# fetch_allow SECONDS: the release hosts' current addresses (and the resolvers), open for that long
+fetch_allow() {
+    [ "$1" -gt 0 ] 2>/dev/null || return 0
+    _v4=; _v6=; _d4=; _d6=
+    for _a in $(fetch_resolvers); do
+        case $_a in
+            *:*) case $_a in *[!0-9A-Fa-f:.]*) ;; *) _d6="$_d6${_d6:+, }$_a timeout $1s" ;; esac ;;
+            *[!0-9.]*) ;;
+            *.*.*.*) _d4="$_d4${_d4:+, }$_a timeout $1s" ;;
+        esac
+    done
+    [ -z "$_d4" ] || nft add element inet mu300_vpn dns4 "{ $_d4 }" 2>/dev/null || true
+    [ -z "$_d6" ] || nft add element inet mu300_vpn dns6 "{ $_d6 }" 2>/dev/null || true
+    for _a in $(for _h in $(fetch_hosts); do resolve_all "$_h"; done | sort -u); do
+        case $_a in
+            *[!0-9.]*) case $_a in *:*) case $_a in *[!0-9A-Fa-f:.]*) ;; *) _v6="$_v6${_v6:+, }$_a timeout $1s" ;; esac ;; esac ;;
+            *.*.*.*) _v4="$_v4${_v4:+, }$_a timeout $1s" ;;
+        esac
+    done
+    [ -z "$_v4" ] || nft add element inet mu300_vpn fetch4 "{ $_v4 }" 2>/dev/null || true
+    [ -z "$_v6" ] || nft add element inet mu300_vpn fetch6 "{ $_v6 }" 2>/dev/null || true
+}
+# kill_tree PID: a process and everything it started (the download runs in curl or wget under mu300-extra's shell;
+# killing only that shell would leave them running). Stopped first, so it starts nothing new meanwhile.
+kill_tree() {
+    kill -STOP "$1" 2>/dev/null || return 0
+    for _k in $(pgrep -P "$1" 2>/dev/null); do kill_tree "$_k"; done
+    kill -TERM "$1" 2>/dev/null; kill -CONT "$1" 2>/dev/null
+    return 0
+}
+FETCH_PIDS=
+# back to the full kill switch; if even that fails, at least nothing of the window stays open
+fetch_close() {
+    for _p in $FETCH_PIDS; do kill_tree "$_p"; done
+    FETCH_PIDS=
+    killswitch_on && return 0
+    for _s in dns4 dns6 fetch4 fetch6; do nft flush set inet mu300_vpn "$_s" 2>/dev/null; done
+    return 1
+}
+# fetch_engines: mu300-extra install vpn through the download window; the window is closed again however this ends
+# (done, failed, timed out, or the service stopped with a signal)
+fetch_engines() {
+    trap "trap '' INT TERM HUP; trap - EXIT; fetch_close; exit 1" INT TERM HUP
+    trap 'fetch_close' EXIT
+    _deadline=$(( $(date +%s) + FETCH_TIME ))
+    if ! killswitch_fetch; then
+        trap - INT TERM HUP EXIT; fetch_close; return 1
+    fi
+    fetch_allow "$FETCH_TIME"
+    # in the background and waited for, so a signal is handled at once rather than after the download
+    "$EXTRA_CMD" install vpn >&2 &
+    _c=$!; FETCH_PIDS=$_c
+    # looks the addresses up again while the download runs, and ends the download at the deadline; stops by
+    # itself when this script is gone
+    _me=$$
+    ( trap - EXIT; while kill -0 "$_me" 2>/dev/null; do
+        sleep "$FETCH_REFRESH"; _left=$(( _deadline - $(date +%s) ))
+        [ "$_left" -gt 0 ] || { echo "the download took longer than ${FETCH_TIME}s" >&2; kill_tree "$_c"; exit 0; }
+        fetch_allow "$_left" >/dev/null 2>&1
+    done ) &
+    FETCH_PIDS="$FETCH_PIDS $!"
+    _rc=0; wait "$_c" || _rc=$?
+    # the install is over (and reaped: its pid may be another process's by now); a signal from here on would
+    # cut the close short, so they wait until it is done
+    FETCH_PIDS=${FETCH_PIDS#"$_c"}
+    trap '' INT TERM HUP; trap - EXIT
+    fetch_close || _rc=1
+    trap - INT TERM HUP
+    return "$_rc"
 }
 
 # json_str VALUE : JSON string literal
@@ -412,12 +522,33 @@ table inet mu300_vpn {
 }
 NFT
 }
-# only the clients' part of the kill switch: nothing is forwarded to the modem, the device's own traffic goes out
-killswitch_clients() {
+# The download window (see fetch_engines): the full kill switch, plus the device's own DNS to the resolvers in
+# dns4/dns6 and its HTTP(S) to the addresses in fetch4/fetch6, each for a limited time; clients' DNS to the device is dropped, so dnsmasq does not
+# carry their lookups out meanwhile. Replaced in one transaction, as killswitch_on is, so there is never a moment
+# without either.
+killswitch_fetch() {
     nft -f - <<NFT
 table inet mu300_vpn
 delete table inet mu300_vpn
 table inet mu300_vpn {
+    set dns4 { type ipv4_addr; flags timeout; }
+    set dns6 { type ipv6_addr; flags timeout; }
+    set fetch4 { type ipv4_addr; flags timeout; }
+    set fetch6 { type ipv6_addr; flags timeout; }
+    chain output {
+        type filter hook output priority filter - 5; policy accept;
+        oifname "sipa_eth*" meta mark $MARK accept
+        oifname "sipa_eth*" udp dport 123 accept
+        oifname "sipa_eth*" ip daddr @dns4 meta l4proto { tcp, udp } th dport 53 accept
+        oifname "sipa_eth*" ip6 daddr @dns6 meta l4proto { tcp, udp } th dport 53 accept
+        oifname "sipa_eth*" ip daddr @fetch4 tcp dport { 80, 443 } accept
+        oifname "sipa_eth*" ip6 daddr @fetch6 tcp dport { 80, 443 } accept
+        oifname "sipa_eth*" counter drop
+    }
+    chain input {
+        type filter hook input priority filter - 5; policy accept;
+        iifname != "lo" meta l4proto { tcp, udp } th dport 53 drop
+    }
     chain forward {
         type filter hook forward priority filter - 5; policy accept;
         oifname "sipa_eth*" counter drop
@@ -475,17 +606,36 @@ case "${1:-status}" in
     gen) gen ;;
     run)
         [ "$ENABLE" = 1 ] || { echo "VPN disabled (ENABLE=0 in $CONF)"; killswitch_off; exit 0; }
+        # The kill switch goes up before anything that can fail: no engines, a failed or corrupt download, a config
+        # that does not check, an engine that will not start or dies later - every one of them leaves it up. It is
+        # replaced in one nft transaction, so a restart never has a moment without it. Only ENABLE=0 and mu300-vpn
+        # off take it down; the service stop leaves it, so a stopped or crashed engine never leaks.
+        if [ "$KILL_SWITCH" = 1 ]; then killswitch_on || { echo "could not put up the kill switch" >&2; exit 1; }; fi
         ensure_engines || exit 1
+        if [ "$_engine" = xray ] && [ "$ENGINE" = sing-box ] && [ "$KILL_SWITCH" = 1 ]; then
+            # Xray pins the certificate of a link that asks for allowInsecure; sing-box would not check it at all
+            case "$VLESS_URI" in *[?\&]allowInsecure=1*|*[?\&]allowInsecure=true*)
+                echo "the kill switch needs sing-box, and sing-box would accept any certificate for this link" \
+                    "(allowInsecure), where xray pins it: not started, the kill switch stays up. Use a link that" \
+                    "verifies the certificate, or KILL_SWITCH=0." >&2
+                exit 1 ;;
+            esac
+            echo "ENGINE=xray cannot start behind the kill switch: running sing-box instead" >&2
+        fi
+        if [ "$ENGINE" = xray ] && [ "$KILL_SWITCH" = 1 ]; then
+            # pick_engines takes sing-box for this whenever it is there; without it the kill switch stays up
+            echo "the kill switch needs ENGINE=sing-box (xray cannot start behind it), and sing-box is not installed:" \
+                "the kill switch stays up. Install the vpn extra (mu300-extra install vpn), or set KILL_SWITCH=0." >&2
+            exit 1
+        fi
         [ "$ENGINE" = xray ] || gen >/dev/null
         ensure_firewall_zone
-        if [ "$ENGINE" = xray ] && [ "$KILL_SWITCH" = 1 ]; then
-            # see ENGINE above: with the kill switch on, this engine could never come up, and the device would be
-            # left with no connection at all
-            echo "the kill switch is not supported with ENGINE=xray yet: running without it (ENGINE=sing-box has it)" >&2
-            killswitch_off
-        elif [ "$KILL_SWITCH" = 1 ]; then killswitch_on; else killswitch_off; fi
+        [ "$KILL_SWITCH" = 1 ] || killswitch_off
         [ "$ENGINE" = xray ] && run_xray
         exec "$BIN" run -c "$RUN/config.json" ;;
+    # guard: before the modem's bearer comes up (mobile-data calls it), so a VPN with the kill switch is never
+    # without it at boot, before the service has started
+    guard) if [ "$ENABLE" = 1 ] && [ "$KILL_SWITCH" = 1 ]; then killswitch_on; fi ;;
     off) killswitch_off; echo "kill switch removed"; routing_cleanup ;;
     status)
         echo "engine: $ENGINE  enabled: $ENABLE  kill switch: $KILL_SWITCH ($(nft list table inet mu300_vpn >/dev/null 2>&1 && echo active || echo inactive))"
@@ -497,5 +647,5 @@ case "${1:-status}" in
     engines)
         for e in "$XRAY" "$HEV" "$BIN"; do printf '%s %s\n' "$e" "$([ -x "$e" ] && echo ok || echo missing)"; done
         engines_ok || { echo "$MISSING" >&2; exit 1; } ;;
-    *) echo "usage: $0 gen|run|off|status|engines" >&2; exit 2 ;;
+    *) echo "usage: $0 gen|run|guard|off|status|engines" >&2; exit 2 ;;
 esac
