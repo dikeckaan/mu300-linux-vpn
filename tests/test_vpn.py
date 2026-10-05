@@ -389,28 +389,33 @@ class KillSwitch(ShellTest):
     def test_a_signal_mid_download_closes_the_window(self):
         for shell in self.each_shell():
             for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
-                self.fresh()
-                self.extra_cmd(install='hang')
-                self.conf.write_text(self.conf_ks())
-                p = subprocess.Popen(shell + [str(BIN / 'mu300-vpn'), 'run'], env=self.env(**self.envs()),
-                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
-                try:
-                    self.wait_for(self.tmp / 'started')
-                    self.assertIn('fetch4', self.state.read_text())
-                    t = time.monotonic()
-                    # only the script itself is signalled, as procd does (systemd signals the whole group)
-                    os.kill(p.pid, sig)
-                    _, err = p.communicate(timeout=10)
-                    self.assertLess(time.monotonic() - t, 5, 'waited for the download')
-                    self.assertNotEqual(p.returncode, 0)
-                    self.assertClosed((sig, err))
-                    # the refresher is gone with it: nothing is opened again afterwards
-                    n = len(self.events())
-                    time.sleep(2.5)
-                    self.assertEqual(len(self.events()), n, self.events()[n:])
-                    self.assertClosed(sig)
-                finally:
-                    self.reap(p)
+                with self.subTest(sig=sig.name):
+                    self.fresh()
+                    self.extra_cmd(install='hang')
+                    self.conf.write_text(self.conf_ks())
+                    # a shell cannot trap a signal that was ignored when it started (POSIX), and test runners can start
+                    # us with SIGINT/SIGHUP ignored (GitHub's macOS runner does): the script gets the defaults, as from
+                    # systemd or procd
+                    p = subprocess.Popen(shell + [str(BIN / 'mu300-vpn'), 'run'], env=self.env(**self.envs()),
+                                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True,
+                                         preexec_fn=self.default_signals)
+                    try:
+                        self.wait_for(self.tmp / 'started')
+                        self.assertIn('fetch4', self.state.read_text())
+                        t = time.monotonic()
+                        # only the script itself is signalled, as procd does (systemd signals the whole group)
+                        os.kill(p.pid, sig)
+                        _, err = p.communicate(timeout=10)
+                        self.assertLess(time.monotonic() - t, 5, 'waited for the download')
+                        self.assertNotEqual(p.returncode, 0)
+                        self.assertClosed((sig, err))
+                        # the refresher is gone with it: nothing is opened again afterwards
+                        n = len(self.events())
+                        time.sleep(2.5)
+                        self.assertEqual(len(self.events()), n, self.events()[n:])
+                        self.assertClosed(sig)
+                    finally:
+                        self.reap(p)
 
     def test_sigkill_mid_download_leaves_only_what_runs_out(self):
         # SIGKILL cannot be caught: the window stays, but every allowance in it has a timeout, and the refresher
@@ -561,6 +566,11 @@ class KillSwitch(ShellTest):
             r = self.sh(shell, f'. "{BIN}/mu300-vpn"; fetch_hosts', **self.envs(
                 MU300_LIB=1, MU300_RELEASE_URL='http://a;b}/x', FETCH_HOSTS='github.com'))
             self.assertEqual(r.stdout.split(), ['github.com'])
+
+    @staticmethod
+    def default_signals():
+        for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+            signal.signal(sig, signal.SIG_DFL)
 
     def reap(self, p):
         try:
