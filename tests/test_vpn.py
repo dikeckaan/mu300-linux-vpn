@@ -113,6 +113,13 @@ class Vpn(ShellTest):
             tun = cfg['inbounds'][0]
             self.assertEqual(tun['type'], 'tun')
             self.assertEqual(tun['route_exclude_address'], ['192.168.77.0/24', '192.168.78.0/24'])
+            # LAN clients' traffic to private addresses is refused, not sent out "direct" around the tunnel: that
+            # would put them on the network of the uplink (the Wi-Fi client's home LAN, the carrier's), past the
+            # isolation wifi-client keeps without the VPN. The device's own private traffic still goes direct.
+            rules = cfg['route']['rules']
+            rej = {'source_ip_cidr': ['192.168.77.0/24', '192.168.78.0/24'], 'ip_is_private': True, 'action': 'reject'}
+            self.assertIn(rej, rules)
+            self.assertLess(rules.index(rej), rules.index({'ip_is_private': True, 'outbound': 'direct'}))
             self.assertEqual(cfg['outbounds'][0]['server'], 'vpn.example.com')
             self.assertIn('check -c', (self.tmp / 'sb.args').read_text())
 
