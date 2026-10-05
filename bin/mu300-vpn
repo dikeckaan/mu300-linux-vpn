@@ -300,8 +300,8 @@ gen_singbox() {
     [ -n "$UPSTREAM_HTTP_PROXY" ] && printf ',{"type":"http","tag":"upstream","server":%s,"server_port":%s}' "$(json_str "${UPSTREAM_HTTP_PROXY%:*}")" "${UPSTREAM_HTTP_PROXY##*:}"
     printf ',{"type":"direct","tag":"direct"}],\n'
     # A LAN client's packet to a private address is refused rather than sent "direct": direct leaves outside the
-    # tunnel, onto the uplink's own network (the Wi-Fi client's home LAN, the carrier's), which wifi-client keeps
-    # LAN clients off when the VPN is off. The LAN itself never comes in here (route_exclude_address).
+    # tunnel, onto the uplink's own network (the Wi-Fi client's home LAN; wifi-client keeps LAN clients off it
+    # when the VPN is off too). The LAN itself never comes in here (route_exclude_address).
     printf '"route":{"rules":[{"action":"sniff"},{"protocol":"dns","action":"hijack-dns"},{"source_ip_cidr":%s,"ip_is_private":true,"action":"reject"},{"ip_is_private":true,"outbound":"direct"}],' "$excl"
     printf '"final":"proxy","auto_detect_interface":true,"default_mark":%d,"default_domain_resolver":"bootstrap"}}\n' "$MARK"
     } > "$RUN/config.json"
