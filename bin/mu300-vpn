@@ -157,30 +157,42 @@ fetch_close() {
 # fetch_engines: mu300-extra install vpn through the download window; the window is closed again however this ends
 # (done, failed, timed out, or the service stopped with a signal)
 fetch_engines() {
-    trap "trap '' INT TERM HUP; trap - EXIT; fetch_close; exit 1" INT TERM HUP
+    # A signal only sets a flag; the loop below sees it within a second and closes the window outside the trap.
+    # Doing the work in the trap, or waiting on the download itself, depended on the shell: bash 3.2 can take a
+    # signal that arrives just before "wait" blocks only after the child has ended, and could exit from inside
+    # the trap before the close was done.
+    FETCH_SIG=
+    trap 'FETCH_SIG=1' INT TERM HUP
     trap 'fetch_close' EXIT
     _deadline=$(( $(date +%s) + FETCH_TIME ))
     if ! killswitch_fetch; then
         trap - INT TERM HUP EXIT; fetch_close; return 1
     fi
     fetch_allow "$FETCH_TIME"
-    # in the background and waited for, so a signal is handled at once rather than after the download
     "$EXTRA_CMD" install vpn >&2 &
     _c=$!; FETCH_PIDS=$_c
     # looks the addresses up again while the download runs, and ends the download at the deadline; stops by
     # itself when this script is gone
     _me=$$
-    ( trap - EXIT; while kill -0 "$_me" 2>/dev/null; do
+    ( trap - EXIT INT TERM HUP; while kill -0 "$_me" 2>/dev/null; do
         sleep "$FETCH_REFRESH"; _left=$(( _deadline - $(date +%s) ))
         [ "$_left" -gt 0 ] || { echo "the download took longer than ${FETCH_TIME}s" >&2; kill_tree "$_c"; exit 0; }
         fetch_allow "$_left" >/dev/null 2>&1
     done ) &
     FETCH_PIDS="$FETCH_PIDS $!"
-    _rc=0; wait "$_c" || _rc=$?
-    # the install is over (and reaped: its pid may be another process's by now); a signal from here on would
-    # cut the close short, so they wait until it is done
-    FETCH_PIDS=${FETCH_PIDS#"$_c"}
+    while [ -z "$FETCH_SIG" ] && kill -0 "$_c" 2>/dev/null; do
+        sleep 1 & _s=$!
+        wait "$_s" 2>/dev/null; kill "$_s" 2>/dev/null
+    done
+    # from here on a signal would cut the close short: it waits until the close is done
     trap '' INT TERM HUP; trap - EXIT
+    if [ -n "$FETCH_SIG" ]; then
+        fetch_close
+        exit 1
+    fi
+    # the install is over: its status, and its pid out of the list (it may be another process's by now)
+    _rc=0; wait "$_c" || _rc=$?
+    FETCH_PIDS=${FETCH_PIDS#"$_c"}
     fetch_close || _rc=1
     trap - INT TERM HUP
     return "$_rc"
