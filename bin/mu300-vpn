@@ -6,7 +6,8 @@
 #   ENGINE=sing-box  sing-box with its own TUN inbound (gvisor stack, see FINDINGS 26b)
 #   mu300-vpn gen       build the engine's config under /run/mu300-vpn from vpn.conf and check it
 #   mu300-vpn run       gen + kill switch + run the engine in the foreground (used by the service)
-#   mu300-vpn guard     put the kill switch up if the VPN is on with it (mobile-data, before the bearer is up)
+#   mu300-vpn guard     put the kill switch up if the VPN is on with it (mobile-data and wifi-client, before
+#                       their uplink is up)
 #   mu300-vpn off       remove the kill switch (the service stop does not, so a crash never leaks),
 #                       and any routing an engine left behind if it is no longer running
 #   mu300-vpn status    service, tunnel, exit IP
@@ -15,6 +16,9 @@ set -e
 CONF=${MU300_VPN_CONF:-/etc/mu300/vpn.conf}
 RUN=${MU300_VPN_RUN:-/run/mu300-vpn}   # (MU300_VPN_RUN, MU300_LAN_CONF, MU300_BIN, MU300_LIB: for tests/)
 MARK=0x2d0           # routing mark on the engine's own connections: they bypass the tunnel and the kill switch
+# The uplinks the kill switch closes: the modem's bearer (sipa_eth*) and the Wi-Fi client (wifi-client), which is
+# shared with the LAN as mobile data is. As the hotspot, wlan0 is a port of br-lan and never an output interface.
+WIFI_IF=${MU300_WIFI_IFACE:-wlan0}
 [ -r "$CONF" ] && . "$CONF"
 ENABLE=${ENABLE:-0}; KILL_SWITCH=${KILL_SWITCH:-1}; REMOTE_DNS=${REMOTE_DNS:-1.1.1.1}
 # only 0 turns the kill switch off: a value that is not understood (yes, true, a typo) leaves it on
@@ -516,6 +520,8 @@ gen() {
     case "$ENGINE" in xray) gen_xray ;; *) gen_singbox ;; esac
 }
 
+# Everything unmarked that would leave on an uplink is dropped, for the device and its clients; on the Wi-Fi
+# client, its DHCP renewals still go out: they keep the address the engine's own connection leaves from.
 killswitch_on() {
     nft -f - <<NFT
 table inet mu300_vpn
@@ -526,10 +532,15 @@ table inet mu300_vpn {
         oifname "sipa_eth*" meta mark $MARK accept
         oifname "sipa_eth*" udp dport 123 accept
         oifname "sipa_eth*" counter drop
+        oifname "$WIFI_IF" meta mark $MARK accept
+        oifname "$WIFI_IF" udp dport 123 accept
+        oifname "$WIFI_IF" udp sport 68 udp dport 67 accept
+        oifname "$WIFI_IF" counter drop
     }
     chain forward {
         type filter hook forward priority filter - 5; policy accept;
         oifname "sipa_eth*" counter drop
+        oifname "$WIFI_IF" counter drop
     }
 }
 NFT
@@ -556,6 +567,14 @@ table inet mu300_vpn {
         oifname "sipa_eth*" ip daddr @fetch4 tcp dport { 80, 443 } accept
         oifname "sipa_eth*" ip6 daddr @fetch6 tcp dport { 80, 443 } accept
         oifname "sipa_eth*" counter drop
+        oifname "$WIFI_IF" meta mark $MARK accept
+        oifname "$WIFI_IF" udp dport 123 accept
+        oifname "$WIFI_IF" udp sport 68 udp dport 67 accept
+        oifname "$WIFI_IF" ip daddr @dns4 meta l4proto { tcp, udp } th dport 53 accept
+        oifname "$WIFI_IF" ip6 daddr @dns6 meta l4proto { tcp, udp } th dport 53 accept
+        oifname "$WIFI_IF" ip daddr @fetch4 tcp dport { 80, 443 } accept
+        oifname "$WIFI_IF" ip6 daddr @fetch6 tcp dport { 80, 443 } accept
+        oifname "$WIFI_IF" counter drop
     }
     chain input {
         type filter hook input priority filter - 5; policy accept;
@@ -564,6 +583,7 @@ table inet mu300_vpn {
     chain forward {
         type filter hook forward priority filter - 5; policy accept;
         oifname "sipa_eth*" counter drop
+        oifname "$WIFI_IF" counter drop
     }
 }
 NFT
