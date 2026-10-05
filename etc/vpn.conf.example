@@ -8,7 +8,8 @@ VLESS_URI=""
 # unset: xray, or sing-box when KILL_SWITCH=1
 ENGINE=xray
 # 1: nothing leaves through the cellular interface except the tunnel itself (also while the tunnel is down).
-# Only works with ENGINE=sing-box for now; with xray it is ignored, with a warning.
+# It needs sing-box: with ENGINE=xray, sing-box runs instead (and without sing-box the kill switch stays up and
+# nothing goes out). Missing engines are downloaded through it: only the device, only to the release hosts.
 KILL_SWITCH=0
 # DNS for the device and its clients, resolved through the tunnel
 REMOTE_DNS=1.1.1.1
