@@ -1,6 +1,7 @@
 """mu300-vpn, sourced for its functions (MU300_LIB=1): the VLESS URI parser, JSON helpers, which networks stay out of
 the tunnel, and the sing-box config it writes. Ubuntu and OpenWrt both run it (dash, bash, busybox ash)."""
 import json
+import shutil
 import unittest
 
 from helpers import BIN, ShellTest
@@ -109,6 +110,93 @@ class Vpn(ShellTest):
             self.assertEqual(tun['route_exclude_address'], ['192.168.77.0/24', '192.168.78.0/24'])
             self.assertEqual(cfg['outbounds'][0]['server'], 'vpn.example.com')
             self.assertIn('check -c', (self.tmp / 'sb.args').read_text())
+
+
+class Engines(ShellTest):
+    """where mu300-vpn finds its engines: the vpn extra on the Linux partition first, an older image's own second;
+    and what it does when there are none"""
+
+    def setUp(self):
+        super().setUp()
+        self.conf = self.tmp / 'vpn.conf'
+        self.disk = self.tmp / 'disk'
+        self.opt = self.tmp / 'opt'
+        (self.opt / 'bin').mkdir(parents=True)
+        self.extra = self.disk / 'extra/vpn/bin'
+        self.stub('ip', 'exit 0')
+
+    def put(self, d, names):
+        d.mkdir(parents=True, exist_ok=True)
+        for n in names:
+            (d / n).write_text('#!/bin/sh\n')
+            (d / n).chmod(0o755)
+
+    def vpn(self, shell, code, conf='ENABLE=1\nENGINE=xray\n', **env):
+        self.conf.write_text(conf)
+        e = dict(MU300_LIB=1, MU300_VPN_CONF=self.conf, MU300_VPN_RUN=self.tmp / 'run-vpn', MU300_BIN=BIN,
+                 MU300_LAN_CONF=self.tmp / 'no-lan.conf', MU300_OPT=self.opt, MU300_DISK=self.disk,
+                 MU300_EXTRA_CMD=self.stubs / 'extra')
+        e.update(env)
+        return self.sh(shell, f'. "{BIN}/mu300-vpn"; {code}', **e)
+
+    def reset(self):
+        shutil.rmtree(self.disk, ignore_errors=True)
+        shutil.rmtree(self.opt / 'bin')
+        (self.opt / 'bin').mkdir()
+
+    def test_the_extra_comes_first(self):
+        names = ('xray', 'hev-socks5-tunnel', 'sing-box')
+        for shell in self.each_shell():
+            self.reset()
+            self.put(self.opt / 'bin', names)
+            r = self.vpn(shell, 'echo "$XRAY $HEV $BIN"')
+            self.assertEqual(r.stdout.split(), [str(self.opt / 'bin' / n) for n in names])
+            self.put(self.extra, names)
+            r = self.vpn(shell, 'echo "$XRAY $HEV $BIN"; engines_ok && echo OK')
+            self.assertEqual(r.stdout.split(), [str(self.extra / n) for n in names] + ['OK'])
+            # vpn.conf may name its own
+            r = self.vpn(shell, 'echo "$XRAY"', conf='ENABLE=1\nXRAY=/x/xray\n')
+            self.assertEqual(r.stdout.strip(), '/x/xray')
+
+    def test_missing_engines_are_reported(self):
+        for shell in self.each_shell():
+            self.reset()
+            r = self.vpn(shell, 'engines_ok && echo OK || echo "$MISSING"')
+            self.assertEqual(r.stdout.strip(), 'the VPN engines are not installed: run mu300-extra install vpn')
+            r = self.vpn(shell, '(gen) && echo rc=0 || echo rc=1')
+            self.assertIn('mu300-extra install vpn', r.stderr)
+            self.assertNotIn('rc=0', r.stdout)
+
+    def test_a_configured_vpn_gets_its_engines_back(self):
+        for shell in self.each_shell():
+            for adopt_ok, install_ok, want in ((True, False, 'adopt'), (False, True, 'adopt install'),
+                                               (False, False, 'adopt install')):
+                self.reset()
+                (self.tmp / 'calls').unlink(missing_ok=True)
+                self.stub('extra', f'echo "$1" >> "$STUBLOG/calls"; '
+                                   f'case $1 in adopt) ok={int(adopt_ok)} ;; install) ok={int(install_ok)} ;; esac; '
+                                   f'[ $ok = 1 ] || exit 1; d="{self.extra}"; mkdir -p "$d"; '
+                                   'for n in xray hev-socks5-tunnel sing-box; do printf "#!/bin/sh\\n" > "$d/$n"; chmod 755 "$d/$n"; done')
+                r = self.vpn(shell, 'ensure_engines && echo rc=0 || echo rc=1; echo "$XRAY"')
+                self.assertEqual((self.tmp / 'calls').read_text().split(), want.split(), (adopt_ok, install_ok))
+                if adopt_ok or install_ok:
+                    self.assertEqual(r.stdout.split()[-2:], ['rc=0', str(self.extra / 'xray')], r.stderr)
+                else:
+                    self.assertIn('rc=1', r.stdout)
+                    self.assertIn('mu300-extra install vpn', r.stderr)
+            # engines that are there: nothing is fetched
+            self.put(self.extra, ('xray', 'hev-socks5-tunnel', 'sing-box'))
+            (self.tmp / 'calls').unlink(missing_ok=True)
+            r = self.vpn(shell, 'ensure_engines && echo rc=0 || echo rc=1')
+            self.assertIn('rc=0', r.stdout)
+            self.assertFalse((self.tmp / 'calls').exists())
+
+    def test_run_gets_the_engines_before_anything_else(self):
+        src = (BIN / 'mu300-vpn').read_text()
+        run = src[src.index('    run)'):src.index('    off)')]
+        self.assertLess(run.index('ENABLE'), run.index('ensure_engines'))
+        self.assertLess(run.index('ensure_engines'), run.index('killswitch_on'))
+        self.assertLess(run.index('ensure_engines'), run.index('gen'))
 
 
 if __name__ == '__main__':

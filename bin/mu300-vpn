@@ -9,6 +9,7 @@
 #   mu300-vpn off       remove the kill switch (the service stop does not, so a crash never leaks),
 #                       and any routing an engine left behind if it is no longer running
 #   mu300-vpn status    service, tunnel, exit IP
+#   mu300-vpn engines   which engine programs it uses (the vpn extra: mu300-extra install vpn)
 set -e
 CONF=${MU300_VPN_CONF:-/etc/mu300/vpn.conf}
 RUN=${MU300_VPN_RUN:-/run/mu300-vpn}   # (MU300_VPN_RUN, MU300_LAN_CONF, MU300_BIN, MU300_LIB: for tests/)
@@ -31,14 +32,44 @@ case ",${LAN_CIDRS:-}," in *",$own,"*) ;; *) LAN_CIDRS=${LAN_CIDRS:+$LAN_CIDRS,}
 # fetched with openssl - both unmarked. sing-box does its bootstrap lookup on its own marked socket, so it works
 # there. An update keeps vpn.conf, and older ones say KILL_SWITCH=1: they stay on sing-box, which is what they ran.
 if [ -z "${ENGINE:-}" ]; then [ "$KILL_SWITCH" = 1 ] && ENGINE=sing-box || ENGINE=xray; fi
-XRAY=${XRAY:-/opt/mu300/bin/xray}; HEV=${HEV:-/opt/mu300/bin/hev-socks5-tunnel}
-BIN=${SING_BOX:-/opt/mu300/bin/sing-box}
 SOCKS_PORT=10808
-# an image built before the xray engine existed has only sing-box: keep working with what is there
-if [ "$ENGINE" = xray ] && { [ ! -x "$XRAY" ] || [ ! -x "$HEV" ]; }; then
-    [ -x "$BIN" ] && { echo "xray engine not installed, using sing-box" >&2; ENGINE=sing-box; }
-fi
-case "$ENGINE" in xray) TUN=xtun ;; *) TUN=sbtun ;; esac
+# The engines are not part of the images: they are the vpn extra, on the Linux partition (mu300-extra install vpn).
+# Images from before the extra carry them in /opt/mu300/bin, which is the second place to look. XRAY, HEV and
+# SING_BOX (in vpn.conf or the environment) name other programs. (MU300_OPT, MU300_DISK, MU300_EXTRA_CMD: tests/)
+OPTBIN=${MU300_OPT:-/opt/mu300}/bin
+VPN_EXTRA=${MU300_DISK:-/mnt/mu300-disk}/extra/vpn/bin
+EXTRA_CMD=${MU300_EXTRA_CMD:-$OPTBIN/mu300-extra}
+MISSING="the VPN engines are not installed: run mu300-extra install vpn"
+engine() {
+    for _p in "$VPN_EXTRA/$1" "$OPTBIN/$1"; do [ -x "$_p" ] && { echo "$_p"; return 0; }; done
+    echo "$VPN_EXTRA/$1"
+}
+_engine=$ENGINE; _xray=${XRAY:-}; _hev=${HEV:-}; _sb=${SING_BOX:-}
+pick_engines() {
+    XRAY=${_xray:-$(engine xray)}; HEV=${_hev:-$(engine hev-socks5-tunnel)}; BIN=${_sb:-$(engine sing-box)}
+    ENGINE=$_engine
+    # an image built before the xray engine existed has only sing-box: keep working with what is there
+    if [ "$ENGINE" = xray ] && { [ ! -x "$XRAY" ] || [ ! -x "$HEV" ]; }; then
+        [ -x "$BIN" ] && { echo "xray engine not installed, using sing-box" >&2; ENGINE=sing-box; }
+    fi
+    case "$ENGINE" in xray) TUN=xtun ;; *) TUN=sbtun ;; esac
+}
+engines_ok() { case "$ENGINE" in xray) [ -x "$XRAY" ] && [ -x "$HEV" ] ;; *) [ -x "$BIN" ] ;; esac; }
+pick_engines
+
+# The VPN is on and there is no engine: a system updated from an image that carried them by a path that did not
+# bring the vpn extra along (an older updater or installer). Take the engines of the image it replaced, or download
+# the extra - before the kill switch, which would stop the download. A configured VPN comes back by itself.
+ensure_engines() {
+    engines_ok && return 0
+    echo "the VPN engines are not installed; getting the vpn extra" >&2
+    if { "$EXTRA_CMD" adopt vpn || "$EXTRA_CMD" install vpn; } >&2; then
+        pick_engines
+        engines_ok && return 0
+    fi
+    echo "$MISSING" >&2
+    return 1
+}
 
 # json_str VALUE : JSON string literal
 json_str() { printf '"%s"' "$(printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g')"; }
@@ -353,7 +384,10 @@ run_xray() {
     exit 1
 }
 
-gen() { case "$ENGINE" in xray) gen_xray ;; *) gen_singbox ;; esac; }
+gen() {
+    engines_ok || { echo "$MISSING" >&2; exit 1; }
+    case "$ENGINE" in xray) gen_xray ;; *) gen_singbox ;; esac
+}
 
 killswitch_on() {
     nft -f - <<NFT
@@ -423,6 +457,7 @@ case "${1:-status}" in
     gen) gen ;;
     run)
         [ "$ENABLE" = 1 ] || { echo "VPN disabled (ENABLE=0 in $CONF)"; killswitch_off; exit 0; }
+        ensure_engines || exit 1
         [ "$ENGINE" = xray ] || gen >/dev/null
         ensure_firewall_zone
         if [ "$ENGINE" = xray ] && [ "$KILL_SWITCH" = 1 ]; then
@@ -436,9 +471,13 @@ case "${1:-status}" in
     off) killswitch_off; echo "kill switch removed"; routing_cleanup ;;
     status)
         echo "engine: $ENGINE  enabled: $ENABLE  kill switch: $KILL_SWITCH ($(nft list table inet mu300_vpn >/dev/null 2>&1 && echo active || echo inactive))"
+        engines_ok || echo "$MISSING"
         ip -br addr show "$TUN" 2>/dev/null || echo "$TUN: down"
         if ip link show "$TUN" >/dev/null 2>&1; then
             printf 'exit IP: '; (wget -qO- -T 8 http://api.ipify.org 2>/dev/null || curl -s -m 8 http://api.ipify.org 2>/dev/null || echo unreachable); echo
         fi ;;
-    *) echo "usage: $0 gen|run|off|status" >&2; exit 2 ;;
+    engines)
+        for e in "$XRAY" "$HEV" "$BIN"; do printf '%s %s\n' "$e" "$([ -x "$e" ] && echo ok || echo missing)"; done
+        engines_ok || { echo "$MISSING" >&2; exit 1; } ;;
+    *) echo "usage: $0 gen|run|off|status|engines" >&2; exit 2 ;;
 esac
