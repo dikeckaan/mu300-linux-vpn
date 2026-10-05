@@ -59,15 +59,20 @@ pick_engines
 
 # The VPN is on and there is no engine: a system updated from an image that carried them by a path that did not
 # bring the vpn extra along (an older updater or installer). Take the engines of the image it replaced, or download
-# the extra - before the kill switch, which would stop the download. A configured VPN comes back by itself.
+# the extra. A configured VPN comes back by itself.
+#
+# The full kill switch would stop that download (the device's own traffic to the modem is dropped), and no kill
+# switch at all would let the clients out unprotected while it runs. So with KILL_SWITCH=1 the clients stay blocked
+# (killswitch_clients) and only the device itself goes out, to fetch the engines; when that fails the full kill
+# switch goes up, and the next start (the service restarts it) lowers it to the clients' part again for its try.
 ensure_engines() {
     engines_ok && return 0
     echo "the VPN engines are not installed; getting the vpn extra" >&2
-    if { "$EXTRA_CMD" adopt vpn || "$EXTRA_CMD" install vpn; } >&2; then
-        pick_engines
-        engines_ok && return 0
-    fi
+    if [ "$KILL_SWITCH" = 1 ]; then killswitch_clients; else killswitch_off; fi
+    "$EXTRA_CMD" adopt vpn >&2 && pick_engines && engines_ok && return 0
+    "$EXTRA_CMD" install vpn >&2 && pick_engines && engines_ok && return 0
     echo "$MISSING" >&2
+    if [ "$KILL_SWITCH" = 1 ]; then killswitch_on; fi
     return 1
 }
 
@@ -400,6 +405,19 @@ table inet mu300_vpn {
         oifname "sipa_eth*" udp dport 123 accept
         oifname "sipa_eth*" counter drop
     }
+    chain forward {
+        type filter hook forward priority filter - 5; policy accept;
+        oifname "sipa_eth*" counter drop
+    }
+}
+NFT
+}
+# only the clients' part of the kill switch: nothing is forwarded to the modem, the device's own traffic goes out
+killswitch_clients() {
+    nft -f - <<NFT
+table inet mu300_vpn
+delete table inet mu300_vpn
+table inet mu300_vpn {
     chain forward {
         type filter hook forward priority filter - 5; policy accept;
         oifname "sipa_eth*" counter drop

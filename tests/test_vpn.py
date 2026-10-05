@@ -124,6 +124,7 @@ class Engines(ShellTest):
         (self.opt / 'bin').mkdir(parents=True)
         self.extra = self.disk / 'extra/vpn/bin'
         self.stub('ip', 'exit 0')
+        self.stub('nft', '[ "$1" = -f ] && cat >> "$STUBLOG/nft"; echo "--- $*" >> "$STUBLOG/nft"')
 
     def put(self, d, names):
         d.mkdir(parents=True, exist_ok=True)
@@ -190,6 +191,46 @@ class Engines(ShellTest):
             r = self.vpn(shell, 'ensure_engines && echo rc=0 || echo rc=1')
             self.assertIn('rc=0', r.stdout)
             self.assertFalse((self.tmp / 'calls').exists())
+
+    def test_the_kill_switch_holds_the_clients_while_the_engines_are_fetched(self):
+        # KILL_SWITCH=1: clients stay blocked during the download, the device itself is let out to fetch; a failure
+        # leaves the full kill switch up (the next start lowers it again for its own try)
+        for shell in self.each_shell():
+            for install_ok in (True, False):
+                self.reset()
+                (self.tmp / 'nft').unlink(missing_ok=True)
+                (self.tmp / 'calls').unlink(missing_ok=True)
+                self.stub('extra', f'echo "$1" >> "$STUBLOG/calls"; [ "$1" = install ] && [ {int(install_ok)} = 1 ] || exit 1; '
+                                   f'd="{self.extra}"; mkdir -p "$d"; '
+                                   'for n in xray hev-socks5-tunnel sing-box; do printf "#!/bin/sh\n" > "$d/$n"; chmod 755 "$d/$n"; done')
+                conf = 'ENABLE=1\nENGINE=sing-box\nKILL_SWITCH=1\n'
+                r = self.vpn(shell, 'ensure_engines && echo rc=0 || echo rc=1', conf=conf)
+                tables = (self.tmp / 'nft').read_text().split('--- ')
+                first, last = tables[0], tables[-2] if len(tables) > 2 else tables[0]
+                self.assertIn('chain forward', first, shell)
+                self.assertNotIn('chain output', first, shell)
+                if install_ok:
+                    self.assertIn('rc=0', r.stdout, r.stderr)
+                    self.assertEqual(len(tables), 2, tables)
+                else:
+                    self.assertIn('rc=1', r.stdout)
+                    self.assertEqual(len(tables), 3, tables)
+                    self.assertIn('chain output', tables[1])
+            # KILL_SWITCH=0: no table is left up while fetching
+            self.reset()
+            (self.tmp / 'nft').unlink(missing_ok=True)
+            r = self.vpn(shell, 'ensure_engines; true', conf='ENABLE=1\nENGINE=sing-box\nKILL_SWITCH=0\n')
+            self.assertIn('delete table inet mu300_vpn', (self.tmp / 'nft').read_text())
+
+    def test_an_adopt_without_engines_still_downloads(self):
+        for shell in self.each_shell():
+            self.reset()
+            (self.tmp / 'calls').unlink(missing_ok=True)
+            self.stub('extra', f'echo "$1" >> "$STUBLOG/calls"; [ "$1" = adopt ] && exit 0; d="{self.extra}"; mkdir -p "$d"; '
+                               'for n in xray hev-socks5-tunnel sing-box; do printf "#!/bin/sh\n" > "$d/$n"; chmod 755 "$d/$n"; done')
+            r = self.vpn(shell, 'ensure_engines && echo rc=0 || echo rc=1')
+            self.assertEqual((self.tmp / 'calls').read_text().split(), ['adopt', 'install'])
+            self.assertIn('rc=0', r.stdout, r.stderr)
 
     def test_run_gets_the_engines_before_anything_else(self):
         src = (BIN / 'mu300-vpn').read_text()
