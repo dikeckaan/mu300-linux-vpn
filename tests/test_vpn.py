@@ -113,6 +113,13 @@ class Vpn(ShellTest):
             tun = cfg['inbounds'][0]
             self.assertEqual(tun['type'], 'tun')
             self.assertEqual(tun['route_exclude_address'], ['192.168.77.0/24', '192.168.78.0/24'])
+            # LAN clients' traffic to private addresses is refused, not sent out "direct" around the tunnel: that
+            # would put them on the network of the uplink (the Wi-Fi client's home LAN, the carrier's), past the
+            # isolation wifi-client keeps without the VPN. The device's own private traffic still goes direct.
+            rules = cfg['route']['rules']
+            rej = {'source_ip_cidr': ['192.168.77.0/24', '192.168.78.0/24'], 'ip_is_private': True, 'action': 'reject'}
+            self.assertIn(rej, rules)
+            self.assertLess(rules.index(rej), rules.index({'ip_is_private': True, 'outbound': 'direct'}))
             self.assertEqual(cfg['outbounds'][0]['server'], 'vpn.example.com')
             self.assertIn('check -c', (self.tmp / 'sb.args').read_text())
 
@@ -315,6 +322,11 @@ class KillSwitch(ShellTest):
         self.assertIn('chain forward', ruleset, msg)
         self.assertRegex(ruleset, r'chain output \{[^}]*oifname "sipa_eth\*" counter drop', msg)
         self.assertRegex(ruleset, r'chain forward \{[^}]*oifname "sipa_eth\*" counter drop', msg)
+        # the Wi-Fi client is an uplink too (wifi-client shares it with the LAN): the same for wlan0, except the
+        # device's DHCP to that network, which keeps the address the engine's own connection goes out on
+        self.assertRegex(ruleset, r'chain output \{[^}]*oifname "wlan0" udp sport 68 udp dport 67 accept'
+                                  r'[^}]*oifname "wlan0" counter drop', msg)
+        self.assertRegex(ruleset, r'chain forward \{[^}]*oifname "wlan0" counter drop', msg)
         self.assertNotIn('fetch', ruleset, msg)
         self.assertNotIn('dport 53', ruleset, msg)
 
@@ -359,6 +371,7 @@ class KillSwitch(ShellTest):
                 window = self.state.read_text()
                 # clients: everything to the modem dropped, and their DNS to the device too (dnsmasq would carry it)
                 self.assertRegex(window, r'chain forward \{[^}]*oifname "sipa_eth\*" counter drop')
+                self.assertRegex(window, r'chain forward \{[^}]*oifname "wlan0" counter drop')
                 self.assertRegex(window, r'chain input \{[^}]*iifname != "lo" meta l4proto \{ tcp, udp \} th dport 53 drop')
                 # the device: the engine's marked connections, NTP, DNS and the release hosts - everything else dropped
                 out = window.split('chain output {')[1].split('chain ')[0]
@@ -370,7 +383,15 @@ class KillSwitch(ShellTest):
                     'oifname "sipa_eth*" ip6 daddr @dns6 meta l4proto { tcp, udp } th dport 53 accept',
                     'oifname "sipa_eth*" ip daddr @fetch4 tcp dport { 80, 443 } accept',
                     'oifname "sipa_eth*" ip6 daddr @fetch6 tcp dport { 80, 443 } accept',
-                    'oifname "sipa_eth*" counter drop'])
+                    'oifname "sipa_eth*" counter drop',
+                    'oifname "wlan0" meta mark 0x2d0 accept',
+                    'oifname "wlan0" udp dport 123 accept',
+                    'oifname "wlan0" udp sport 68 udp dport 67 accept',
+                    'oifname "wlan0" ip daddr @dns4 meta l4proto { tcp, udp } th dport 53 accept',
+                    'oifname "wlan0" ip6 daddr @dns6 meta l4proto { tcp, udp } th dport 53 accept',
+                    'oifname "wlan0" ip daddr @fetch4 tcp dport { 80, 443 } accept',
+                    'oifname "wlan0" ip6 daddr @fetch6 tcp dport { 80, 443 } accept',
+                    'oifname "wlan0" counter drop'])
                 # every allowance runs out by itself
                 for name in ('dns4', 'dns6', 'fetch4', 'fetch6'):
                     self.assertIn('flags timeout', re.search(r'set %s \{[^}]*' % name, window).group(0))
