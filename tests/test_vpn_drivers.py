@@ -253,3 +253,157 @@ class Store(ShellTest):
             self.assertEqual(stat.S_IMODE(self.conf.stat().st_mode), 0o600)
             r = self.vpn(shell, 'echo "$ENABLE"')
             self.assertEqual(r.stdout.strip(), '1', r.stderr)
+
+
+class Contract(ShellTest):
+    """The driver loader and what every driver in /opt/mu300/lib/vpn provides; the routing the core installs for
+    drivers that leave it to the core (DRV_ROUTES=core); and the resolve window, which lets the device's own DNS out
+    past the kill switch for as long as server names are looked up."""
+
+    def setUp(self):
+        super().setUp()
+        self.conf = self.tmp / 'vpn.conf'
+        self.conf.write_text('ENABLE=1\nKILL_SWITCH=1\n')
+        self.ev = self.tmp / 'events'
+        self.rules = self.tmp / 'rules'
+
+    def vpn(self, shell, code, **env):
+        e = dict(MU300_LIB=1, MU300_VPN_CONF=self.conf, MU300_VPN_RUN=self.tmp / 'run', MU300_VPN_LIB=LIB,
+                 MU300_LAN_CONF=self.tmp / 'no', MU300_BIN=BIN, MU300_OPT=self.tmp / 'opt',
+                 MU300_DISK=self.tmp / 'disk')
+        e.update(env)
+        return self.sh(shell, f'. "{BIN}/mu300-vpn"; {code}', **e)
+
+    def test_reserved_types(self):
+        self.stub('ip', 'exit 0')
+        for shell in self.each_shell():
+            for t in ('l2tp', 'pptp', 'ikev2', 'tailscale-exit'):
+                r = self.vpn(shell, f'load_driver {t}; echo LOADED')
+                self.assertNotEqual(r.returncode, 0, t)
+                self.assertNotIn('LOADED', r.stdout)
+                self.assertIn(f'{t}: not available in this version', r.stderr)
+            # nothing but a name of [a-z-] ever becomes a path, and a type without a driver is refused too
+            for t in ('../x', 'x/y', 'X', '', 'nosuch'):
+                r = self.vpn(shell, f"load_driver '{t}'; echo LOADED")
+                self.assertNotEqual(r.returncode, 0, t)
+                self.assertNotIn('LOADED', r.stdout, t)
+
+    def test_every_driver_defines_the_contract(self):
+        self.stub('ip', 'exit 0')
+        names = sorted(p.stem for p in LIB.glob('*.sh') if p.name != 'uri.sh' and not p.name.startswith('common'))
+        self.assertIn('xray', names)
+        self.assertIn('sing-box', names)
+        funcs = 'drv_engines drv_engines_ok drv_check drv_gen drv_start drv_alive drv_stop drv_status drv_import'
+        for shell in self.each_shell():
+            for n in names:
+                r = self.vpn(shell, f'load_driver {n}; for f in {funcs}; do command -v "$f" >/dev/null || '
+                                    'echo "missing $f"; done; echo "extra=[$DRV_EXTRA] routes=$DRV_ROUTES"')
+                self.assertEqual(r.returncode, 0, (n, r.stderr))
+                self.assertNotIn('missing', r.stdout, n)
+                self.assertRegex(r.stdout, r'routes=(core|self)\n', n)
+
+    # the Tailscale ip stub of test_vpn: rules kept as the kernel lists them
+    IP = ('r="$STUBLOG/rules"; touch "$r"\n'
+          'case "$1 $2" in\n'
+          '  "rule add") shift 2; [ "$1" = pref ] || exit 2; grep -qxF "$*" "$r" && exit 2\n'
+          '      [ -e "$STUBLOG/fail-$2" ] && exit 2; echo "$*" >> "$r" ;;\n'
+          '  "rule del") [ "$3" = pref ] || exit 2\n'
+          '      awk -v p="$4" \'!d && $2 == p {d = 1; next} {print} END {exit !d}\' "$r" > "$r.new" || { rm -f "$r.new"; exit 2; }\n'
+          '      mv "$r.new" "$r" ;;\n'
+          '  "rule show") sort -s -n -k2,2 "$r" | sed "s/^pref \\([0-9]*\\) /\\1: /" ;;\n'
+          '  "link show") [ -e "$STUBLOG/tun" ]; exit ;;\n'
+          'esac\nexit 0')
+
+    def test_core_routes(self):
+        self.stub('ip', self.IP)
+        self.stub('nft', '[ "$1" = -f ] && cat > /dev/null; exit 0')
+        for shell in self.each_shell():
+            self.rules.unlink(missing_ok=True)
+            r = self.vpn(shell, 'TUN=wg-mu300; mkdir -p "$RUN"; '
+                                "printf '203.0.113.9\\n198.51.100.1\\n' > \"$RUN/server-ip\"; routes_up")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            rules = self.rules.read_text().splitlines()
+            for want in ('pref 9000 fwmark 0x2d0 lookup main', 'pref 9002 to 203.0.113.9 lookup main',
+                         'pref 9002 to 198.51.100.1 lookup main', 'pref 9010 lookup 2022'):
+                self.assertIn(want, rules)
+            r = self.vpn(shell, 'TUN=wg-mu300; routes_down')
+            self.assertEqual(r.returncode, 0, r.stderr)
+            left = [l for l in self.rules.read_text().splitlines() if 9000 <= int(l.split()[1]) <= 9010]
+            self.assertEqual(left, [])
+
+    def test_resolve_window(self):
+        # the KillSwitch nft stub of test_vpn: the ruleset in force, and every call in order
+        self.stub('nft', 'case "$1" in\n'
+                         '  -f) r=$(cat); printf "%s\\n" "$r" > "$STUBLOG/nft.state.new"; mv "$STUBLOG/nft.state.new" "$STUBLOG/nft.state"\n'
+                         '      { echo "nft -f"; printf "%s\\n" "$r" | sed "s/^/  | /"; } >> "$STUBLOG/events" ;;\n'
+                         '  list) [ -s "$STUBLOG/nft.state" ] ;;\n'
+                         '  *) echo "nft $*" >> "$STUBLOG/events"\n'
+                         '     [ "$*" = "delete table inet mu300_vpn" ] && : > "$STUBLOG/nft.state"; exit 0 ;;\n'
+                         'esac')
+        self.stub('getent', '[ "$2" = srv.example ] && echo "203.0.113.5     STREAM srv.example"; exit 0')
+        self.stub('ip', 'exit 0')
+        (self.tmp / 'resolv.conf').write_text('nameserver 127.0.0.53\nnameserver 10.177.0.34\n')
+        for shell in self.each_shell():
+            for code in ('resolve_window; vpn_resolve srv.example; resolve_close',
+                         # by itself it opens and closes the window around the lookup
+                         'vpn_resolve srv.example'):
+                self.ev.unlink(missing_ok=True)
+                r = self.vpn(shell, code, MU300_RESOLV_FILES=self.tmp / 'resolv.conf')
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertEqual(r.stdout.strip(), '203.0.113.5')
+                ev = self.ev.read_text()
+                sets = ev.split('nft -f\n')[1:]
+                self.assertEqual(len(sets), 2, ev)
+                window, full = ('\n'.join(l[4:] for l in s.splitlines() if l.startswith('  | ')) for s in sets)
+                self.assertIn('@dns4', window)
+                self.assertNotIn('dns4', full)
+                self.assertNotIn('fetch4', full)
+                adds = [l for l in ev.splitlines() if l.startswith('nft add element')]
+                self.assertTrue(any('dns4 { 10.177.0.34 timeout 30s }' in a for a in adds), adds)
+                self.assertFalse(any('fetch' in a for a in adds), adds)
+                self.assertNotIn('nft delete table', ev)
+            # without the kill switch there is nothing to open
+            self.ev.unlink(missing_ok=True)
+            self.conf.write_text('ENABLE=1\nKILL_SWITCH=0\n')
+            r = self.vpn(shell, 'vpn_resolve srv.example', MU300_RESOLV_FILES=self.tmp / 'resolv.conf')
+            self.conf.write_text('ENABLE=1\nKILL_SWITCH=1\n')
+            self.assertEqual(r.stdout.strip(), '203.0.113.5')
+            self.assertFalse(self.ev.exists())
+
+    def test_xray_runs_in_the_core_loop(self):
+        # xray and hev-socks5-tunnel as stubs: the core routes the tunnel once both are up, keeps $RUN/iface while
+        # it is, and takes it all down when one of them exits
+        self.stub('ip', self.IP)
+        self.stub('nft', '[ "$1" = -f ] && cat > /dev/null; exit 0')
+        self.stub('ss', 'echo "LISTEN 0 4096 127.0.0.1:10808 0.0.0.0:*"')
+        self.stub('getent', '[ "$2" = vpn.example.com ] && echo "203.0.113.9     STREAM vpn.example.com"; exit 0')
+        self.stub('pgrep', 'exit 1')
+        d = self.tmp / 'disk/extra/vpn/bin'
+        d.mkdir(parents=True)
+        (d / 'xray').write_text('#!/bin/sh\n[ "$2" = -test ] && exit 0\n'
+                                'n=0; until [ -e "$MU300_VPN_RUN/iface" ] || [ $n -gt 100 ]; do sleep 0.1; n=$((n+1)); done\n'
+                                'cp "$STUBLOG/rules" "$STUBLOG/rules-up"; cp "$MU300_VPN_RUN/iface" "$STUBLOG/iface-up"\n'
+                                'echo "[Warning] gone"\n')
+        (d / 'hev-socks5-tunnel').write_text('#!/bin/sh\nexec sleep 30\n')
+        for n in ('xray', 'hev-socks5-tunnel'):
+            (d / n).chmod(0o755)
+        (self.tmp / 'tun').write_text('')
+        uri = 'vless://11111111-2222-3333-4444-555555555555@vpn.example.com:443?security=tls&type=tcp'
+        for shell in self.each_shell():
+            for p in ('rules', 'rules-up', 'iface-up'):
+                (self.tmp / p).unlink(missing_ok=True)
+            self.conf.write_text(f"ENABLE=1\nENGINE=xray\nKILL_SWITCH=0\nVLESS_URI='{uri}'\n")
+            r = self.script(shell, BIN / 'mu300-vpn', 'run', MU300_VPN_CONF=self.conf, MU300_VPN_RUN=self.tmp / 'run',
+                            MU300_VPN_LIB=LIB, MU300_LAN_CONF=self.tmp / 'no', MU300_BIN=BIN,
+                            MU300_OPT=self.tmp / 'opt', MU300_DISK=self.tmp / 'disk')
+            self.assertEqual(r.returncode, 1, r.stderr)
+            self.assertIn('tunnel up on xtun', r.stdout)
+            self.assertIn('[Warning] gone', r.stdout)
+            self.assertIn('xray exited, tearing the tunnel down', r.stderr)
+            self.assertNotIn('11111111', r.stdout + r.stderr)
+            up = (self.tmp / 'rules-up').read_text().splitlines()
+            self.assertIn('pref 9002 to 203.0.113.9 lookup main', up)
+            self.assertIn('pref 9010 lookup 2022', up)
+            self.assertEqual((self.tmp / 'iface-up').read_text().strip(), 'xtun')
+            self.assertEqual([l for l in self.rules.read_text().splitlines() if l.split()[1] >= '9000'], [])
+            self.assertFalse((self.tmp / 'run/iface').exists())

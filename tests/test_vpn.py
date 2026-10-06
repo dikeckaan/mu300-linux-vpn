@@ -9,7 +9,7 @@ import subprocess
 import time
 import unittest
 
-from helpers import BIN, ShellTest
+from helpers import BIN, LIB, ShellTest
 
 
 class Vpn(ShellTest):
@@ -30,7 +30,7 @@ class Vpn(ShellTest):
         (self.tmp / 'br-lan').write_text(brlan or '')
         return self.sh(shell, f'. "{BIN}/mu300-vpn"; {code}', MU300_LIB=1, MU300_VPN_CONF=self.conf,
                        MU300_VPN_RUN=self.tmp / 'run-vpn', MU300_LAN_CONF=self.tmp / 'no-lan.conf',
-                       MU300_BIN=BIN, MU300_SYSROOT=self.root)
+                       MU300_BIN=BIN, MU300_SYSROOT=self.root, MU300_VPN_LIB=LIB)
 
     def test_own_lan_always_local(self):
         cases = [
@@ -94,11 +94,11 @@ class Vpn(ShellTest):
     def test_outbound_json(self):
         for shell in self.each_shell():
             for uri, _ in self.URIS:
-                r = self.vpn(shell, f"VLESS_URI='{uri}'; UPSTREAM_HTTP_PROXY=; parse_uri; outbound_json")
+                r = self.vpn(shell, f"VLESS_URI='{uri}'; UPSTREAM_HTTP_PROXY=; parse_uri; load_driver sing-box; outbound_json")
                 o = json.loads(r.stdout)
                 self.assertEqual(o['type'], 'vless')
                 self.assertIsInstance(o['server_port'], int)
-            r = self.vpn(shell, f"VLESS_URI='{self.URIS[1][0]}'; UPSTREAM_HTTP_PROXY=; parse_uri; outbound_json")
+            r = self.vpn(shell, f"VLESS_URI='{self.URIS[1][0]}'; UPSTREAM_HTTP_PROXY=; parse_uri; load_driver sing-box; outbound_json")
             o = json.loads(r.stdout)
             self.assertEqual(o['tls']['reality'], {'enabled': True, 'public_key': 'KEY', 'short_id': 'ab'})
             self.assertEqual(o['transport'], {'type': 'grpc', 'service_name': 'svc'})
@@ -107,7 +107,7 @@ class Vpn(ShellTest):
         self.stub('sing-box', 'echo "$*" >> "$STUBLOG/sb.args"')
         conf = f"VLESS_URI='{self.URIS[0][0]}'\nLAN_CIDRS=192.168.77.0/24\nENGINE=sing-box\n"
         for shell in self.each_shell():
-            code = f'BIN="{self.stubs}/sing-box"; UPSTREAM_HTTP_PROXY=; gen_singbox'
+            code = f'load_driver sing-box; BIN="{self.stubs}/sing-box"; UPSTREAM_HTTP_PROXY=; gen_singbox'
             r = self.vpn(shell, code, conf, 'u30air', '192.168.78.1/24')
             self.assertEqual(r.returncode, 0, r.stderr)
             cfg = json.loads((self.tmp / 'run-vpn' / 'config.json').read_text())
@@ -149,7 +149,7 @@ class Engines(ShellTest):
         self.conf.write_text(conf)
         e = dict(MU300_LIB=1, MU300_VPN_CONF=self.conf, MU300_VPN_RUN=self.tmp / 'run-vpn', MU300_BIN=BIN,
                  MU300_LAN_CONF=self.tmp / 'no-lan.conf', MU300_OPT=self.opt, MU300_DISK=self.disk,
-                 MU300_EXTRA_CMD=self.stubs / 'extra')
+                 MU300_EXTRA_CMD=self.stubs / 'extra', MU300_VPN_LIB=LIB)
         e.update(env)
         return self.sh(shell, f'. "{BIN}/mu300-vpn"; {code}', **e)
 
@@ -296,7 +296,8 @@ class KillSwitch(ShellTest):
     def envs(self, **extra):
         e = dict(MU300_VPN_CONF=self.conf, MU300_VPN_RUN=self.tmp / 'run-vpn', MU300_BIN=BIN,
                  MU300_LAN_CONF=self.tmp / 'no-lan.conf', MU300_OPT=self.opt, MU300_DISK=self.disk,
-                 MU300_EXTRA_CMD=self.stubs / 'extra', FETCH_REFRESH=1, MU300_RESOLV_FILES=self.tmp / 'resolv.conf')
+                 MU300_EXTRA_CMD=self.stubs / 'extra', FETCH_REFRESH=1, MU300_RESOLV_FILES=self.tmp / 'resolv.conf',
+                 MU300_VPN_LIB=LIB)
         e.update(extra)
         return e
 
@@ -647,7 +648,7 @@ class Tailscale(ShellTest):
     def envs(self, **extra):
         e = dict(MU300_VPN_CONF=self.conf, MU300_VPN_RUN=self.tmp / 'run-vpn', MU300_BIN=BIN,
                  MU300_LAN_CONF=self.tmp / 'no-lan.conf', MU300_OPT=self.tmp / 'opt', MU300_DISK=self.disk,
-                 MU300_EXTRA_CMD=self.stubs / 'extra')
+                 MU300_EXTRA_CMD=self.stubs / 'extra', MU300_VPN_LIB=LIB)
         e.update(extra)
         return e
 
@@ -693,19 +694,19 @@ class Tailscale(ShellTest):
         self.assertEqual(self.ours(), [])
         self.assertEqual([l for l in self.shown() if l.split()[1] < '9000'], self.TAILSCALED.splitlines())
 
-    def test_xray_routes_up_and_down(self):
+    def test_routes_up_and_down(self):
         for shell in self.each_shell():
             self.tailscaled()
-            r = self.lib(shell, 'xray_routes_up', self.conf_text('xray'))
+            r = self.lib(shell, 'routes_up', self.conf_text('xray'))
             self.assertEqual(r.returncode, 0, r.stderr)
             self.assertThrough(self.shown())
             self.assertIn('pref 9010 lookup 2022', self.shown())
-            # a restart (run_xray: down, then up), and up again: never doubled, never refused
-            r = self.lib(shell, 'xray_routes_down; xray_routes_up; tailscale_up', self.conf_text('xray'))
+            # a restart (the run: down, then up), and up again: never doubled, never refused
+            r = self.lib(shell, 'routes_down; routes_up; tailscale_up', self.conf_text('xray'))
             self.assertEqual(r.returncode, 0, r.stderr)
             self.assertNotIn('could not', r.stderr)
             self.assertThrough(self.shown())
-            r = self.lib(shell, 'xray_routes_down', self.conf_text('xray'))
+            r = self.lib(shell, 'routes_down', self.conf_text('xray'))
             self.assertEqual(r.returncode, 0, r.stderr)
             # gone with the routes; tailscaled's own rules stay
             self.assertGone()
@@ -747,7 +748,7 @@ class Tailscale(ShellTest):
     def test_tailscale_0_leaves_it_alone(self):
         for shell in self.each_shell():
             self.tailscaled()
-            r = self.lib(shell, 'xray_routes_up', self.conf_text('xray', 'TAILSCALE=0\n'))
+            r = self.lib(shell, 'routes_up', self.conf_text('xray', 'TAILSCALE=0\n'))
             self.assertEqual(r.returncode, 0, r.stderr)
             self.assertGone()
             self.assertIn('pref 9010 lookup 2022', self.shown())
@@ -763,7 +764,7 @@ class Tailscale(ShellTest):
             # anything else is on
             for v in ('1', 'yes', ''):
                 self.tailscaled()
-                self.lib(shell, 'xray_routes_up', self.conf_text('xray', f'TAILSCALE={v}\n'))
+                self.lib(shell, 'routes_up', self.conf_text('xray', f'TAILSCALE={v}\n'))
                 self.assertThrough(self.shown())
 
     def test_a_disabled_vpn_takes_it_away(self):
@@ -793,7 +794,7 @@ class Tailscale(ShellTest):
             self.stub('nft', '[ "$1" = -f ] && cat >> "$STUBLOG/nft"; exit 0')
             (self.tmp / 'nft').unlink(missing_ok=True)
             self.tailscaled()
-            r = self.lib(shell, 'killswitch_on; killswitch_fetch; xray_routes_up', self.conf_text('xray'))
+            r = self.lib(shell, 'killswitch_on; killswitch_fetch; routes_up', self.conf_text('xray'))
             self.assertEqual(r.returncode, 0, r.stderr)
             ruleset = (self.tmp / 'nft').read_text()
             self.assertNotIn('0x80000', ruleset)

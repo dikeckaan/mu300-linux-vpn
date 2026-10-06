@@ -5,8 +5,11 @@
 #   ENGINE=xray      Xray-core (the VLESS reference client) behind hev-socks5-tunnel, a small C program on a
 #                    plain kernel TUN - the default
 #   ENGINE=sing-box  sing-box with its own TUN inbound (gvisor stack, see FINDINGS 26b)
-#   mu300-vpn gen       build the engine's config under /run/mu300-vpn from vpn.conf and check it
+# The engines are drivers, one file per profile type in /opt/mu300/lib/vpn (load_driver); this script keeps the
+# kill switch, the routing, the store and the service's run loop.
+#   mu300-vpn gen       build the engine's config under /run/mu300-vpn from the active profile and check it
 #   mu300-vpn run       gen + kill switch + run the engine in the foreground (used by the service)
+#   mu300-vpn check [ID]  check a profile (the active one by default)
 #   mu300-vpn guard     put the kill switch up if the VPN is on with it (mobile-data and wifi-client, before
 #                       their uplink is up)
 #   mu300-vpn off       remove the kill switch (the service stop does not, so a crash never leaks),
@@ -17,12 +20,16 @@ set -e
 CONF=${MU300_VPN_CONF:-/etc/mu300/vpn.conf}
 RUN=${MU300_VPN_RUN:-/run/mu300-vpn}   # (MU300_VPN_RUN, MU300_LAN_CONF, MU300_BIN, MU300_LIB: for tests/)
 MARK=0x2d0           # routing mark on the engine's own connections: they bypass the tunnel and the kill switch
-TABLE=2022           # the tunnel's routing table: sing-box's auto_route default, and what xray_routes_up fills
+TABLE=2022           # the tunnel's routing table: sing-box's auto_route default, and what routes_up fills
 TS_MARK=0x80000/0xff0000   # Tailscale's mark on its own WireGuard, DERP and control connections (see tailscale_up)
 TS_PREFS='5198 5199 5200'  # the rule prefs that send them through the tunnel, before tailscaled's own 5210
 # The uplinks the kill switch closes: the modem's bearer (sipa_eth*) and the Wi-Fi client (wifi-client), which is
 # shared with the LAN as mobile data is. As the hotspot, wlan0 is a port of br-lan and never an output interface.
 WIFI_IF=${MU300_WIFI_IFACE:-wlan0}
+# The engine drivers and the link parser (MU300_VPN_LIB: tests). Read only when they are there: guard and off must
+# keep working on a system whose library is missing or damaged, since the kill switch depends on them.
+LIB=${MU300_VPN_LIB:-/opt/mu300/lib/vpn}
+if [ -r "$LIB/uri.sh" ]; then . "$LIB/uri.sh"; fi
 
 # ---- the store: profiles and settings under /etc/mu300/vpn --------------------------------------------------
 # vpn.conf stays THE switch (ENABLE), because mu300-update, the installers, wifi-client, mu300-extra, the dashboard
@@ -285,6 +292,20 @@ migrate_apply() {
     fi
     return 0
 }
+# profile_load ID: PDIR, PTYPE and PURI of that profile (ID already checked with valid_id)
+profile_load() {
+    PDIR=$PROFILES/$1; PTYPE=; PURI=
+    VLESS_URI=; ENGINE=; TLS_PIN_SHA256=; UPSTREAM_HTTP_PROXY=
+    kv_var PTYPE "$PDIR/meta" TYPE
+    # a link profile of the two engines the code below knows: what vpn.conf used to give it
+    case $PTYPE in xray|sing-box)
+        ENGINE=$PTYPE
+        if [ -r "$PDIR/uri" ]; then PURI=$(cat "$PDIR/uri"); fi
+        case $PURI in vless://*) VLESS_URI=$PURI ;; esac
+        kv_var TLS_PIN_SHA256 "$PDIR/meta" TLS_PIN_SHA256
+        kv_var UPSTREAM_HTTP_PROXY "$PDIR/meta" UPSTREAM_HTTP_PROXY ;;
+    esac
+}
 # Where the store cannot be used (not root, a read-only /etc), vpn.conf is read the way it always was: sourced,
 # its defaults filled in. Nothing is written and nothing is said about it.
 legacy_inmemory() {
@@ -309,19 +330,9 @@ if [ -d "$PROFILES" ] && [ -r "$SETTINGS" ]; then
     settings_load
     ACTIVE=$(cat "$ACTIVE_FILE" 2>/dev/null) || ACTIVE=
     { valid_id "$ACTIVE" && [ -d "$PROFILES/$ACTIVE" ]; } || ACTIVE=
-    PDIR=${ACTIVE:+$PROFILES/$ACTIVE}; PTYPE=; PURI=
+    PDIR=; PTYPE=; PURI=
     VLESS_URI=; ENGINE=; TLS_PIN_SHA256=; UPSTREAM_HTTP_PROXY=
-    if [ -n "$ACTIVE" ]; then
-        kv_var PTYPE "$PDIR/meta" TYPE
-        # a link profile of the two engines the code below knows: what vpn.conf used to give it
-        case $PTYPE in xray|sing-box)
-            ENGINE=$PTYPE
-            [ -r "$PDIR/uri" ] && PURI=$(cat "$PDIR/uri")
-            case $PURI in vless://*) VLESS_URI=$PURI ;; esac
-            kv_var TLS_PIN_SHA256 "$PDIR/meta" TLS_PIN_SHA256
-            kv_var UPSTREAM_HTTP_PROXY "$PDIR/meta" UPSTREAM_HTTP_PROXY ;;
-        esac
-    fi
+    if [ -n "$ACTIVE" ]; then profile_load "$ACTIVE"; fi
 else
     legacy_inmemory
 fi
@@ -349,19 +360,25 @@ case ",${LAN_CIDRS:-}," in *",$own,"*) ;; *) LAN_CIDRS=${LAN_CIDRS:+$LAN_CIDRS,}
 if [ -z "${ENGINE:-}" ]; then [ "$KILL_SWITCH" = 1 ] && ENGINE=sing-box || ENGINE=xray; fi
 SOCKS_PORT=10808
 # The engines are not part of the images: they are the vpn extra, on the Linux partition (mu300-extra install vpn).
-# Images from before the extra carry them in /opt/mu300/bin, which is the second place to look. XRAY, HEV and
-# SING_BOX (in vpn.conf or the environment) name other programs. (MU300_OPT, MU300_DISK, MU300_EXTRA_CMD: tests/)
+# Images from before the extra carry them in /opt/mu300/bin, which is the second place to look; engines that come
+# as packages (none of xray and sing-box) are found on PATH. XRAY, HEV and SING_BOX (in the settings, vpn.conf or
+# the environment) name other programs. (MU300_OPT, MU300_DISK, MU300_EXTRA_CMD: tests/)
 OPTBIN=${MU300_OPT:-/opt/mu300}/bin
-VPN_EXTRA=${MU300_DISK:-/mnt/mu300-disk}/extra/vpn/bin
+DISK=${MU300_DISK:-/mnt/mu300-disk}
 EXTRA_CMD=${MU300_EXTRA_CMD:-$OPTBIN/mu300-extra}
 MISSING="the VPN engines are not installed: run mu300-extra install vpn"
-engine() {
-    for _p in "$VPN_EXTRA/$1" "$OPTBIN/$1"; do [ -x "$_p" ] && { echo "$_p"; return 0; }; done
-    echo "$VPN_EXTRA/$1"
+# engine_path NAME [EXTRA]: the first of the extra's bin (when there is one), /opt/mu300/bin and PATH that has the
+# program; else where the extra would put it (or /opt/mu300/bin without an extra), so a message can name a path
+engine_path() {
+    _ex=; [ -z "${2:-}" ] || _ex=$DISK/extra/$2/bin/$1
+    for _p in $_ex "$OPTBIN/$1"; do [ -x "$_p" ] && { echo "$_p"; return 0; }; done
+    if _p=$(command -v "$1" 2>/dev/null); then case $_p in /*) [ -x "$_p" ] && { echo "$_p"; return 0; } ;; esac; fi
+    echo "${_ex:-$OPTBIN/$1}"
 }
 _engine=$ENGINE
 pick_engines() {
-    XRAY=${_xray:-$(engine xray)}; HEV=${_hev:-$(engine hev-socks5-tunnel)}; BIN=${_sb:-$(engine sing-box)}
+    XRAY=${_xray:-$(engine_path xray vpn)}; HEV=${_hev:-$(engine_path hev-socks5-tunnel vpn)}
+    BIN=${_sb:-$(engine_path sing-box vpn)}
     ENGINE=$_engine
     # an image built before the xray engine existed has only sing-box: keep working with what is there
     if [ "$ENGINE" = xray ] && { [ ! -x "$XRAY" ] || [ ! -x "$HEV" ]; }; then
@@ -370,9 +387,41 @@ pick_engines() {
     # xray cannot start behind the kill switch (see ENGINE above): sing-box, which can, is what runs then. It is
     # never run without it.
     if [ "$ENGINE" = xray ] && [ "$KILL_SWITCH" = 1 ] && [ -x "$BIN" ]; then ENGINE=sing-box; fi
-    case "$ENGINE" in xray) TUN=xtun ;; *) TUN=sbtun ;; esac
+    # (a loaded driver names its own tunnel)
+    [ -n "$DRIVER" ] || case "$ENGINE" in xray) TUN=xtun ;; *) TUN=sbtun ;; esac
 }
 engines_ok() { case "$ENGINE" in xray) [ -x "$XRAY" ] && [ -x "$HEV" ] ;; *) [ -x "$BIN" ] ;; esac; }
+
+# ---- engine drivers -------------------------------------------------------------------------------------------
+# One file per profile type in $LIB, defining drv_engines, drv_engines_ok, drv_check, drv_gen, drv_start, drv_alive,
+# drv_stop, drv_status and drv_import (see the spec's table), and DRV_EXTRA, the extra that carries its engines
+# (empty: they are packages, which the service never installs). Until one is loaded - no active profile - the vpn
+# extra's engines for ENGINE are what gen, ensure_engines and status check, as before profiles existed.
+DRIVER=; DRV_EXTRA=vpn; DRV_PKG=; DRV_ROUTES=core; DRV_FOREGROUND=0; DRV_PIDS=; DRV_GONE=
+drv_engines_ok() { engines_ok; }
+drv_status() { :; }
+drv_poll() { :; }
+# load_driver TYPE: that type's driver sourced. The type becomes a path, so only [a-z-] gets that far; the types
+# reserved for later versions say so.
+load_driver() {
+    case $1 in
+        l2tp|pptp|ikev2|tailscale-exit) echo "$1: not available in this version" >&2; return 1 ;;
+        *[!a-z-]*|'') echo "not a profile type" >&2; return 1 ;;
+    esac
+    [ -r "$LIB/$1.sh" ] || { echo "$1: no driver for this profile type ($LIB/$1.sh)" >&2; return 1; }
+    _drv=$1
+    # what a driver does not set is the default; drv_status and drv_poll are optional
+    DRV_ROUTES=core; DRV_FOREGROUND=0; TUN=; DRV_PIDS=; DRV_EXTRA=; DRV_PKG=; DRV_GONE=
+    drv_status() { :; }
+    drv_poll() { :; }
+    . "$LIB/$_drv.sh"
+    DRIVER=$_drv
+}
+# the messages for engines that are not there
+engines_missing() {
+    if [ -n "$DRV_EXTRA" ]; then echo "the VPN engines are not installed: run mu300-extra install $DRV_EXTRA" >&2
+    else echo "the $PTYPE engine is not installed: run mu300-vpn engines install $PTYPE" >&2; fi
+}
 pick_engines
 
 # The VPN is on and there is no engine: a system updated from an image that carried them by a path that did not
@@ -383,16 +432,19 @@ pick_engines
 # the download. It is not taken down for it: adopting needs no network, and the download gets a narrow window
 # (fetch_engines) - the device's own connections to the release hosts, nothing forwarded, for FETCH_TIME seconds at
 # most - which closes back to the full kill switch on every way out, success or not.
+#
+# Packages (a driver with no DRV_EXTRA) are never installed by the service: it fails closed with the command to run.
 ensure_engines() {
-    engines_ok && return 0
-    echo "the VPN engines are not installed; getting the vpn extra" >&2
-    "$EXTRA_CMD" adopt vpn >&2 && pick_engines && engines_ok && return 0
+    drv_engines_ok && return 0
+    [ -n "$DRV_EXTRA" ] || { engines_missing; return 1; }
+    echo "the VPN engines are not installed; getting the $DRV_EXTRA extra" >&2
+    "$EXTRA_CMD" adopt "$DRV_EXTRA" >&2 && pick_engines && drv_engines_ok && return 0
     if [ "$KILL_SWITCH" = 1 ]; then
-        fetch_engines && pick_engines && engines_ok && return 0
+        fetch_engines && pick_engines && drv_engines_ok && return 0
     else
-        "$EXTRA_CMD" install vpn >&2 && pick_engines && engines_ok && return 0
+        "$EXTRA_CMD" install "$DRV_EXTRA" >&2 && pick_engines && drv_engines_ok && return 0
     fi
-    echo "$MISSING" >&2
+    engines_missing
     return 1
 }
 
@@ -427,10 +479,10 @@ fetch_resolvers() {
     for _f in $RESOLV_FILES; do [ -r "$_f" ] && awk '$1 == "nameserver" {print $2}' "$_f"; done |
         grep -v -e '^127\.' -e '^::1$' -e '^0\.' | sort -u
 }
-# fetch_allow SECONDS: the release hosts' current addresses (and the resolvers), open for that long
-fetch_allow() {
+# dns_allow SECONDS: the device's own DNS to its resolvers, open for that long
+dns_allow() {
     [ "$1" -gt 0 ] 2>/dev/null || return 0
-    _v4=; _v6=; _d4=; _d6=
+    _d4=; _d6=
     for _a in $(fetch_resolvers); do
         case $_a in
             *:*) case $_a in *[!0-9A-Fa-f:.]*) ;; *) _d6="$_d6${_d6:+, }$_a timeout $1s" ;; esac ;;
@@ -440,6 +492,12 @@ fetch_allow() {
     done
     [ -z "$_d4" ] || nft add element inet mu300_vpn dns4 "{ $_d4 }" 2>/dev/null || true
     [ -z "$_d6" ] || nft add element inet mu300_vpn dns6 "{ $_d6 }" 2>/dev/null || true
+}
+# fetch_allow SECONDS: the release hosts' current addresses (and the resolvers), open for that long
+fetch_allow() {
+    [ "$1" -gt 0 ] 2>/dev/null || return 0
+    dns_allow "$1"
+    _v4=; _v6=
     for _a in $(for _h in $(fetch_hosts); do resolve_all "$_h"; done | sort -u); do
         case $_a in
             *[!0-9.]*) case $_a in *:*) case $_a in *[!0-9A-Fa-f:.]*) ;; *) _v6="$_v6${_v6:+, }$_a timeout $1s" ;; esac ;; esac ;;
@@ -466,8 +524,8 @@ fetch_close() {
     for _s in dns4 dns6 fetch4 fetch6; do nft flush set inet mu300_vpn "$_s" 2>/dev/null; done
     return 1
 }
-# fetch_engines: mu300-extra install vpn through the download window; the window is closed again however this ends
-# (done, failed, timed out, or the service stopped with a signal)
+# fetch_engines: mu300-extra install (the driver's extra) through the download window; the window is closed again
+# however this ends (done, failed, timed out, or the service stopped with a signal)
 fetch_engines() {
     # A signal only sets a flag; the loop below sees it within a second and closes the window outside the trap.
     # Doing the work in the trap, or waiting on the download itself, depended on the shell: bash 3.2 can take a
@@ -481,7 +539,7 @@ fetch_engines() {
         trap - INT TERM HUP EXIT; fetch_close; return 1
     fi
     fetch_allow "$FETCH_TIME"
-    "$EXTRA_CMD" install vpn >&2 &
+    "$EXTRA_CMD" install "$DRV_EXTRA" >&2 &
     _c=$!; FETCH_PIDS=$_c
     # looks the addresses up again while the download runs, and ends the download at the deadline; stops by
     # itself when this script is gone
@@ -510,120 +568,9 @@ fetch_engines() {
     return "$_rc"
 }
 
-# json_str VALUE : JSON string literal
-json_str() { printf '"%s"' "$(printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g')"; }
-# json_list "a,b,c" : JSON array of strings
-json_list() { printf '%s' "$1" | awk -F, '{printf "["; for (i = 1; i <= NF; i++) { gsub(/"/, "\\\"", $i); printf "%s\"%s\"", (i > 1 ? "," : ""), $i } printf "]"}'; }
-hex2dec() { printf '%d' "0x$1"; }
-# busybox awk has no hex string conversion: decode %XX with printf instead
-urldecode() {
-    rest=$1; out=
-    while :; do
-        case "$rest" in
-            *%[0-9A-Fa-f][0-9A-Fa-f]*)
-                pre=${rest%%%*}; tail=${rest#*%}; hh=$(printf '%s' "$tail" | cut -c1-2); rest=$(printf '%s' "$tail" | cut -c3-)
-                out="$out$pre$(printf "\\$(printf '%03o' "$(hex2dec "$hh")")")" ;;
-            *) out="$out$rest"; break ;;
-        esac
-    done
-    printf '%s' "$out"
-}
-param() { printf '%s' "$QUERY" | tr '&' '\n' | sed -n "s/^$1=//p" | head -n1; }
-
-parse_uri() {
-    u=$VLESS_URI
-    case "$u" in vless://*) ;; *) echo "VLESS_URI must start with vless://" >&2; exit 1 ;; esac
-    u=${u#vless://}; u=${u%%#*}
-    case "$u" in *\?*) QUERY=${u#*\?}; u=${u%%\?*} ;; *) QUERY= ;; esac
-    UUID=$(urldecode "${u%%@*}"); hp=${u#*@}; hp=${hp%/}
-    case "$hp" in
-        \[*\]:*) HOST=${hp#\[}; HOST=${HOST%%\]*}; PORT=${hp##*:} ;;
-        *:*) HOST=${hp%:*}; PORT=${hp##*:} ;;
-        *) HOST=$hp; PORT=443 ;;
-    esac
-    TYPE=$(param type); TYPE=${TYPE:-tcp}
-    SECURITY=$(param security); SECURITY=${SECURITY:-none}
-    SNI=$(urldecode "$(param sni)"); [ -n "$SNI" ] || SNI=$(urldecode "$(param peer)")
-    FP=$(param fp); ALPN=$(urldecode "$(param alpn)"); FLOW=$(param flow)
-    INSECURE=$(param allowInsecure); PBK=$(param pbk); SID=$(param sid)
-    WSPATH=$(urldecode "$(param path)"); WSHOST=$(urldecode "$(param host)"); SVC=$(urldecode "$(param serviceName)")
-    [ -n "$UUID" ] && [ -n "$HOST" ] || { echo "cannot parse VLESS_URI" >&2; exit 1; }
-}
-
-outbound_json() {
-    printf '{"type":"vless","tag":"proxy","server":%s,"server_port":%s,"uuid":%s' "$(json_str "$HOST")" "$PORT" "$(json_str "$UUID")"
-    [ -n "$FLOW" ] && printf ',"flow":%s' "$(json_str "$FLOW")"
-    printf ',"packet_encoding":"xudp","domain_resolver":"bootstrap"'
-    [ -n "$UPSTREAM_HTTP_PROXY" ] && printf ',"detour":"upstream"'
-    case "$SECURITY" in
-        tls|reality)
-            printf ',"tls":{"enabled":true,"server_name":%s' "$(json_str "${SNI:-$HOST}")"
-            case "$INSECURE" in 1|true) printf ',"insecure":true' ;; esac
-            # h3 (QUIC) does not apply to VLESS over TCP
-            ALPN=$(printf '%s' "$ALPN" | awk -F, '{n = 0; for (i = 1; i <= NF; i++) if ($i != "h3") printf "%s%s", (n++ ? "," : ""), $i}')
-            [ -n "$ALPN" ] && printf ',"alpn":%s' "$(json_list "$ALPN")"
-            [ -n "$FP" ] && printf ',"utls":{"enabled":true,"fingerprint":%s}' "$(json_str "$FP")"
-            [ "$SECURITY" = reality ] && printf ',"reality":{"enabled":true,"public_key":%s,"short_id":%s}' "$(json_str "$PBK")" "$(json_str "$SID")"
-            printf '}' ;;
-    esac
-    case "$TYPE" in
-        ws) printf ',"transport":{"type":"ws","path":%s' "$(json_str "${WSPATH:-/}")"; [ -n "$WSHOST" ] && printf ',"headers":{"Host":%s}' "$(json_str "$WSHOST")"; printf '}' ;;
-        grpc) printf ',"transport":{"type":"grpc","service_name":%s}' "$(json_str "$SVC")" ;;
-        httpupgrade) printf ',"transport":{"type":"httpupgrade","path":%s' "$(json_str "${WSPATH:-/}")"; [ -n "$WSHOST" ] && printf ',"host":%s' "$(json_str "$WSHOST")"; printf '}' ;;
-        tcp|raw) ;;
-        *) echo "transport type '$TYPE' is not supported by this helper" >&2; exit 1 ;;
-    esac
-    printf '}'
-}
-
-gen_singbox() {
-    [ -n "$VLESS_URI" ] || { echo "VLESS_URI is not set in $CONF" >&2; exit 1; }
-    parse_uri
-    mkdir -p "$RUN"; chmod 700 "$RUN"
-    excl=$(json_list "$LAN_CIDRS")
-    {
-    printf '{"log":{"level":"warn","timestamp":false},\n'
-    printf '"dns":{"servers":[{"type":"tcp","tag":"remote","server":%s,"detour":"proxy"},' "$(json_str "$REMOTE_DNS")"
-    # the VPN server name is looked up via BOOTSTRAP_DNS (directly, or over TCP through UPSTREAM_HTTP_PROXY)
-    if [ -n "$UPSTREAM_HTTP_PROXY" ]; then
-        printf '{"type":"tcp","tag":"bootstrap","server":%s,"detour":"upstream"}],' "$(json_str "$BOOTSTRAP_DNS")"
-    else
-        printf '{"type":"udp","tag":"bootstrap","server":%s}],' "$(json_str "$BOOTSTRAP_DNS")"
-    fi
-    # IPv6 through the tunnel only when the server side has it: otherwise programs prefer the (dead) IPv6 route and
-    # every connection to a dual-stack host fails first, so DNS answers only A records and the TUN gets no IPv6 address
-    if [ "$IPV6" = 1 ]; then strategy=prefer_ipv4; addrs='"172.19.0.1/30","fdfe:dcba:9876::1/126"'
-    else strategy=ipv4_only; addrs='"172.19.0.1/30"'; fi
-    printf '"final":"remote","strategy":"%s"},\n' "$strategy"
-    # "stack":"gvisor", not the default system stack. On this device's 5.4 vendor kernel the system stack
-    # takes the connection off the tun and then drops it: sing-box logs one "router: pre-match => sniff" and
-    # nothing more, the client gets an RST ("Connection refused", or uclient-fetch's "Operation not permitted")
-    # and not a single packet reaches an outbound. DNS still worked, which is what made it look like a routing
-    # or firewall problem for so long. The warning it prints on startup is the same story from the other end:
-    # "inbound/tun[tun-in]: enable offload: set udp offload: TUNSETOFFLOAD: invalid argument" - the kernel does
-    # not have what that stack expects. gvisor carries its own TCP/IP and does not care.
-    printf '"inbounds":[{"type":"tun","tag":"tun-in","stack":"gvisor","interface_name":"%s","address":[%s],"mtu":1400,' "$TUN" "$addrs"
-    printf '"auto_route":true,"strict_route":true,"route_exclude_address":%s}],\n' "$excl"
-    printf '"outbounds":['; outbound_json
-    [ -n "$UPSTREAM_HTTP_PROXY" ] && printf ',{"type":"http","tag":"upstream","server":%s,"server_port":%s}' "$(json_str "${UPSTREAM_HTTP_PROXY%:*}")" "${UPSTREAM_HTTP_PROXY##*:}"
-    printf ',{"type":"direct","tag":"direct"}],\n'
-    # A LAN client's packet to a private address is refused rather than sent "direct": direct leaves outside the
-    # tunnel, onto the uplink's own network (the Wi-Fi client's home LAN; wifi-client keeps LAN clients off it
-    # when the VPN is off too). The LAN itself never comes in here (route_exclude_address).
-    printf '"route":{"rules":[{"action":"sniff"},{"protocol":"dns","action":"hijack-dns"},{"source_ip_cidr":%s,"ip_is_private":true,"action":"reject"},{"ip_is_private":true,"outbound":"direct"}],' "$excl"
-    printf '"final":"proxy","auto_detect_interface":true,"default_mark":%d,"default_domain_resolver":"bootstrap"}}\n' "$MARK"
-    } > "$RUN/config.json"
-    chmod 600 "$RUN/config.json"
-    "$BIN" check -c "$RUN/config.json"
-}
-
-# ---- xray engine ----------------------------------------------------------------------------------------------
-# Xray does VLESS and nothing else here; hev-socks5-tunnel owns the TUN and hands every TCP/UDP flow to Xray's
-# SOCKS port on loopback. Neither installs routes, so this script does, with the same rule prefs and table as
-# sing-box's auto_route - which is what lets routing_cleanup and the kill switch serve both engines.
 
 # first IPv4 address for a name, from the system resolver. Runs before any rule points into the tunnel, so the
-# answer comes over the plain bearer.
+# answer comes over the plain bearer (through the resolve window behind the kill switch: vpn_resolve).
 resolve4() {
     case "$1" in *[!0-9.]*) ;; *) printf '%s' "$1"; return 0 ;; esac
     # glibc's getent on Ubuntu; OpenWrt has no getent but its busybox has nslookup (Ubuntu's image does not)
@@ -633,124 +580,86 @@ resolve4() {
         nslookup "$1" 2>/dev/null | awk '/^Name:/ {n = 1} n && /^Address/ {sub(/^Address( [0-9]+)?: */, ""); if ($0 ~ /^[0-9.]+$/) {print; exit}}'
     fi
 }
-listening() { { ss -ltn 2>/dev/null || netstat -ltn 2>/dev/null; } | grep -q "127.0.0.1:$1 "; }
 
-xray_stream_json() {
-    case "$TYPE" in tcp|raw) net=raw ;; ws|grpc|httpupgrade|xhttp) net=$TYPE ;;
-        *) echo "transport type '$TYPE' is not supported by this helper" >&2; exit 1 ;; esac
-    printf '"streamSettings":{"network":"%s"' "$net"
-    case "$TYPE" in
-        ws) printf ',"wsSettings":{"path":%s' "$(json_str "${WSPATH:-/}")"; [ -n "$WSHOST" ] && printf ',"host":%s' "$(json_str "$WSHOST")"; printf '}' ;;
-        grpc) printf ',"grpcSettings":{"serviceName":%s}' "$(json_str "$SVC")" ;;
-        httpupgrade) printf ',"httpupgradeSettings":{"path":%s' "$(json_str "${WSPATH:-/}")"; [ -n "$WSHOST" ] && printf ',"host":%s' "$(json_str "$WSHOST")"; printf '}' ;;
-        xhttp) printf ',"xhttpSettings":{"path":%s' "$(json_str "${WSPATH:-/}")"; [ -n "$WSHOST" ] && printf ',"host":%s' "$(json_str "$WSHOST")"
-               [ -n "$XMODE" ] && printf ',"mode":%s' "$(json_str "$XMODE")"; printf '}' ;;
-    esac
-    case "$SECURITY" in
-        tls)
-            printf ',"security":"tls","tlsSettings":{"serverName":%s' "$(json_str "${SNI:-$HOST}")"
-            # Xray 26 removed allowInsecure. Its replacement pins the one certificate the server presents,
-            # which is stricter: anything else is refused, including a correctly signed certificate for a
-            # different host. It also skips the expiry check, so an expired certificate keeps working until
-            # the server renews it - and then the pin has to change with it.
-            [ -n "$PIN" ] && printf ',"pinnedPeerCertSha256":%s' "$(json_str "$PIN")"
-            [ -n "$VCN" ] && printf ',"verifyPeerCertByName":%s' "$(json_str "$VCN")"
-            [ -n "$ALPN" ] && printf ',"alpn":%s' "$(json_list "$ALPN")"
-            [ -n "$FP" ] && printf ',"fingerprint":%s' "$(json_str "$FP")"
-            printf '}' ;;
-        reality)
-            printf ',"security":"reality","realitySettings":{"serverName":%s,"fingerprint":%s,"publicKey":%s,"shortId":%s' \
-                "$(json_str "${SNI:-$HOST}")" "$(json_str "${FP:-chrome}")" "$(json_str "$PBK")" "$(json_str "$SID")"
-            [ -n "$SPX" ] && printf ',"spiderX":%s' "$(json_str "$SPX")"
-            printf '}' ;;
-    esac
-    printf ',"sockopt":{"mark":%d}}' "$((MARK))"
+# ---- names behind the kill switch: the resolve window -----------------------------------------------------------
+# Server names are looked up before the tunnel exists, and with the kill switch up the device's own DNS is dropped
+# like everything else. For the lookups the download window's ruleset goes up with only its DNS sets filled - the
+# device's own resolvers, 30 s each - and the full kill switch comes back after: one nft transaction each way, never
+# a moment without either. Nothing is open for HTTP(S) meanwhile, and clients' DNS to the device is dropped. A run
+# killed with the window open leaves only allowances that run out by themselves. Only while the VPN is on: a "gen"
+# with it off must not put a kill switch up.
+RESOLVE_OPEN=
+resolve_window() {
+    [ "$ENABLE" = 1 ] && [ "$KILL_SWITCH" = 1 ] || return 0
+    killswitch_fetch >/dev/null || return 1
+    RESOLVE_OPEN=1
+    dns_allow 30 >/dev/null
 }
-
-# Xray 26 has no allowInsecure; pinnedPeerCertSha256 is its replacement. For a link that asks for allowInsecure the
-# pin is managed here: fetched once when there is none, kept in vpn.conf, and fetched again only when Xray reports
-# that the server's certificate no longer matches (a renewal). A pin that came from the link (pcs) or was written
-# by hand without allowInsecure is left alone.
-pin_managed() { [ "$SECURITY" = tls ] && case "$INSECURE" in 1|true) true ;; *) false ;; esac; }
-
-# SHA-256 of the leaf certificate the server presents, in the form Xray expects. Goes out directly: at start the
-# tunnel's rules are not in place yet, and while it runs rule 9002 keeps the server's address off the tunnel.
-fetch_pin() {
-    command -v openssl >/dev/null 2>&1 || { echo "fetching the server certificate needs openssl (OpenWrt: apk add openssl-util)" >&2; return 1; }
-    t=; command -v timeout >/dev/null 2>&1 && t="timeout 20"
-    h=$($t openssl s_client -connect "$SERVER_IP:$PORT" -servername "${SNI:-$HOST}" </dev/null 2>/dev/null |
-        openssl x509 -outform DER 2>/dev/null | sha256sum | cut -d' ' -f1)
-    # the hash of nothing is what an empty pipe produces when the handshake failed
-    case "$h" in ""|e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855) return 1 ;; esac
-    printf '%s' "$h"
+# back to the full kill switch; if even that fails, at least nothing of the window stays open
+resolve_close() {
+    [ -n "$RESOLVE_OPEN" ] || return 0
+    RESOLVE_OPEN=
+    killswitch_on >/dev/null && return 0
+    for _s in dns4 dns6 fetch4 fetch6; do nft flush set inet mu300_vpn "$_s" 2>/dev/null; done
+    return 1
 }
-
-# the pin goes where the link is: the active profile's meta, or vpn.conf when the store is not used
-save_pin() {
-    if [ -n "$ACTIVE" ]; then kv_set "$PDIR/meta" TLS_PIN_SHA256 "$1"; return; fi
-    if grep -q '^TLS_PIN_SHA256=' "$CONF"; then sed -i "s/^TLS_PIN_SHA256=.*/TLS_PIN_SHA256=$1/" "$CONF"
-    else printf '# fetched by mu300-vpn: the VPN server certificate, standing in for allowInsecure (Xray 26)\nTLS_PIN_SHA256=%s\n' "$1" >> "$CONF"; fi
-}
-
-gen_xray() {
-    [ -n "$VLESS_URI" ] || { echo "VLESS_URI is not set in $CONF" >&2; exit 1; }
-    parse_uri
-    XMODE=$(param mode); SPX=$(urldecode "$(param spx)"); ENC=$(urldecode "$(param encryption)")
-    # pcs/vcn are the share-link spellings of pinnedPeerCertSha256/verifyPeerCertByName; TLS_PIN_SHA256 in
-    # vpn.conf is for links written before those existed
-    PIN=${TLS_PIN_SHA256:-$(urldecode "$(param pcs)")}; VCN=$(urldecode "$(param vcn)")
-    # the name is looked up now and Xray is given the address, so it never has to resolve anything itself - the
-    # resolver it would use sits behind the tunnel it is trying to build. The name stays as the SNI.
-    SERVER_IP=$(resolve4 "$HOST")
-    [ -n "$SERVER_IP" ] || { echo "cannot resolve the VPN server $HOST" >&2; exit 1; }
-    # allowInsecure with nothing pinned yet: take whatever certificate the server presents now and keep it
-    if pin_managed && [ -z "$PIN" ]; then
-        PIN=$(fetch_pin) || { echo "the link asks for allowInsecure, which Xray no longer has, and the server's" \
-            "certificate could not be fetched to pin instead. Set TLS_PIN_SHA256 in $CONF, or ENGINE=sing-box." >&2; exit 1; }
-        save_pin "$PIN"
-        echo "pinned the server's current certificate ($PIN)"
+# vpn_resolve HOST: its first IPv4 address. A driver with several names opens the window once around all of them;
+# a lookup on its own opens and closes it here.
+vpn_resolve() {
+    if [ -n "$RESOLVE_OPEN" ] || ! { [ "$ENABLE" = 1 ] && [ "$KILL_SWITCH" = 1 ]; }; then
+        _ip=$(resolve4 "$1") || _ip=
+    else
+        resolve_window || { resolve_close; echo "could not open the resolve window" >&2; return 1; }
+        _ip=$(resolve4 "$1") || _ip=
+        resolve_close || return 1
     fi
-    mkdir -p "$RUN"; chmod 700 "$RUN"
-    {
-    # info, not warning: a failed outbound - including a pin mismatch - is only reported at info. run_xray's
-    # reader scans every line and passes on only warnings and worse, so the system log does not fill up.
-    printf '{"log":{"loglevel":"info","access":"none"},\n'
-    printf '"inbounds":[{"tag":"socks-in","listen":"127.0.0.1","port":%d,"protocol":"socks","settings":{"auth":"noauth","udp":true,"ip":"127.0.0.1"}}],\n' "$SOCKS_PORT"
-    printf '"outbounds":[{"tag":"proxy","protocol":"vless","settings":{"vnext":[{"address":%s,"port":%s,"users":[{"id":%s,"encryption":%s' \
-        "$(json_str "$SERVER_IP")" "$PORT" "$(json_str "$UUID")" "$(json_str "${ENC:-none}")"
-    [ -n "$FLOW" ] && printf ',"flow":%s' "$(json_str "$FLOW")"
-    printf '}]}]},'; xray_stream_json; printf '},\n'
-    printf '{"tag":"direct","protocol":"freedom","streamSettings":{"sockopt":{"mark":%d}}}]}\n' "$((MARK))"
-    } > "$RUN/xray.json"
-    chmod 600 "$RUN/xray.json"
-    cat > "$RUN/hev.yml" <<YML
-tunnel:
-  name: $TUN
-  mtu: 8500
-  multi-queue: false
-  ipv4: 198.18.0.1
-socks5:
-  port: $SOCKS_PORT
-  address: 127.0.0.1
-  udp: 'udp'
-misc:
-  log-level: warn
-YML
-    printf '%s\n' "$SERVER_IP" > "$RUN/server-ip"
-    "$XRAY" run -test -c "$RUN/xray.json" >/dev/null || { "$XRAY" run -test -c "$RUN/xray.json" >&2; exit 1; }
-    echo "xray config OK ($RUN/xray.json), server $HOST -> $SERVER_IP"
+    [ -n "$_ip" ] || return 1
+    printf '%s\n' "$_ip"
 }
 
-xray_routes_up() {
+# ---- the tunnel's routing -------------------------------------------------------------------------------------
+# What sing-box's auto_route does itself, for every driver that leaves it to the core (DRV_ROUTES=core): rule 9000
+# keeps the engine's own marked connections off the tunnel, 9001 the LAN, 9002 the servers' addresses
+# ($RUN/server-ip, one per line, from drv_gen); everything else goes to table 2022, whose default route is $TUN.
+routes_up() {
     ip rule add pref 9000 fwmark "$MARK" lookup main
-    for c in $(printf '%s' "$LAN_CIDRS" | tr ',' ' '); do ip rule add pref 9001 to "$c" lookup main; done
-    ip rule add pref 9002 to "$(cat "$RUN/server-ip")" lookup main
+    for _c in $(printf '%s' "$LAN_CIDRS" | tr ',' ' '); do
+        case $_c in *:*) ;; *) ip rule add pref 9001 to "$_c" lookup main ;; esac
+    done
+    _s6=
+    if [ -r "$RUN/server-ip" ]; then
+        while IFS= read -r _a || [ -n "$_a" ]; do
+            if ip4_ok "$_a"; then ip rule add pref 9002 to "$_a" lookup main
+            elif ip6_ok "$_a"; then _s6="$_s6 $_a"; fi
+        done < "$RUN/server-ip"
+    fi
     ip route replace default dev "$TUN" table "$TABLE"
     ip rule add pref 9010 lookup "$TABLE"
+    # IPv6 the same way, but only when the tunnel has a global IPv6 address of its own: otherwise programs would
+    # prefer a dead IPv6 route (see IPV6 in gen_singbox), and IPv6 is left as it is
+    if [ "$IPV6" = 1 ] && ip -6 addr show dev "$TUN" scope global 2>/dev/null | grep -q inet6; then
+        ip -6 rule add pref 9000 fwmark "$MARK" lookup main
+        for _c in $(printf '%s' "$LAN_CIDRS" | tr ',' ' '); do
+            case $_c in *:*) ip -6 rule add pref 9001 to "$_c" lookup main ;; esac
+        done
+        for _a in $_s6; do ip -6 rule add pref 9002 to "$_a" lookup main; done
+        ip -6 route replace default dev "$TUN" table "$TABLE"
+        ip -6 rule add pref 9010 lookup "$TABLE"
+    fi
     tailscale_up
     # the device's own lookups: dnsmasq forwards to whatever the bearer handed out, and the carrier's resolver
-    # does not answer from the far end of the tunnel. Send them to REMOTE_DNS instead, which the routing above
-    # then carries through the tunnel. Clients that use their own DNS are already going through it.
+    # does not answer from the far end of the tunnel. Send them to the tunnel's DNS ($RUN/dns, from the driver) or
+    # REMOTE_DNS instead, which the routing above then carries through the tunnel. Clients that use their own DNS
+    # are already going through it. An IPv4 table: the first IPv4 address of the two.
+    _dns=
+    if [ -r "$RUN/dns" ]; then
+        while IFS= read -r _a || [ -n "$_a" ]; do ip4_ok "$_a" && { _dns=$_a; break; }; done < "$RUN/dns"
+    fi
+    if [ -z "$_dns" ] && ip4_ok "$REMOTE_DNS"; then _dns=$REMOTE_DNS; fi
+    if [ -z "$_dns" ]; then
+        echo "no IPv4 DNS server for the tunnel: the device's own lookups are not redirected" >&2
+        return 0
+    fi
     nft -f - <<NFT
 table ip mu300_vpn_dns
 delete table ip mu300_vpn_dns
@@ -759,19 +668,31 @@ table ip mu300_vpn_dns {
         type nat hook output priority -100; policy accept;
         meta mark $MARK return
         ip daddr 127.0.0.0/8 return
-        udp dport 53 dnat to $REMOTE_DNS
-        tcp dport 53 dnat to $REMOTE_DNS
+        udp dport 53 dnat to $_dns
+        tcp dport 53 dnat to $_dns
     }
 }
 NFT
 }
 
-xray_routes_down() {
+routes_down() {
     nft delete table ip mu300_vpn_dns 2>/dev/null || true
     for pref in $TS_PREFS 9000 9001 9002 9003 9010; do
         while ip rule del pref "$pref" 2>/dev/null; do :; done
     done
     ip route flush table "$TABLE" 2>/dev/null || true
+    routes6_down
+}
+# The IPv6 rules go as often as "ip -6 rule show" lists them, not until a delete fails: an ip (or a kernel) without
+# IPv6 policy routing then has nothing to loop on.
+routes6_down() {
+    _r6=$(ip -6 rule show 2>/dev/null) || _r6=
+    for pref in 9000 9001 9002 9010; do
+        for _x in $(printf '%s\n' "$_r6" | awk -v p="$pref:" '$1 == p {print "x"}'); do
+            ip -6 rule del pref "$pref" 2>/dev/null || true
+        done
+    done
+    ip -6 route flush table "$TABLE" 2>/dev/null || true
 }
 
 # Tailscale through the tunnel. tailscaled marks its own sockets (WireGuard to peers, DERP, the control server)
@@ -812,64 +733,62 @@ tailscale_up() {
 }
 tailscale_failed() { tailscale_down; echo "could not route Tailscale through the tunnel (ip rule)" >&2; }
 
-# Two processes and the routing between them, torn down together: if either dies the service exits, the routes
-# go with it and procd starts the whole thing again. Leaving rules behind with nothing at the other end is what
-# made sing-box's crashes look like a dead modem (routing_cleanup), so every way out of here goes through down().
-run_xray() {
-    xray_routes_down
-    gen_xray
-    # Xray's output goes through a reader that passes it on and notes a pin mismatch, so a renewed server
-    # certificate is noticed without polling the server
-    rm -f "$RUN/pin-mismatch" "$RUN/xray.out"; mkfifo "$RUN/xray.out"
-    while IFS= read -r l; do
-        case "$l" in *"peer cert is unrecognized (against pinnedPeerCertSha256)"*) : > "$RUN/pin-mismatch" ;; esac
-        case "$l" in *"[Info]"*|*"[Debug]"*) ;; *) printf '%s\n' "$l" ;; esac
-    done < "$RUN/xray.out" &
-    "$XRAY" run -c "$RUN/xray.json" > "$RUN/xray.out" 2>&1 & xpid=$!
-    hpid=
-    down() {
-        trap - EXIT INT TERM
-        [ -n "$hpid" ] && kill "$hpid" 2>/dev/null
-        kill "$xpid" 2>/dev/null
-        wait 2>/dev/null
-        xray_routes_down
-    }
-    trap 'down; exit 0' INT TERM
-    trap down EXIT
-    n=0
-    until listening "$SOCKS_PORT"; do
-        kill -0 "$xpid" 2>/dev/null || { echo "xray exited during start" >&2; exit 1; }
-        n=$((n + 1)); [ "$n" -lt 15 ] || { echo "xray did not open its SOCKS port" >&2; exit 1; }
-        sleep 1
-    done
-    "$HEV" "$RUN/hev.yml" & hpid=$!
-    n=0
-    until ip link show "$TUN" >/dev/null 2>&1; do
-        kill -0 "$hpid" 2>/dev/null || { echo "hev-socks5-tunnel exited during start" >&2; exit 1; }
-        n=$((n + 1)); [ "$n" -lt 15 ] || { echo "$TUN did not appear" >&2; exit 1; }
-        sleep 1
-    done
-    ip link set "$TUN" up
-    xray_routes_up
-    echo "tunnel up on $TUN (xray $xpid, hev $hpid)"
-    # whichever exits first ends the service
-    while kill -0 "$xpid" 2>/dev/null && kill -0 "$hpid" 2>/dev/null; do
-        sleep 2
-        [ -e "$RUN/pin-mismatch" ] && pin_managed || continue
-        rm -f "$RUN/pin-mismatch"
-        new=$(fetch_pin) || { sleep 30; continue; }
-        [ "$new" = "$PIN" ] && { sleep 30; continue; }
-        save_pin "$new"
-        echo "the server's certificate changed; pinned the new one and restarting" >&2
-        exit 1
-    done
-    echo "$( kill -0 "$xpid" 2>/dev/null && echo hev-socks5-tunnel || echo xray ) exited, tearing the tunnel down" >&2
-    exit 1
+# An xray profile with a VLESS link runs on the sing-box driver where pick_engines chose sing-box: behind the kill
+# switch, which Xray could not start behind before the resolve window existed and which VLESS links keep (sing-box
+# does its bootstrap lookup on its own marked socket), and on an image with only sing-box. Other xray links stay
+# on Xray.
+vless_on_sing_box() {
+    [ "$PTYPE" = xray ] || return 0
+    case ${PURI:-} in vless://*) ;; *) return 0 ;; esac
+    if [ "$ENGINE" = sing-box ]; then
+        if [ "$KILL_SWITCH" = 1 ]; then
+            # Xray pins the certificate of a link that asks for allowInsecure; sing-box would not check it at all
+            case "$PURI" in *[?\&]allowInsecure=1*|*[?\&]allowInsecure=true*)
+                echo "the kill switch needs sing-box, and sing-box would accept any certificate for this link" \
+                    "(allowInsecure), where xray pins it: not started, the kill switch stays up. Use a link that" \
+                    "verifies the certificate, or KILL_SWITCH=0." >&2
+                return 1 ;;
+            esac
+            echo "ENGINE=xray cannot start behind the kill switch: running sing-box instead" >&2
+        fi
+        load_driver sing-box
+    elif [ "$KILL_SWITCH" = 1 ]; then
+        # pick_engines takes sing-box for this whenever it is there; without it the kill switch stays up
+        echo "the kill switch needs ENGINE=sing-box (xray cannot start behind it), and sing-box is not installed:" \
+            "the kill switch stays up. Install the vpn extra (mu300-extra install vpn), or set KILL_SWITCH=0." >&2
+        return 1
+    fi
 }
 
 gen() {
-    engines_ok || { echo "$MISSING" >&2; exit 1; }
-    case "$ENGINE" in xray) gen_xray ;; *) gen_singbox ;; esac
+    if [ -n "$PTYPE" ]; then load_driver "$PTYPE" || exit 1; fi
+    drv_engines_ok || { engines_missing; exit 1; }
+    [ -n "$PTYPE" ] || { echo "no active profile: mu300-vpn profile use ID" >&2; exit 1; }
+    vless_on_sing_box || exit 1
+    drv_gen
+}
+
+# The service's tunnel for a driver that is not exec'd: started, routed, and watched until either end goes. Every
+# way out - a signal, an engine that exits, a failed start - goes through tunnel_down, which stops the engines and
+# takes the routing with them; the kill switch stays.
+run_tunnel() {
+    tunnel_down() {
+        trap - EXIT INT TERM
+        drv_stop
+        if [ "$DRV_ROUTES" = core ]; then routes_down; else tailscale_down; fi
+        rm -f "$RUN/iface"
+    }
+    trap 'tunnel_down; exit 0' INT TERM
+    trap tunnel_down EXIT
+    drv_start || exit 1
+    if [ "$DRV_ROUTES" = core ]; then routes_up; else tailscale_up; fi
+    echo "$TUN" > "$RUN/iface"
+    while drv_alive; do
+        sleep 2
+        drv_poll || exit 1
+    done
+    echo "${DRV_GONE:-the engine} exited, tearing the tunnel down" >&2
+    exit 1
 }
 
 # Everything unmarked that would leave on an uplink is dropped, for the device and its clients; on the Wi-Fi
@@ -971,7 +890,11 @@ ensure_firewall_zone() {
 #
 # Only when nothing is running, so this never takes the rules away from a live tunnel.
 routing_cleanup() {
-    pgrep -f '[s]ing-box run|[x]ray run|[h]ev-socks5-tunnel' >/dev/null 2>&1 && return 0
+    pgrep -f '[s]ing-box run|[x]ray run|[h]ev-socks5-tunnel|[m]ihomo|[o]penvpn --config /run/mu300-vpn' >/dev/null 2>&1 &&
+        return 0
+    # the tunnel the last run brought up, whichever driver it was ($RUN/iface), or the two engines' own names
+    _if=$(cat "$RUN/iface" 2>/dev/null) || _if=
+    if [ -n "$_if" ] && ip link show "$_if" >/dev/null 2>&1; then return 0; fi
     ip link show "$TUN" >/dev/null 2>&1 && return 0
     n=0
     for pref in 9000 9001 9002 9003 9010; do
@@ -979,7 +902,9 @@ routing_cleanup() {
     done
     tailscale_down
     ip route flush table "$TABLE" 2>/dev/null || true
+    routes6_down
     nft delete table ip mu300_vpn_dns 2>/dev/null || true
+    rm -f "$RUN/iface"
     [ "$n" -gt 0 ] && echo "removed $n stale routing rule(s) left by a VPN engine"
     return 0
 }
@@ -989,38 +914,44 @@ routing_cleanup() {
 
 case "${1:-status}" in
     gen) gen ;;
+    # check [ID]: a profile's files, as its driver reads them (the active profile by default)
+    check)
+        if [ -n "${2:-}" ] || [ -n "$ACTIVE" ]; then
+            _id=${2:-$ACTIVE}
+            valid_id "$_id" && [ -d "$PROFILES/$_id" ] || { echo "no such profile" >&2; exit 1; }
+            profile_load "$_id"
+        fi
+        [ -n "$PTYPE" ] || { echo "no active profile: mu300-vpn profile use ID" >&2; exit 1; }
+        load_driver "$PTYPE" || exit 1
+        drv_check || exit 1
+        echo "profile ${_id:-$PTYPE}: OK" ;;
     run)
         [ "$ENABLE" = 1 ] || { echo "VPN disabled (ENABLE=0 in $CONF)"; killswitch_off; tailscale_down; exit 0; }
         # The kill switch goes up before anything that can fail: no engines, a failed or corrupt download, a config
         # that does not check, an engine that will not start or dies later - every one of them leaves it up. It is
         # replaced in one nft transaction, so a restart never has a moment without it. Only ENABLE=0 and mu300-vpn
         # off take it down; the service stop leaves it, so a stopped or crashed engine never leaks.
-        if [ "$KILL_SWITCH" = 1 ]; then killswitch_on || { echo "could not put up the kill switch" >&2; exit 1; }; fi
+        if [ "$KILL_SWITCH" = 1 ]; then killswitch_on || { echo "could not put up the kill switch" >&2; exit 1; }
+        # without it, one left from before KILL_SWITCH=0 comes down now: the server names are looked up below, and
+        # only a kill switch that is wanted gets a resolve window
+        else killswitch_off; fi
+        [ -n "$PTYPE" ] || { echo "no active profile: mu300-vpn profile use ID" >&2; exit 1; }
+        load_driver "$PTYPE" || exit 1
         ensure_engines || exit 1
-        if [ "$_engine" = xray ] && [ "$ENGINE" = sing-box ] && [ "$KILL_SWITCH" = 1 ]; then
-            # Xray pins the certificate of a link that asks for allowInsecure; sing-box would not check it at all
-            case "$VLESS_URI" in *[?\&]allowInsecure=1*|*[?\&]allowInsecure=true*)
-                echo "the kill switch needs sing-box, and sing-box would accept any certificate for this link" \
-                    "(allowInsecure), where xray pins it: not started, the kill switch stays up. Use a link that" \
-                    "verifies the certificate, or KILL_SWITCH=0." >&2
-                exit 1 ;;
-            esac
-            echo "ENGINE=xray cannot start behind the kill switch: running sing-box instead" >&2
-        fi
-        if [ "$ENGINE" = xray ] && [ "$KILL_SWITCH" = 1 ]; then
-            # pick_engines takes sing-box for this whenever it is there; without it the kill switch stays up
-            echo "the kill switch needs ENGINE=sing-box (xray cannot start behind it), and sing-box is not installed:" \
-                "the kill switch stays up. Install the vpn extra (mu300-extra install vpn), or set KILL_SWITCH=0." >&2
-            exit 1
-        fi
-        [ "$ENGINE" = xray ] || gen >/dev/null
+        vless_on_sing_box || exit 1
+        # Leftover routing of a run that was killed goes first, as it always did for xray: the drivers look the
+        # servers up over the bearer, not into a tunnel with nothing at the other end. Then what this run's driver
+        # writes, and nothing a previous profile left.
+        routes_down
+        rm -f "$RUN/server-ip" "$RUN/dns" "$RUN/iface"
+        if [ "$DRV_FOREGROUND" = 1 ]; then drv_gen >/dev/null; else drv_gen; fi
         ensure_firewall_zone
-        [ "$KILL_SWITCH" = 1 ] || killswitch_off
-        [ "$ENGINE" = xray ] && run_xray
+        [ "$DRV_FOREGROUND" = 1 ] || run_tunnel
         # sing-box builds its routes itself; the Tailscale rules are inert until it has (see tailscale_up), and
         # after it exits they are again: table $TABLE is empty then. mu300-vpn off and the next start clear them.
         tailscale_up
-        exec "$BIN" run -c "$RUN/config.json" ;;
+        echo "$TUN" > "$RUN/iface"
+        drv_start ;;
     # guard: before the modem's bearer comes up (mobile-data calls it), so a VPN with the kill switch is never
     # without it at boot, before the service has started
     guard) if [ "$ENABLE" = 1 ] && [ "$KILL_SWITCH" = 1 ]; then killswitch_on; fi ;;
@@ -1035,5 +966,5 @@ case "${1:-status}" in
     engines)
         for e in "$XRAY" "$HEV" "$BIN"; do printf '%s %s\n' "$e" "$([ -x "$e" ] && echo ok || echo missing)"; done
         engines_ok || { echo "$MISSING" >&2; exit 1; } ;;
-    *) echo "usage: $0 gen|run|guard|off|status|engines" >&2; exit 2 ;;
+    *) echo "usage: $0 gen|run|check [ID]|guard|off|status|engines" >&2; exit 2 ;;
 esac
