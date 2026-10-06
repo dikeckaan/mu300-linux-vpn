@@ -288,6 +288,59 @@ class Contract(ShellTest):
                 self.assertNotEqual(r.returncode, 0, t)
                 self.assertNotIn('LOADED', r.stdout, t)
 
+    def test_only_complete_drivers_load(self):
+        self.stub('ip', 'exit 0')
+        lib = self.tmp / 'lib'
+        shutil.copytree(LIB, lib)
+        # a driver that lacks drv_alive: refused, and xray's (loaded before it) is not used in its place
+        (lib / 'broken.sh').write_text('drv_engines() { :; }\ndrv_engines_ok() { :; }\ndrv_check() { :; }\n'
+                                       'drv_gen() { :; }\ndrv_start() { :; }\ndrv_stop() { :; }\n'
+                                       'drv_import() { :; }\n')
+        for shell in self.each_shell():
+            for t in ('uri', 'common', 'common-x'):
+                r = self.vpn(shell, f'load_driver {t}; echo LOADED', MU300_VPN_LIB=lib)
+                self.assertNotIn('LOADED', r.stdout, t)
+                self.assertIn(f'{t}: invalid type', r.stderr)
+            r = self.vpn(shell, 'load_driver xray || exit 9; load_driver broken && echo LOADED; '
+                                'command -v drv_alive >/dev/null && echo STALE; echo "[$DRIVER]"', MU300_VPN_LIB=lib)
+            self.assertNotIn('LOADED', r.stdout)
+            self.assertNotIn('STALE', r.stdout)
+            self.assertIn('[]', r.stdout)
+            self.assertIn('broken: the driver is incomplete (no drv_alive)', r.stderr)
+
+    def test_a_signal_closes_the_resolve_window(self):
+        import signal
+        import subprocess
+        import time
+        self.stub('nft', 'case "$1" in\n'
+                         '  -f) r=$(cat); printf "%s\\n" "$r" > "$STUBLOG/nft.state"; echo "nft -f" >> "$STUBLOG/events" ;;\n'
+                         '  *) echo "nft $*" >> "$STUBLOG/events" ;;\n'
+                         'esac; exit 0')
+        # a slow resolver: the service is stopped while it is looking the server up
+        self.stub('getent', 'touch "$STUBLOG/resolving"; sleep 2; echo "203.0.113.5     STREAM srv.example"')
+        self.stub('ip', 'exit 0')
+        (self.tmp / 'resolv.conf').write_text('nameserver 10.177.0.34\n')
+        for shell in self.each_shell():
+            for p in ('events', 'resolving', 'nft.state'):
+                (self.tmp / p).unlink(missing_ok=True)
+            e = dict(MU300_LIB=1, MU300_VPN_CONF=self.conf, MU300_VPN_RUN=self.tmp / 'run', MU300_VPN_LIB=LIB,
+                     MU300_LAN_CONF=self.tmp / 'no', MU300_BIN=BIN, MU300_OPT=self.tmp / 'opt',
+                     MU300_DISK=self.tmp / 'disk', MU300_RESOLV_FILES=self.tmp / 'resolv.conf')
+            p = subprocess.Popen(shell + ['-c', f'. "{BIN}/mu300-vpn"; vpn_resolve srv.example; echo DONE'],
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=self.env(**e))
+            deadline = time.time() + 20
+            while not (self.tmp / 'resolving').exists() and time.time() < deadline:
+                time.sleep(0.05)
+            p.send_signal(signal.SIGTERM)
+            out, err = p.communicate(timeout=30)
+            self.assertNotEqual(p.returncode, 0, err)
+            self.assertNotIn('DONE', out)
+            # the window went up and the full kill switch came back over it
+            self.assertEqual((self.tmp / 'events').read_text().count('nft -f'), 2, err)
+            state = (self.tmp / 'nft.state').read_text()
+            self.assertIn('counter drop', state)
+            self.assertNotIn('dns4', state)
+
     def test_every_driver_defines_the_contract(self):
         self.stub('ip', 'exit 0')
         names = sorted(p.stem for p in LIB.glob('*.sh') if p.name != 'uri.sh' and not p.name.startswith('common'))
@@ -369,6 +422,35 @@ class Contract(ShellTest):
             self.conf.write_text('ENABLE=1\nKILL_SWITCH=1\n')
             self.assertEqual(r.stdout.strip(), '203.0.113.5')
             self.assertFalse(self.ev.exists())
+
+    def test_a_failed_drv_start_step_routes_nothing(self):
+        # drv_start runs without set -e (drv_start || exit 1): an "ip link set xtun up" that fails must end it,
+        # and the core must never route into that tunnel
+        self.stub('ip', self.IP.replace('  "link show")', '  "link set") exit 1 ;;\n  "link show")'))
+        self.stub('nft', '[ "$1" = -f ] && cat > /dev/null; exit 0')
+        self.stub('ss', 'echo "LISTEN 0 4096 127.0.0.1:10808 0.0.0.0:*"')
+        self.stub('getent', 'echo "203.0.113.9     STREAM $2"')
+        self.stub('pgrep', 'exit 1')
+        d = self.tmp / 'disk/extra/vpn/bin'
+        d.mkdir(parents=True)
+        (d / 'xray').write_text('#!/bin/sh\n[ "$2" = -test ] && exit 0\nexec sleep 30\n')
+        (d / 'hev-socks5-tunnel').write_text('#!/bin/sh\nexec sleep 30\n')
+        for n in ('xray', 'hev-socks5-tunnel'):
+            (d / n).chmod(0o755)
+        (self.tmp / 'tun').write_text('')
+        uri = 'vless://11111111-2222-3333-4444-555555555555@vpn.example.com:443?security=tls&type=tcp'
+        for shell in self.each_shell():
+            self.rules.unlink(missing_ok=True)
+            self.conf.write_text(f"ENABLE=1\nENGINE=xray\nKILL_SWITCH=0\nVLESS_URI='{uri}'\n")
+            r = self.script(shell, BIN / 'mu300-vpn', 'run', MU300_VPN_CONF=self.conf, MU300_VPN_RUN=self.tmp / 'run',
+                            MU300_VPN_LIB=LIB, MU300_LAN_CONF=self.tmp / 'no', MU300_BIN=BIN,
+                            MU300_OPT=self.tmp / 'opt', MU300_DISK=self.tmp / 'disk')
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn('cannot bring xtun up', r.stderr)
+            self.assertNotIn('tunnel up', r.stdout)
+            rules = self.rules.read_text() if self.rules.exists() else ''
+            self.assertNotIn('pref 9010', rules)
+            self.assertFalse((self.tmp / 'run/iface').exists())
 
     def test_xray_runs_in_the_core_loop(self):
         # xray and hev-socks5-tunnel as stubs: the core routes the tunnel once both are up, keeps $RUN/iface while

@@ -165,7 +165,9 @@ drv_set() { link_opt_set "$1" "$2"; }
 drv_start() {
     # Xray's output goes through a reader that passes it on and notes a pin mismatch, so a renewed server
     # certificate is noticed without polling the server
-    rm -f "$RUN/pin-mismatch" "$RUN/xray.out"; mkfifo "$RUN/xray.out"
+    # (every step that can fail returns 1 itself: the core runs this without set -e, see load_driver)
+    rm -f "$RUN/pin-mismatch" "$RUN/xray.out"
+    mkfifo "$RUN/xray.out" || { echo "cannot create $RUN/xray.out" >&2; return 1; }
     while IFS= read -r l; do
         case "$l" in *"peer cert is unrecognized (against pinnedPeerCertSha256)"*) : > "$RUN/pin-mismatch" ;; esac
         case "$l" in *"[Info]"*|*"[Debug]"*) ;; *) printf '%s\n' "$l" ;; esac
@@ -186,7 +188,7 @@ drv_start() {
         n=$((n + 1)); [ "$n" -lt 15 ] || { echo "$TUN did not appear" >&2; return 1; }
         sleep 1
     done
-    ip link set "$TUN" up
+    ip link set "$TUN" up || { echo "cannot bring $TUN up" >&2; return 1; }
     echo "tunnel up on $TUN (xray $XPID, hev $HPID)"
 }
 # whichever exits first ends the service

@@ -406,6 +406,9 @@ engines_ok() { case "$ENGINE" in xray) [ -x "$XRAY" ] && [ -x "$HEV" ] ;; *) [ -
 # drv_stop, drv_status and drv_import (see the spec's table), and DRV_EXTRA, the extra that carries its engines
 # (empty: they are packages, which the service never installs). Until one is loaded - no active profile - the vpn
 # extra's engines for ENGINE are what gen, ensure_engines and status check, as before profiles existed.
+# The core calls drv_start as "drv_start || exit 1", and a function called that way runs without set -e: a step that
+# fails does not end it. Every step of a driver's drv_start whose failure would leave half a tunnel must therefore
+# return non-zero itself (cmd || return 1), or the core would route into a tunnel that is not there.
 DRIVER=; DRV_EXTRA=vpn; DRV_PKG=; DRV_ROUTES=core; DRV_FOREGROUND=0; DRV_PIDS=; DRV_GONE=; DRV_KEYS=
 drv_engines() { case $ENGINE in xray) printf '%s\n' "$XRAY" "$HEV" ;; *) printf '%s\n' "$BIN" ;; esac; }
 drv_engines_ok() { engines_ok; }
@@ -417,10 +420,13 @@ drv_set_default() { if [ -n "$2" ]; then kv_set "$PDIR/meta" "$1" "$2"; else kv_
 drv_set() { drv_set_default "$@"; }
 # load_driver TYPE: that type's driver sourced. The type becomes a path, so only [a-z-] gets that far; the types
 # reserved for later versions say so.
+DRV_FUNCS='drv_engines drv_engines_ok drv_check drv_gen drv_start drv_alive drv_stop drv_import'
 load_driver() {
     case $1 in
         l2tp|pptp|ikev2|tailscale-exit) echo "$1: not available in this version" >&2; return 1 ;;
         *[!a-z-]*|'') echo "not a profile type" >&2; return 1 ;;
+        # the library's helper files are not drivers
+        uri|common*) echo "$1: invalid type" >&2; return 1 ;;
     esac
     [ -r "$LIB/$1.sh" ] || { echo "$1: no driver for this profile type ($LIB/$1.sh)" >&2; return 1; }
     _drv=$1
@@ -429,7 +435,12 @@ load_driver() {
     drv_status() { :; }
     drv_poll() { :; }
     drv_set() { drv_set_default "$@"; }
+    # The previous driver's functions go first: a driver that lacks one must fail here, not run another type's.
+    unset -f $DRV_FUNCS
     . "$LIB/$_drv.sh"
+    for _fn in $DRV_FUNCS; do
+        command -v "$_fn" >/dev/null 2>&1 || { echo "$_drv: the driver is incomplete (no $_fn)" >&2; DRIVER=; return 1; }
+    done
     DRIVER=$_drv
 }
 # the messages for engines that are not there
@@ -604,16 +615,21 @@ resolve4() {
 # killed with the window open leaves only allowances that run out by themselves. Only while the VPN is on: a "gen"
 # with it off must not put a kill switch up.
 RESOLVE_OPEN=
+# A signal while it is open (the service stopped mid-lookup) closes it before the script ends: the trap is set before
+# the window goes up, and resolve_close takes it away again. No caller has INT, TERM or HUP traps of its own while
+# names are looked up (run_tunnel sets its traps after drv_gen), so the defaults are what is restored.
 resolve_window() {
     [ "$ENABLE" = 1 ] && [ "$KILL_SWITCH" = 1 ] || return 0
-    killswitch_fetch >/dev/null || return 1
+    trap 'resolve_close; exit 1' INT TERM HUP
     RESOLVE_OPEN=1
+    killswitch_fetch >/dev/null || return 1
     dns_allow 30 >/dev/null
 }
 # back to the full kill switch; if even that fails, at least nothing of the window stays open
 resolve_close() {
     [ -n "$RESOLVE_OPEN" ] || return 0
     RESOLVE_OPEN=
+    trap - INT TERM HUP
     killswitch_on >/dev/null && return 0
     for _s in dns4 dns6 fetch4 fetch6; do nft flush set inet mu300_vpn "$_s" 2>/dev/null; done
     return 1
@@ -788,12 +804,12 @@ gen() {
 # takes the routing with them; the kill switch stays.
 run_tunnel() {
     tunnel_down() {
-        trap - EXIT INT TERM
+        trap - EXIT INT TERM HUP
         drv_stop
         if [ "$DRV_ROUTES" = core ]; then routes_down; else tailscale_down; fi
         rm -f "$RUN/iface"
     }
-    trap 'tunnel_down; exit 0' INT TERM
+    trap 'tunnel_down; exit 0' INT TERM HUP
     trap tunnel_down EXIT
     drv_start || exit 1
     if [ "$DRV_ROUTES" = core ]; then routes_up; else tailscale_up; fi
