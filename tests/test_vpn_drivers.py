@@ -407,3 +407,383 @@ class Contract(ShellTest):
             self.assertEqual((self.tmp / 'iface-up').read_text().strip(), 'xtun')
             self.assertEqual([l for l in self.rules.read_text().splitlines() if l.split()[1] >= '9000'], [])
             self.assertFalse((self.tmp / 'run/iface').exists())
+
+
+VMESS = {"v": "2", "ps": "n", "add": "vm.example", "port": "8443", "id": "11111111-2222-3333-4444-555555555555",
+         "aid": "0", "scy": "auto", "net": "ws", "type": "none", "host": "h.example", "path": "/p", "tls": "tls",
+         "sni": "s.example"}
+
+
+def b64(s, urlsafe=False):
+    import base64
+    raw = s.encode()
+    if urlsafe:
+        return base64.urlsafe_b64encode(raw).decode().rstrip('=')
+    return base64.b64encode(raw).decode()
+
+
+def vmess_link(urlsafe=False, **over):
+    import json
+    d = dict(VMESS, **over)
+    return 'vmess://' + b64(json.dumps(d), urlsafe)
+
+
+class Uris(ShellTest):
+    """parse_link for every kind of link the xray driver takes, and the outbound gen_xray writes from each: the
+    right protocol, the server's resolved address, and the mark that lets it past the kill switch."""
+
+    LINKS = [
+        (vmess_link(), 'vmess',
+         dict(PROTO='vmess', HOST='vm.example', PORT='8443', TYPE='ws', WSPATH='/p', WSHOST='h.example',
+              SECURITY='tls', SNI='s.example', AID='0', METHOD='auto')),
+        (vmess_link(urlsafe=True), 'vmess',
+         dict(PROTO='vmess', HOST='vm.example', PORT='8443', TYPE='ws', WSPATH='/p', WSHOST='h.example',
+              SECURITY='tls', SNI='s.example')),
+        ('trojan://p%40ss@tr.example:443?type=grpc&serviceName=g&sni=x.example#t', 'trojan',
+         dict(PROTO='trojan', PASSWORD='p@ss', HOST='tr.example', PORT='443', TYPE='grpc', SVC='g', SECURITY='tls',
+              SNI='x.example')),
+        ('ss://' + b64('aes-256-gcm:pw', urlsafe=True) + '@ss.example:8388#n', 'shadowsocks',
+         dict(PROTO='ss', METHOD='aes-256-gcm', PASSWORD='pw', HOST='ss.example', PORT='8388', SECURITY='none')),
+        ('ss://2022-blake3-aes-128-gcm:a%2Bb%3D@[2001:db8::2]:443', 'shadowsocks',
+         dict(PROTO='ss', METHOD='2022-blake3-aes-128-gcm', PASSWORD='a+b=', HOST='2001:db8::2', PORT='443')),
+        ('ss://' + b64('chacha20-ietf-poly1305:pw@1.2.3.4:8000') + '#legacy', 'shadowsocks',
+         dict(PROTO='ss', METHOD='chacha20-ietf-poly1305', PASSWORD='pw', HOST='1.2.3.4', PORT='8000')),
+        ('vless://11111111-2222-3333-4444-555555555555@vl.example:443?security=tls&type=tcp', 'vless',
+         dict(PROTO='vless', HOST='vl.example', PORT='443', TYPE='tcp', SECURITY='tls')),
+    ]
+    BAD = ['ss://' + b64('aes-256-gcm:pw', urlsafe=True) + '@ss.example:8388/?plugin=obfs-local%3Bobfs%3Dhttp',
+           'ss://' + b64('aes-256-gcm:pw') + '@ss.example:8388?plugin=obfs',
+           'vmess://bm90IGpzb24',               # base64, but not JSON
+           vmess_link(net='tcp', type='http'),   # TCP with an HTTP header: not something xray_stream_json writes
+           vmess_link(port='x'),
+           'trojan://@tr.example:443', 'trojan://pw@tr.example:99999', 'vless://u@h:443/?x\nmore',
+           'ss://bm9jb2xvbg', 'https://example.com', 'vless://u@bad host:443']
+
+    def setUp(self):
+        super().setUp()
+        self.conf = self.tmp / 'vpn.conf'
+        self.conf.write_text('ENABLE=0\nKILL_SWITCH=0\n')
+        self.stub('ip', 'exit 0')
+        self.stub('nft', 'cat >/dev/null; exit 0')
+        self.stub('getent', 'echo "203.0.113.10    STREAM $2"')
+        self.stub('xray', 'echo "$*" >> "$STUBLOG/xray.args"')
+
+    def vpn(self, shell, code):
+        return self.sh(shell, f'. "{BIN}/mu300-vpn"; {code}', MU300_LIB=1, MU300_VPN_CONF=self.conf,
+                       MU300_VPN_RUN=self.tmp / 'run', MU300_VPN_LIB=LIB, MU300_LAN_CONF=self.tmp / 'no',
+                       MU300_BIN=BIN, MU300_OPT=self.tmp / 'opt', MU300_DISK=self.tmp / 'disk')
+
+    def test_parse_link(self):
+        for shell in self.each_shell():
+            for uri, _, want in self.LINKS:
+                code = f"parse_link '{uri}' || exit 9; " + '; '.join(f'echo "{k}=${k}"' for k in want)
+                r = self.vpn(shell, code)
+                self.assertEqual(r.returncode, 0, (uri, r.stderr))
+                got = dict(line.split('=', 1) for line in r.stdout.splitlines())
+                self.assertEqual(got, want, uri)
+            for uri in self.BAD:
+                r = self.vpn(shell, f"parse_link '{uri}' && echo PARSED")
+                self.assertNotIn('PARSED', r.stdout, uri)
+                self.assertNotEqual(r.returncode, 0, uri)
+            r = self.vpn(shell, "parse_link '" + self.BAD[0] + "'")
+            self.assertIn('ss plugins are not supported', r.stderr)
+            # the vless-only entry point the sing-box driver uses still refuses everything else
+            r = self.vpn(shell, f"VLESS_URI='{self.LINKS[2][0]}'; parse_uri; echo PARSED")
+            self.assertNotIn('PARSED', r.stdout)
+
+    def test_b64d(self):
+        for shell in self.each_shell():
+            r = self.vpn(shell, "b64d 'YWVzLTI1Ni1nY206cHc'; b64d 'YWVzLTI1Ni1nY206cHc='; b64d 'Pz8_'")
+            self.assertEqual(r.stdout.split('\n')[:3], ['aes-256-gcm:pw', 'aes-256-gcm:pw', '???'], r.stderr)
+
+    def test_gen_xray_outbounds(self):
+        import json
+        for shell in self.each_shell():
+            for uri, proto, want in self.LINKS:
+                (self.tmp / 'xray.args').unlink(missing_ok=True)
+                r = self.vpn(shell, f"PURI='{uri}'; load_driver xray; XRAY='{self.stubs}/xray'; gen_xray")
+                self.assertEqual(r.returncode, 0, (uri, r.stderr))
+                cfg = json.loads((self.tmp / 'run/xray.json').read_text())
+                out = cfg['outbounds'][0]
+                self.assertEqual(out['protocol'], proto, uri)
+                server = (out['settings'].get('vnext') or out['settings'].get('servers'))[0]
+                # a name is resolved; an address is used as it is
+                addr = want['HOST'] if want['HOST'][0].isdigit() else '203.0.113.10'
+                self.assertEqual(server['address'], addr, uri)
+                self.assertEqual(server['port'], int(want['PORT']), uri)
+                self.assertEqual(out['streamSettings']['sockopt']['mark'], 720, uri)
+                self.assertEqual(cfg['outbounds'][1]['streamSettings']['sockopt']['mark'], 720)
+                if proto == 'vmess':
+                    self.assertEqual(server['users'][0]['alterId'], 0)
+                    self.assertEqual(server['users'][0]['security'], 'auto')
+                    self.assertEqual(out['streamSettings']['wsSettings'], {'path': '/p', 'host': 'h.example'})
+                    self.assertEqual(out['streamSettings']['tlsSettings']['serverName'], 's.example')
+                if proto == 'trojan':
+                    self.assertEqual(server['password'], 'p@ss')
+                    self.assertEqual(out['streamSettings']['grpcSettings'], {'serviceName': 'g'})
+                if proto == 'shadowsocks':
+                    self.assertEqual((server['method'], server['password']), (want['METHOD'], want['PASSWORD']))
+                    self.assertNotIn('security', out['streamSettings'])
+                self.assertEqual((self.tmp / 'run/server-ip').read_text().strip(), addr)
+                self.assertIn(f'run -test -c {self.tmp}/run/xray.json', (self.tmp / 'xray.args').read_text())
+                # what gen prints names the server, never the credentials
+                for secret in ('11111111', 'p@ss', 'a+b='):
+                    self.assertNotIn(secret, r.stdout + r.stderr, uri)
+
+
+class Cli(ShellTest):
+    """The commands: profile list/show/add/import/edit/set/remove/use/export, settings, on/off; run as the
+    script, with the service manager a stub that notes what it was told (MU300_VPN_SVC)."""
+
+    UUID = '11111111-2222-3333-4444-555555555555'
+    LINK = f'vless://{UUID}@vpn.example.com:443?security=tls&type=tcp#Home'
+    LINK2 = f'vless://{UUID}@other.example.com:443?security=tls&type=ws&path=%2Fw'
+
+    def setUp(self):
+        super().setUp()
+        self.conf = self.tmp / 'vpn.conf'
+        self.conf.write_text('ENABLE=0\n')
+        self.store = self.tmp / 'vpn'
+        self.svclog = self.tmp / 'svc.log'
+        self.ev = self.tmp / 'events'
+        self.stub('svc', 'echo "svc $*" >> "$STUBLOG/svc.log"')
+        self.stub('ip', '[ "$1 $2" = "rule del" ] && exit 2; exit 0')
+        self.stub('pgrep', 'exit 1')
+        self.stub('getent', 'echo "203.0.113.10    STREAM $2"')
+        self.stub('nft', 'case "$1" in\n'
+                         '  -f) r=$(cat); printf "%s\\n" "$r" > "$STUBLOG/nft.state"\n'
+                         '      { echo "nft -f"; printf "%s\\n" "$r" | sed "s/^/  | /"; } >> "$STUBLOG/events" ;;\n'
+                         '  list) [ -s "$STUBLOG/nft.state" ] ;;\n'
+                         '  *) echo "nft $*" >> "$STUBLOG/events"\n'
+                         '     [ "$*" = "delete table inet mu300_vpn" ] && : > "$STUBLOG/nft.state"; exit 0 ;;\n'
+                         'esac')
+
+    def engines(self, names=('xray', 'hev-socks5-tunnel', 'sing-box')):
+        d = self.tmp / 'disk/extra/vpn/bin'
+        d.mkdir(parents=True, exist_ok=True)
+        for n in names:
+            (d / n).write_text('#!/bin/sh\necho "engine ${0##*/} $*" >> "$STUBLOG/events"\nexit 0\n')
+            (d / n).chmod(0o755)
+
+    def fresh(self):
+        shutil.rmtree(self.store, ignore_errors=True)
+        shutil.rmtree(self.tmp / 'disk', ignore_errors=True)
+        for p in (self.svclog, self.ev, self.tmp / 'nft.state'):
+            p.unlink(missing_ok=True)
+        self.conf.write_text('ENABLE=0\n')
+
+    def vpn(self, shell, *args):
+        return self.script(shell, BIN / 'mu300-vpn', *args, MU300_VPN_CONF=self.conf,
+                           MU300_VPN_RUN=self.tmp / 'run', MU300_VPN_LIB=LIB, MU300_LAN_CONF=self.tmp / 'no',
+                           MU300_BIN=BIN, MU300_OPT=self.tmp / 'opt', MU300_DISK=self.tmp / 'disk',
+                           MU300_VPN_SVC=self.stubs / 'svc', MU300_EXTRA_CMD=self.stubs / 'no-extra')
+
+    def svc(self):
+        return self.svclog.read_text().splitlines() if self.svclog.exists() else []
+
+    def enable(self, v):
+        self.conf.write_text(f'ENABLE={v}\n')
+
+    def test_import_list_show_export(self):
+        for shell in self.each_shell():
+            self.fresh()
+            r = self.vpn(shell, 'profile', 'import', self.LINK, 'Home')
+            self.assertEqual((r.returncode, r.stdout.strip()), (0, 'home'), r.stderr)
+            r = self.vpn(shell, 'profile', 'import', self.LINK, 'Home')
+            self.assertEqual(r.stdout.strip(), 'home-2', r.stderr)
+            # without a name: the link's own tag
+            r = self.vpn(shell, 'profile', 'import', vmess_link(ps='My VMess'))
+            self.assertEqual(r.stdout.strip(), 'my-vmess', r.stderr)
+            r = self.vpn(shell, 'profile', 'add', 'sing-box', 'SB', self.LINK2)
+            self.assertEqual(r.stdout.strip(), 'sb', r.stderr)
+            r = self.vpn(shell, 'profile', 'list')
+            self.assertEqual(r.returncode, 0, r.stderr)
+            lines = r.stdout.splitlines()
+            self.assertIn(' \thome\txray\tHome', lines)
+            self.assertIn(' \tsb\tsing-box\tSB', lines)
+            self.assertIn(' \tmy-vmess\txray\tMy VMess', lines)
+            pdir = self.store / 'profiles/home'
+            self.assertEqual(stat.S_IMODE((pdir / 'uri').stat().st_mode), 0o600)
+            r = self.vpn(shell, 'profile', 'show', 'home')
+            self.assertEqual(r.returncode, 0, r.stderr)
+            show = dict(l.split('\t', 1) for l in r.stdout.splitlines())
+            self.assertEqual((show['id'], show['name'], show['type'], show['source'], show['server']),
+                             ('home', 'Home', 'xray', 'manual', 'vpn.example.com:443'))
+            self.assertRegex(show['created'], r'^[0-9]+$')
+            for out in (r.stdout + r.stderr, self.vpn(shell, 'profile', 'list').stdout):
+                self.assertNotIn(self.UUID, out)
+                self.assertNotIn('vless://', out)
+            r = self.vpn(shell, 'profile', 'export', 'home')
+            self.assertEqual(r.stdout, self.LINK + '\n')
+
+    def test_refused_imports_leave_nothing(self):
+        wg = self.tmp / 'wg.conf'
+        wg.write_text('[Interface]\nPrivateKey = x\n')
+        for shell in self.each_shell():
+            self.fresh()
+            for args, msg in ((['import', 'ss://' + b64('aes-256-gcm:pw') + '@h:1?plugin=obfs'], 'ss plugins'),
+                              (['import', 'https://example.com/x'], 'not a kind of link'),
+                              (['add', 'sing-box', 'X', vmess_link()], 'not a link this profile type takes'),
+                              (['add', 'l2tp', 'X', self.LINK], 'l2tp: not available in this version'),
+                              (['add', 'nosuch', 'X', self.LINK], 'nosuch: no driver'),
+                              (['import', str(wg)], 'wireguard: no driver')):
+                r = self.vpn(shell, 'profile', *args)
+                self.assertNotEqual(r.returncode, 0, args)
+                self.assertIn(msg, r.stderr, args)
+                self.assertNotIn('pw@', r.stderr)
+                self.assertEqual(list((self.store / 'profiles').iterdir()), [], args)
+
+    def test_use_restarts_a_running_vpn(self):
+        for shell in self.each_shell():
+            self.fresh()
+            self.vpn(shell, 'profile', 'import', self.LINK, 'Home')
+            r = self.vpn(shell, 'profile', 'use', 'home')
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual((self.store / 'active').read_text(), 'home\n')
+            self.assertEqual(self.svc(), [])
+            self.enable(1)
+            r = self.vpn(shell, 'profile', 'use', 'home')
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(self.svc(), ['svc restart'])
+            r = self.vpn(shell, 'profile', 'list')
+            self.assertIn('*\thome\txray\tHome', r.stdout.splitlines())
+
+    def test_invalid_ids(self):
+        for shell in self.each_shell():
+            self.fresh()
+            for args in (['use', '../x'], ['show', 'A'], ['remove', 'a/b'], ['export', ''], ['set', '..', 'NAME', 'x']):
+                r = self.vpn(shell, 'profile', *args)
+                self.assertEqual(r.returncode, 2, args)
+                self.assertIn('invalid profile id', r.stderr, args)
+            r = self.vpn(shell, 'profile', 'show', 'nosuch')
+            self.assertEqual(r.returncode, 1)
+
+    def test_remove(self):
+        for shell in self.each_shell():
+            self.fresh()
+            self.vpn(shell, 'profile', 'import', self.LINK, 'Home')
+            self.vpn(shell, 'profile', 'use', 'home')
+            self.enable(1)
+            r = self.vpn(shell, 'profile', 'remove', 'home')
+            self.assertNotEqual(r.returncode, 0)
+            self.assertTrue((self.store / 'profiles/home').is_dir())
+            r = self.vpn(shell, 'off')
+            self.assertEqual(r.returncode, 0, r.stderr)
+            r = self.vpn(shell, 'profile', 'remove', 'home')
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertFalse((self.store / 'profiles/home').exists())
+            self.assertFalse((self.store / 'active').exists())
+
+    def test_edit_and_set(self):
+        for shell in self.each_shell():
+            self.fresh()
+            self.vpn(shell, 'profile', 'import', self.LINK, 'Home')
+            uri = self.store / 'profiles/home/uri'
+            # a link that does not parse leaves the old one
+            r = self.vpn(shell, 'profile', 'edit', 'home', 'trojan://@x:1')
+            self.assertNotEqual(r.returncode, 0)
+            self.assertEqual(uri.read_text(), self.LINK + '\n')
+            r = self.vpn(shell, 'profile', 'edit', 'home', vmess_link())
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(uri.read_text(), vmess_link() + '\n')
+            self.assertEqual([p.name for p in (self.store / 'profiles').iterdir()], ['home'])
+            r = self.vpn(shell, 'profile', 'set', 'home', 'TLS_PIN_SHA256', 'ab' * 32)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn("TLS_PIN_SHA256='" + 'ab' * 32 + "'", (self.store / 'profiles/home/meta').read_text())
+            for key, val in (('TLS_PIN_SHA256', 'zz'), ('UPSTREAM_HTTP_PROXY', 'h:x'), ('TYPE', 'sing-box'),
+                             ('MIHOMO_STACK', 'gvisor')):
+                r = self.vpn(shell, 'profile', 'set', 'home', key, val)
+                self.assertEqual(r.returncode, 2, (key, r.stderr))
+            r = self.vpn(shell, 'profile', 'set', 'home', 'NAME', 'Büro "1"')
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn('\thome\txray\tBüro "1"', self.vpn(shell, 'profile', 'list').stdout)
+
+    def test_settings(self):
+        for shell in self.each_shell():
+            self.fresh()
+            r = self.vpn(shell, 'settings', 'set', 'KILL_SWITCH', 'yes')
+            self.assertEqual(r.returncode, 2)
+            r = self.vpn(shell, 'settings', 'set', 'NOPE', '1')
+            self.assertEqual(r.returncode, 2)
+            r = self.vpn(shell, 'settings', 'set', 'REMOTE_DNS', '9.9.9.9')
+            self.assertEqual(r.returncode, 0, r.stderr)
+            r = self.vpn(shell, 'settings', 'get', 'REMOTE_DNS')
+            self.assertEqual(r.stdout, '9.9.9.9\n')
+            r = self.vpn(shell, 'settings')
+            got = dict(l.split('=', 1) for l in r.stdout.splitlines())
+            self.assertEqual((got['REMOTE_DNS'], got['KILL_SWITCH'], got['LAN_CIDRS'], got['XRAY']),
+                             ('9.9.9.9', '1', '', ''))
+            self.assertEqual(len(got), 12)
+            # empty: back to the default
+            r = self.vpn(shell, 'settings', 'set', 'REMOTE_DNS', '')
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(self.vpn(shell, 'settings', 'get', 'REMOTE_DNS').stdout, '1.1.1.1\n')
+
+    def test_on_and_off(self):
+        for shell in self.each_shell():
+            self.fresh()
+            r = self.vpn(shell, 'on')
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn('no active profile', r.stderr)
+            self.assertEqual(self.svc(), [])
+            self.vpn(shell, 'profile', 'import', self.LINK, 'Home')
+            self.vpn(shell, 'profile', 'use', 'home')
+            # no engines: not turned on, with the command that gets them
+            r = self.vpn(shell, 'on')
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn('mu300-vpn engines install', r.stderr)
+            self.assertIn('ENABLE=0', self.conf.read_text())
+            self.engines()
+            r = self.vpn(shell, 'on')
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn('ENABLE=1', self.conf.read_text())
+            self.assertEqual(self.svc(), ['svc enable', 'svc restart'])
+            self.svclog.unlink()
+            r = self.vpn(shell, 'restart')
+            self.assertEqual(self.svc(), ['svc restart'])
+            self.svclog.unlink()
+            r = self.vpn(shell, 'off')
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn('ENABLE=0', self.conf.read_text())
+            self.assertEqual(self.svc(), ['svc stop', 'svc disable'])
+            self.assertIn('kill switch removed', r.stdout)
+            self.assertIn('nft delete table inet mu300_vpn', self.ev.read_text())
+
+    def test_switching_profiles_keeps_the_kill_switch(self):
+        for shell in self.each_shell():
+            self.fresh()
+            self.engines()
+            self.enable(1)
+            self.assertEqual(self.vpn(shell, 'profile', 'add', 'sing-box', 'A', self.LINK).returncode, 0)
+            self.assertEqual(self.vpn(shell, 'profile', 'add', 'xray', 'B', self.LINK2).returncode, 0)
+            self.vpn(shell, 'profile', 'use', 'a')
+            r = self.vpn(shell, 'run')
+            self.assertEqual(r.returncode, 0, r.stderr)
+            r = self.vpn(shell, 'profile', 'use', 'b')
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(self.svc(), ['svc restart', 'svc restart'])
+            # the service's next run, on B: an xray VLESS profile behind the kill switch runs on sing-box
+            r = self.vpn(shell, 'run')
+            self.assertEqual(r.returncode, 0, r.stderr)
+            ev = self.ev.read_text()
+            self.assertEqual(ev.count('nft -f\n'), 2, ev)
+            self.assertNotIn('nft delete table inet mu300_vpn', ev)
+            self.assertIn('other.example.com', (self.tmp / 'run/config.json').read_text())
+
+    def test_nothing_secret_in_the_output(self):
+        for shell in self.each_shell():
+            self.fresh()
+            self.engines()
+            self.vpn(shell, 'settings', 'set', 'KILL_SWITCH', '0')
+            links = [self.LINK, vmess_link(), f'trojan://{self.UUID}@tr.example:443?sni=x.example',
+                     'ss://' + b64(f'aes-256-gcm:{self.UUID}') + '@ss.example:8388']
+            for i, link in enumerate(links):
+                r = self.vpn(shell, 'profile', 'import', link, f'p{i}')
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.enable(1)
+                self.vpn(shell, 'profile', 'use', f'p{i}')
+                outs = [self.vpn(shell, *a) for a in (['run'], ['status'], ['profile', 'list'],
+                                                      ['profile', 'show', f'p{i}'], ['check'], ['on'])]
+                for r in outs:
+                    self.assertNotIn(self.UUID, r.stdout + r.stderr, (link, r.args))
+                self.enable(0)

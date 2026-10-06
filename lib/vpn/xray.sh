@@ -1,11 +1,14 @@
-# The xray driver of mu300-vpn (sourced by load_driver): a VLESS link, run by Xray behind hev-socks5-tunnel.
+# The xray driver of mu300-vpn (sourced by load_driver): a vless, vmess, trojan or ss link, run by Xray behind
+# hev-socks5-tunnel.
 DRV_EXTRA=vpn
+# the per-profile options profile set takes (link_opt_set checks them)
+DRV_KEYS='TLS_PIN_SHA256 UPSTREAM_HTTP_PROXY'
 DRV_PKG=
 TUN=xtun
 XPID=; HPID=; DRV_GONE=
 
 # ---- xray engine ----------------------------------------------------------------------------------------------
-# Xray does VLESS and nothing else here; hev-socks5-tunnel owns the TUN and hands every TCP/UDP flow to Xray's
+# Xray speaks the link's protocol; hev-socks5-tunnel owns the TUN and hands every TCP/UDP flow to Xray's
 # SOCKS port on loopback. Neither installs routes, so the core does (routes_up, DRV_ROUTES=core), with the same rule
 # prefs and table as sing-box's auto_route - which is what lets routing_cleanup and the kill switch serve both engines.
 
@@ -70,15 +73,16 @@ save_pin() {
 
 gen_xray() {
     link_need
-    parse_uri
-    XMODE=$(param mode); SPX=$(urldecode "$(param spx)"); ENC=$(urldecode "$(param encryption)")
+    parse_link "$VLESS_URI" || exit 1
+    ENC=$(urldecode "$(param encryption)")
     # pcs/vcn are the share-link spellings of pinnedPeerCertSha256/verifyPeerCertByName; TLS_PIN_SHA256 in
     # vpn.conf is for links written before those existed
     PIN=${TLS_PIN_SHA256:-$(urldecode "$(param pcs)")}; VCN=$(urldecode "$(param vcn)")
     # the name is looked up now and Xray is given the address, so it never has to resolve anything itself - the
     # resolver it would use sits behind the tunnel it is trying to build. The name stays as the SNI. Behind the kill
     # switch the lookup goes through the resolve window (vpn_resolve).
-    SERVER_IP=$(vpn_resolve "$HOST")
+    # (an IPv6 address in the link is used as it is: vpn_resolve looks up IPv4 only)
+    case $HOST in *:*) SERVER_IP=$HOST ;; *) SERVER_IP=$(vpn_resolve "$HOST") ;; esac
     [ -n "$SERVER_IP" ] || { echo "cannot resolve the VPN server $HOST" >&2; exit 1; }
     # allowInsecure with nothing pinned yet: take whatever certificate the server presents now and keep it
     if pin_managed && [ -z "$PIN" ]; then
@@ -91,7 +95,8 @@ gen_xray() {
             exit 1
         fi
         PIN=$(fetch_pin) || { echo "the link asks for allowInsecure, which Xray no longer has, and the server's" \
-            "certificate could not be fetched to pin instead. Set TLS_PIN_SHA256 in $CONF, or ENGINE=sing-box." >&2; exit 1; }
+            "certificate could not be fetched to pin instead: mu300-vpn profile set ${ACTIVE:-ID} TLS_PIN_SHA256 ..." \
+            "(or TLS_PIN_SHA256 in $CONF without a profile store)" >&2; exit 1; }
         save_pin "$PIN"
         echo "pinned the server's current certificate ($PIN)"
     fi
@@ -101,10 +106,24 @@ gen_xray() {
     # reader scans every line and passes on only warnings and worse, so the system log does not fill up.
     printf '{"log":{"loglevel":"info","access":"none"},\n'
     printf '"inbounds":[{"tag":"socks-in","listen":"127.0.0.1","port":%d,"protocol":"socks","settings":{"auth":"noauth","udp":true,"ip":"127.0.0.1"}}],\n' "$SOCKS_PORT"
-    printf '"outbounds":[{"tag":"proxy","protocol":"vless","settings":{"vnext":[{"address":%s,"port":%s,"users":[{"id":%s,"encryption":%s' \
-        "$(json_str "$SERVER_IP")" "$PORT" "$(json_str "$UUID")" "$(json_str "${ENC:-none}")"
-    [ -n "$FLOW" ] && printf ',"flow":%s' "$(json_str "$FLOW")"
-    printf '}]}]},'; xray_stream_json; printf '},\n'
+    # the proxy outbound in the link's protocol; every one gets the same stream settings, with the mark
+    case $PROTO in
+        vless)
+            printf '"outbounds":[{"tag":"proxy","protocol":"vless","settings":{"vnext":[{"address":%s,"port":%s,"users":[{"id":%s,"encryption":%s' \
+                "$(json_str "$SERVER_IP")" "$PORT" "$(json_str "$UUID")" "$(json_str "${ENC:-none}")"
+            [ -n "$FLOW" ] && printf ',"flow":%s' "$(json_str "$FLOW")"
+            printf '}]}]},' ;;
+        vmess)
+            printf '"outbounds":[{"tag":"proxy","protocol":"vmess","settings":{"vnext":[{"address":%s,"port":%s,"users":[{"id":%s,"alterId":%s,"security":%s}]}]},' \
+                "$(json_str "$SERVER_IP")" "$PORT" "$(json_str "$UUID")" "$AID" "$(json_str "${METHOD:-auto}")" ;;
+        trojan)
+            printf '"outbounds":[{"tag":"proxy","protocol":"trojan","settings":{"servers":[{"address":%s,"port":%s,"password":%s}]},' \
+                "$(json_str "$SERVER_IP")" "$PORT" "$(json_str "$PASSWORD")" ;;
+        ss)
+            printf '"outbounds":[{"tag":"proxy","protocol":"shadowsocks","settings":{"servers":[{"address":%s,"port":%s,"method":%s,"password":%s}]},' \
+                "$(json_str "$SERVER_IP")" "$PORT" "$(json_str "$METHOD")" "$(json_str "$PASSWORD")" ;;
+    esac
+    xray_stream_json; printf '},\n'
     printf '{"tag":"direct","protocol":"freedom","streamSettings":{"sockopt":{"mark":%d}}}]}\n' "$((MARK))"
     } > "$RUN/xray.json"
     chmod 600 "$RUN/xray.json"
@@ -133,9 +152,11 @@ drv_engines_ok() {
     # there (the core runs it on the sing-box driver)
     case ${PURI:-${VLESS_URI:-}} in vless://*) [ -x "$BIN" ] ;; *) return 1 ;; esac
 }
-drv_check() { ( link_need; parse_uri ); }
+# the link takes apart and its transport is one the stream settings can express (Xray itself checks in drv_gen)
+drv_check() { ( link_need; parse_link "$VLESS_URI" || exit 1; PIN=; VCN=; xray_stream_json >/dev/null ); }
 drv_gen() { gen_xray; }
-drv_import() { link_import "$1"; }
+drv_import() { link_import "$1" 'vless vmess trojan ss'; }
+drv_set() { link_opt_set "$1" "$2"; }
 
 # Two processes and the routing between them, torn down together: if either dies the service exits, the routes
 # go with it and procd starts the whole thing again. Leaving rules behind with nothing at the other end is what

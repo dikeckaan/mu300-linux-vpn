@@ -648,7 +648,8 @@ class Tailscale(ShellTest):
     def envs(self, **extra):
         e = dict(MU300_VPN_CONF=self.conf, MU300_VPN_RUN=self.tmp / 'run-vpn', MU300_BIN=BIN,
                  MU300_LAN_CONF=self.tmp / 'no-lan.conf', MU300_OPT=self.tmp / 'opt', MU300_DISK=self.disk,
-                 MU300_EXTRA_CMD=self.stubs / 'extra', MU300_VPN_LIB=LIB)
+                 # (off tells the service manager to stop: never the real one)
+                 MU300_EXTRA_CMD=self.stubs / 'extra', MU300_VPN_LIB=LIB, MU300_VPN_SVC='true')
         e.update(extra)
         return e
 

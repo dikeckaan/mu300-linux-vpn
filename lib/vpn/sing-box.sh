@@ -4,6 +4,8 @@
 # exec'd in the foreground, as the service always ran it (DRV_FOREGROUND=1).
 DRV_EXTRA=vpn
 DRV_PKG=
+# (sing-box has no certificate pin: TLS_PIN_SHA256 is the xray driver's)
+DRV_KEYS=UPSTREAM_HTTP_PROXY
 DRV_ROUTES=self
 DRV_FOREGROUND=1
 TUN=sbtun
@@ -21,6 +23,7 @@ drv_alive() { ip link show "$TUN" >/dev/null 2>&1; }
 # exec'd: nothing of its own is left to stop here, and it removes its TUN when it exits
 drv_stop() { :; }
 drv_import() { link_import "$1"; }
+drv_set() { link_opt_set "$1" "$2"; }
 
 outbound_json() {
     printf '{"type":"vless","tag":"proxy","server":%s,"server_port":%s,"uuid":%s' "$(json_str "$HOST")" "$PORT" "$(json_str "$UUID")"

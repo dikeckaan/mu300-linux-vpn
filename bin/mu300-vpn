@@ -12,9 +12,14 @@
 #   mu300-vpn check [ID]  check a profile (the active one by default)
 #   mu300-vpn guard     put the kill switch up if the VPN is on with it (mobile-data and wifi-client, before
 #                       their uplink is up)
-#   mu300-vpn off       remove the kill switch (the service stop does not, so a crash never leaks),
-#                       and any routing an engine left behind if it is no longer running
-#   mu300-vpn status    service, tunnel, exit IP
+#   mu300-vpn on        ENABLE=1, the service enabled and started on the active profile
+#   mu300-vpn off       ENABLE=0, the service stopped, the kill switch removed (the service stop alone does not,
+#                       so a crash never leaks), and any routing an engine left behind
+#   mu300-vpn restart   the service restarted
+#   mu300-vpn status    profile, kill switch, engine, tunnel, exit IP
+#   mu300-vpn profile list|show|add|import|edit|set|remove|use|export   the profiles (export: the one command
+#                       that prints a profile's credentials)
+#   mu300-vpn settings [get [KEY] | set KEY VALUE]
 #   mu300-vpn engines   which engine programs it uses (the vpn extra: mu300-extra install vpn)
 set -e
 CONF=${MU300_VPN_CONF:-/etc/mu300/vpn.conf}
@@ -292,9 +297,10 @@ migrate_apply() {
     fi
     return 0
 }
-# profile_load ID: PDIR, PTYPE and PURI of that profile (ID already checked with valid_id)
+# profile_load ID [DIR]: PDIR, PTYPE and PURI of that profile (ID already checked with valid_id); DIR: read from
+# there instead (profile edit checks a new config in a scratch directory before it replaces the old one)
 profile_load() {
-    PDIR=$PROFILES/$1; PTYPE=; PURI=
+    PDIR=${2:-$PROFILES/$1}; PTYPE=; PURI=
     VLESS_URI=; ENGINE=; TLS_PIN_SHA256=; UPSTREAM_HTTP_PROXY=
     kv_var PTYPE "$PDIR/meta" TYPE
     # a link profile of the two engines the code below knows: what vpn.conf used to give it
@@ -326,7 +332,10 @@ legacy_inmemory() {
 _xray=; _hev=; _sb=; _mihomo=; _openvpn=
 read_enable
 migrate_legacy 2>/dev/null || true
+# STORE=1: the settings and the profiles come from the store (empty: vpn.conf in memory)
+STORE=
 if [ -d "$PROFILES" ] && [ -r "$SETTINGS" ]; then
+    STORE=1
     settings_load
     ACTIVE=$(cat "$ACTIVE_FILE" 2>/dev/null) || ACTIVE=
     { valid_id "$ACTIVE" && [ -d "$PROFILES/$ACTIVE" ]; } || ACTIVE=
@@ -397,10 +406,15 @@ engines_ok() { case "$ENGINE" in xray) [ -x "$XRAY" ] && [ -x "$HEV" ] ;; *) [ -
 # drv_stop, drv_status and drv_import (see the spec's table), and DRV_EXTRA, the extra that carries its engines
 # (empty: they are packages, which the service never installs). Until one is loaded - no active profile - the vpn
 # extra's engines for ENGINE are what gen, ensure_engines and status check, as before profiles existed.
-DRIVER=; DRV_EXTRA=vpn; DRV_PKG=; DRV_ROUTES=core; DRV_FOREGROUND=0; DRV_PIDS=; DRV_GONE=
+DRIVER=; DRV_EXTRA=vpn; DRV_PKG=; DRV_ROUTES=core; DRV_FOREGROUND=0; DRV_PIDS=; DRV_GONE=; DRV_KEYS=
+drv_engines() { case $ENGINE in xray) printf '%s\n' "$XRAY" "$HEV" ;; *) printf '%s\n' "$BIN" ;; esac; }
 drv_engines_ok() { engines_ok; }
 drv_status() { :; }
 drv_poll() { :; }
+# profile set KEY VALUE for a key in DRV_KEYS, with PDIR the profile: into its meta, or removed when empty. A driver
+# that checks its options, or keeps one elsewhere, defines its own.
+drv_set_default() { if [ -n "$2" ]; then kv_set "$PDIR/meta" "$1" "$2"; else kv_del "$PDIR/meta" "$1"; fi; }
+drv_set() { drv_set_default "$@"; }
 # load_driver TYPE: that type's driver sourced. The type becomes a path, so only [a-z-] gets that far; the types
 # reserved for later versions say so.
 load_driver() {
@@ -410,10 +424,11 @@ load_driver() {
     esac
     [ -r "$LIB/$1.sh" ] || { echo "$1: no driver for this profile type ($LIB/$1.sh)" >&2; return 1; }
     _drv=$1
-    # what a driver does not set is the default; drv_status and drv_poll are optional
-    DRV_ROUTES=core; DRV_FOREGROUND=0; TUN=; DRV_PIDS=; DRV_EXTRA=; DRV_PKG=; DRV_GONE=
+    # what a driver does not set is the default; drv_status, drv_poll and drv_set are optional
+    DRV_ROUTES=core; DRV_FOREGROUND=0; TUN=; DRV_PIDS=; DRV_EXTRA=; DRV_PKG=; DRV_GONE=; DRV_KEYS=
     drv_status() { :; }
     drv_poll() { :; }
+    drv_set() { drv_set_default "$@"; }
     . "$LIB/$_drv.sh"
     DRIVER=$_drv
 }
@@ -909,6 +924,299 @@ routing_cleanup() {
     return 0
 }
 
+# ---- the commands: the service, profiles, settings ----------------------------------------------------------------
+# svc ACTION: the mu300-vpn service told to start, stop, restart, enable or disable - systemd on Ubuntu and Arch,
+# procd's init script on OpenWrt (MU300_VPN_SVC: tests). A service manager that is not running (a chroot, a
+# container) is not an error worth stopping for: the switch in vpn.conf is what the next boot goes by.
+svc() {
+    if [ -n "${MU300_VPN_SVC:-}" ]; then "$MU300_VPN_SVC" "$1"
+    elif command -v systemctl >/dev/null 2>&1; then systemctl --no-ask-password "$1" mu300-vpn >/dev/null 2>&1
+    elif [ -x /etc/init.d/mu300-vpn ]; then /etc/init.d/mu300-vpn "$1" >/dev/null 2>&1
+    else false; fi || echo "could not $1 the mu300-vpn service" >&2
+    return 0
+}
+
+# the files a profile's config can be in, exactly one of them per profile (see the spec's Profiles and types)
+CONFIG_FILES='uri config.json config.yaml wg.conf client.ovpn'
+
+# the store, for the commands that change it: it exists only where it can be written (as root), see migrate_legacy
+store_need() {
+    [ -n "$STORE" ] && [ -w "$PROFILES" ] && [ -w "$VPN_DIR" ] ||
+        { echo "the profile store $VPN_DIR cannot be used here: run this as root" >&2; exit 1; }
+}
+store_read() {
+    [ -n "$STORE" ] && [ -r "$PROFILES" ] && [ -x "$PROFILES" ] ||
+        { echo "the profile store $VPN_DIR cannot be read here: run this as root" >&2; exit 1; }
+}
+# profile_arg ID: an id that is valid (exit 2) and names a profile (exit 1). Only a valid id is ever repeated.
+profile_arg() {
+    valid_id "${1:-}" || { echo "invalid profile id" >&2; exit 2; }
+    store_read
+    [ -d "$PROFILES/$1" ] || { echo "no such profile: $1" >&2; exit 1; }
+}
+# set_active ID: the active profile, replaced in one rename
+set_active() {
+    ( umask 077; printf '%s\n' "$1" > "$ACTIVE_FILE.new.$$" ) && mv "$ACTIVE_FILE.new.$$" "$ACTIVE_FILE" && return 0
+    rm -f "${ACTIVE_FILE:?}.new.$$"; return 1
+}
+
+# sniff_type SRC: the profile type a link or a file is for (the spec's import sniffing), or a message and 1. The
+# source is never repeated: a link, or a mistyped one, carries its credentials.
+sniff_type() {
+    case $1 in
+        vless://*|vmess://*|trojan://*|ss://*) echo xray; return 0 ;;
+        *://*) echo "not a kind of link this version knows (vless, vmess, trojan, ss)" >&2; return 1 ;;
+    esac
+    [ -f "$1" ] && [ -r "$1" ] || { echo "neither a link nor a readable file" >&2; return 1; }
+    # JSON: Xray's outbounds name a "protocol", sing-box's a "type"
+    if [ "$(tr -d ' \t\r\n' < "$1" | cut -c1)" = '{' ]; then
+        command -v jq >/dev/null 2>&1 || { echo "reading a JSON config needs jq" >&2; return 1; }
+        _t=$(jq -r 'if (.outbounds | type) != "array" then empty
+                    elif any(.outbounds[]; type == "object" and has("protocol")) then "xray"
+                    elif any(.outbounds[]; type == "object" and has("type")) then "sing-box" else empty end' \
+             "$1" 2>/dev/null) || _t=
+        [ -n "$_t" ] || { echo "a JSON file, but not an Xray or sing-box config with outbounds" >&2; return 1; }
+        echo "$_t"; return 0
+    fi
+    if grep -qi '^[[:space:]]*\[Interface\]' "$1"; then echo wireguard; return 0; fi
+    if grep -q -e '^[[:space:]]*client[[:space:]]*$' -e '^[[:space:]]*remote[[:space:]]' -e '<ca>' "$1"; then
+        echo openvpn; return 0
+    fi
+    if grep -q -e '^proxies:' -e '^proxy-providers:' "$1"; then echo mihomo; return 0; fi
+    echo "cannot tell what kind of config this is: mu300-vpn profile add TYPE NAME FILE" >&2
+    return 1
+}
+# src_name SRC: the name a source gives itself - a link's tag, a file's name without its extension
+src_name() {
+    case $1 in
+        *://*) link_tag "$1" 2>/dev/null || true ;;
+        *) _n=${1##*/}; printf '%s' "${_n%.*}" | tr -d '\000-\037\177' ;;
+    esac
+}
+
+# profile_import SRC [NAME] [TYPE]: a new profile from a link or a file; prints its id. The type is sniffed when
+# not given. The driver writes the files and the profile is checked; when either fails, the new directory goes
+# again, so there are never half-made profiles.
+profile_import() {
+    _src=$1; _name=${2:-}; _type=${3:-}
+    if [ -z "$_type" ]; then _type=$(sniff_type "$_src") || return 1; fi
+    load_driver "$_type" || return 1
+    [ -n "$_name" ] || _name=$(src_name "$_src")
+    [ -n "$_name" ] || _name=$_type
+    _id=$(profile_new "$_type" "$_name") || return 1
+    valid_id "$_id" || return 1
+    # (subshells: a driver's parser may exit)
+    if ( PDIR=$PROFILES/$_id; drv_import "$_src" ) && ( profile_load "$_id"; ACTIVE=$_id; drv_check ) >&2; then
+        echo "$_id"; return 0
+    fi
+    rm -rf "${PROFILES:?}/${_id:?}"
+    echo "profile not added" >&2
+    return 1
+}
+# profile_edit ID SRC: the profile's config replaced by SRC's, of the same type. It is imported and checked in a
+# scratch directory first (a name that is not a valid id, so nothing lists or loads it), and only then moved over
+# the old one; meta stays as it is.
+profile_edit() {
+    kv_var _type "$PROFILES/$1/meta" TYPE
+    load_driver "$_type" || return 1
+    _tmp=${PROFILES:?}/.edit.$$
+    rm -rf "${_tmp:?}"
+    ( umask 077; mkdir "$_tmp" ) && cp -p "$PROFILES/$1/meta" "$_tmp/meta" || { rm -rf "${_tmp:?}"; return 1; }
+    if ! { ( PDIR=$_tmp; drv_import "$2" ) && ( profile_load "$1" "$_tmp"; ACTIVE=$1; drv_check ) >&2; }; then
+        rm -rf "${_tmp:?}"; echo "profile $1 not changed" >&2; return 1
+    fi
+    _new=
+    for _f in $CONFIG_FILES; do [ -e "$_tmp/$_f" ] && { _new=$_f; break; }; done
+    if [ -z "$_new" ] || ! mv "$_tmp/$_new" "$PROFILES/$1/$_new"; then
+        rm -rf "${_tmp:?}"; echo "profile $1 not changed" >&2; return 1
+    fi
+    # the config of the old form, when the new one is another (a link replaced by a JSON config)
+    for _f in $CONFIG_FILES; do [ "$_f" = "$_new" ] || rm -f "${PROFILES:?}/${1:?}/${_f:?}"; done
+    rm -rf "${_tmp:?}"
+}
+# profile_server DIR: the server's HOST:PORT as the profile's config names it, or -. Only these two: the rest of a
+# config is credentials.
+profile_server() (
+    _s=
+    if [ -r "$1/uri" ]; then
+        if parse_link "$(cat "$1/uri")" >/dev/null 2>&1; then
+            case $HOST in *:*) _s="[$HOST]:$PORT" ;; *) _s="$HOST:$PORT" ;; esac
+        fi
+    elif [ -r "$1/wg.conf" ]; then
+        _s=$(sed -n 's/^[[:space:]]*[Ee][Nn][Dd][Pp][Oo][Ii][Nn][Tt][[:space:]]*=[[:space:]]*//p' "$1/wg.conf" | head -n1)
+    elif [ -r "$1/client.ovpn" ]; then
+        _s=$(awk '$1 == "remote" {print $2 ":" ($3 ~ /^[0-9]+$/ ? $3 : 1194); exit}' "$1/client.ovpn")
+    elif [ -r "$1/config.json" ] && command -v jq >/dev/null 2>&1; then
+        _s=$(jq -r '[.outbounds[]? | objects | ((.settings.vnext[]?, .settings.servers[]?) | "\(.address):\(.port)"),
+                     (select(.server) | "\(.server):\(.server_port)")] | first // empty' "$1/config.json" 2>/dev/null) || _s=
+    fi
+    # a file can say anything: only what a host and port can be
+    _s=$(printf '%s' "$_s" | tr -cd 'A-Za-z0-9.:_[]-')
+    echo "${_s:--}"
+)
+# one line of the profile list: * on the active one, then id, type and name, tab-separated
+profile_line() {
+    kv_var _t "$PROFILES/$1/meta" TYPE; kv_var _n "$PROFILES/$1/meta" NAME
+    if [ "$1" = "$ACTIVE" ]; then _a='*'; else _a=' '; fi
+    printf '%s\t%s\t%s\t%s\n' "$_a" "$1" "$_t" "$(printf '%s' "$_n" | tr '\t' ' ')"
+}
+
+profile_usage() {
+    echo "usage: mu300-vpn profile list | show ID | add TYPE NAME FILE|URI | import FILE|URI [NAME] |" \
+        "edit ID FILE|URI | set ID KEY VALUE | remove ID | use ID | export ID" >&2
+    exit 2
+}
+profile_cmd() {
+    _sub=${1:-list}; [ $# -eq 0 ] || shift
+    case $_sub in
+        list)
+            [ $# -eq 0 ] || profile_usage
+            store_read
+            for _d in "$PROFILES"/*; do
+                _i=${_d##*/}
+                if valid_id "$_i" && [ -d "$_d" ]; then profile_line "$_i"; fi
+            done ;;
+        show)
+            [ $# -eq 1 ] || profile_usage
+            profile_arg "$1"
+            _d=$PROFILES/$1
+            for _k in NAME TYPE SOURCE CREATED; do kv_var "_m$_k" "$_d/meta" "$_k"; done
+            printf 'id\t%s\nname\t%s\ntype\t%s\nsource\t%s\ncreated\t%s\nserver\t%s\n' "$1" \
+                "$(printf '%s' "$_mNAME" | tr '\t' ' ')" "$_mTYPE" "$_mSOURCE" "$_mCREATED" "$(profile_server "$_d")" ;;
+        add)
+            [ $# -eq 3 ] || profile_usage
+            store_need
+            profile_import "$3" "$2" "$1" || exit 1 ;;
+        import)
+            [ $# -ge 1 ] && [ $# -le 2 ] || profile_usage
+            store_need
+            profile_import "$1" "${2:-}" || exit 1 ;;
+        edit)
+            [ $# -eq 2 ] || profile_usage
+            profile_arg "$1"; store_need
+            profile_edit "$1" "$2" || exit 1
+            echo "profile $1 changed"
+            # the running VPN on the new config
+            if [ "$1" = "$ACTIVE" ] && [ "$ENABLE" = 1 ]; then svc restart; fi ;;
+        set)
+            [ $# -eq 3 ] || profile_usage
+            profile_arg "$1"; store_need
+            PDIR=$PROFILES/$1
+            case $2 in
+                NAME) [ -n "$3" ] || { echo "a profile needs a name" >&2; exit 2; }
+                      kv_set "$PDIR/meta" NAME "$3" || exit 1 ;;
+                TYPE|SOURCE|CREATED) echo "$2 cannot be changed" >&2; exit 2 ;;
+                *)
+                    kv_var _type "$PDIR/meta" TYPE
+                    load_driver "$_type" || exit 1
+                    case $2 in *[!A-Z0-9_]*|'') echo "not an option of $_type profiles" >&2; exit 2 ;; esac
+                    case " $DRV_KEYS " in *" $2 "*) ;; *) echo "$2 is not an option of $_type profiles" >&2; exit 2 ;; esac
+                    _rc=0; drv_set "$2" "$3" || _rc=$?
+                    [ "$_rc" = 0 ] || exit "$_rc" ;;
+            esac
+            if [ "$1" = "$ACTIVE" ] && [ "$ENABLE" = 1 ]; then echo "the VPN uses it from its next start: mu300-vpn restart" >&2; fi ;;
+        remove)
+            [ $# -eq 1 ] || profile_usage
+            profile_arg "$1"; store_need
+            if [ "$1" = "$ACTIVE" ]; then
+                [ "$ENABLE" != 1 ] || { echo "profile $1 is in use and the VPN is on: mu300-vpn off, or profile use another one, first" >&2; exit 1; }
+                rm -f "${ACTIVE_FILE:?}"
+            fi
+            rm -rf "${PROFILES:?}/${1:?}"
+            echo "profile $1 removed" ;;
+        use)
+            [ $# -eq 1 ] || profile_usage
+            profile_arg "$1"; store_need
+            kv_var _type "$PROFILES/$1/meta" TYPE
+            # a type this version cannot run never becomes the active one
+            load_driver "$_type" || exit 1
+            set_active "$1" || { echo "could not make profile $1 the active one" >&2; exit 1; }
+            echo "profile $1 is the active one"
+            # The service's next run replaces the kill switch in one transaction like any restart, so it stays up
+            # all the way from the old profile's tunnel to the new one's.
+            if [ "$ENABLE" = 1 ]; then svc restart; fi ;;
+        export)
+            [ $# -eq 1 ] || profile_usage
+            profile_arg "$1"
+            # the one place a profile's credentials are printed: asked for by its id, to the terminal
+            for _f in $CONFIG_FILES; do
+                if [ -r "$PROFILES/$1/$_f" ]; then cat "$PROFILES/$1/$_f"; return 0; fi
+            done
+            echo "profile $1 has no config" >&2; exit 1 ;;
+        *) profile_usage ;;
+    esac
+}
+
+SETTING_KEYS='KILL_SWITCH TAILSCALE IPV6 REMOTE_DNS BOOTSTRAP_DNS LAN_CIDRS MIHOMO_CONTROLLER XRAY HEV SING_BOX MIHOMO OPENVPN'
+# setting_show KEY: the value in force - from the store, or as vpn.conf gave it where the store is not used
+setting_show() {
+    if [ -n "$STORE" ]; then setting "$1"; return; fi
+    case $1 in XRAY) _v=$_xray ;; HEV) _v=$_hev ;; SING_BOX) _v=$_sb ;; MIHOMO) _v=$_mihomo ;; OPENVPN) _v=$_openvpn ;;
+        *) eval "_v=\${$1:-}" ;; esac
+    printf '%s\n' "$_v"
+}
+settings_usage() { echo "usage: mu300-vpn settings [get [KEY] | set KEY VALUE]" >&2; exit 2; }
+settings_cmd() {
+    _known() { case " $SETTING_KEYS " in *" $1 "*) return 0 ;; esac; echo "unknown setting" >&2; exit 2; }
+    case ${1:-get} in
+        get)
+            if [ $# -le 1 ]; then
+                for _k in $SETTING_KEYS; do printf '%s=%s\n' "$_k" "$(setting_show "$_k")"; done
+            else
+                [ $# -eq 2 ] || settings_usage
+                _known "$2"; setting_show "$2"
+            fi ;;
+        set)
+            [ $# -eq 3 ] || settings_usage
+            _known "$2"
+            # an empty value puts the setting back to its default
+            [ -z "$3" ] || setting_valid "$2" "$3" || { echo "$2: not a valid value" >&2; exit 2; }
+            store_need
+            if [ -n "$3" ]; then kv_set "$SETTINGS" "$2" "$3" || exit 1; else kv_del "$SETTINGS" "$2" || exit 1; fi
+            if [ "$ENABLE" = 1 ]; then echo "the VPN uses it from its next start: mu300-vpn restart" >&2; fi ;;
+        *) settings_usage ;;
+    esac
+}
+
+# on: the active profile checked, its engines there, then ENABLE=1 and the service enabled and (re)started
+vpn_on() {
+    if [ -n "$STORE" ]; then _have=$ACTIVE; else _have=$PURI; fi
+    [ -n "$_have" ] || { echo "no active profile: mu300-vpn profile use ID" >&2; exit 1; }
+    _who=${ACTIVE:-vpn.conf}
+    load_driver "$PTYPE" || exit 1
+    ( drv_check ) || { echo "profile $_who does not check: the VPN is not turned on" >&2; exit 1; }
+    drv_engines_ok || { echo "the engines of profile $_who are not installed: run mu300-vpn engines install $PTYPE" >&2; exit 1; }
+    # a VLESS xray profile behind the kill switch needs sing-box (vless_on_sing_box), which run would refuse later
+    _m=$( (vless_on_sing_box) 2>&1 >/dev/null ) || { printf '%s\n' "$_m" >&2; exit 1; }
+    set_enable 1 || { echo "could not write ENABLE=1 to $CONF" >&2; exit 1; }
+    svc enable
+    svc restart
+    echo "VPN on (profile $_who)"
+}
+vpn_status() {
+    if [ -n "$ACTIVE" ]; then _p="$ACTIVE ($PTYPE)"
+    elif [ -z "$STORE" ] && [ -n "$PURI" ]; then _p="vpn.conf ($PTYPE)"
+    else _p=none; fi
+    echo "profile: $_p  enabled: $ENABLE  kill switch: $KILL_SWITCH ($(nft list table inet mu300_vpn >/dev/null 2>&1 && echo active || echo inactive))"
+    if [ -z "$PTYPE" ] || load_driver "$PTYPE" 2>/dev/null; then
+        # the engine that would run: a VLESS xray profile behind the kill switch runs on sing-box
+        if [ -n "$PTYPE" ]; then vless_on_sing_box >/dev/null 2>&1 || true; fi
+        if drv_engines_ok; then echo "engine: ${DRIVER:-$ENGINE} ($(drv_engines | tr '\n' ' ' | sed 's/ $//'))"
+        else engines_missing 2>&1; fi
+    else
+        echo "engine: no driver for $PTYPE profiles in this version"
+    fi
+    _if=$(cat "$RUN/iface" 2>/dev/null) || _if=
+    _if=${_if:-$TUN}
+    if [ -n "$_if" ] && ip link show "$_if" >/dev/null 2>&1; then
+        echo "tunnel: $(ip -br addr show "$_if" 2>/dev/null | tr -s ' ')"
+        drv_status 2>/dev/null || true
+        printf 'exit IP: '; (wget -qO- -T 8 http://api.ipify.org 2>/dev/null || curl -s -m 8 http://api.ipify.org 2>/dev/null || echo unreachable); echo
+    else
+        echo "tunnel: down"
+    fi
+}
+
 # tests/ source this file for its functions only
 [ -z "${MU300_LIB:-}" ] || return 0
 
@@ -955,16 +1263,20 @@ case "${1:-status}" in
     # guard: before the modem's bearer comes up (mobile-data calls it), so a VPN with the kill switch is never
     # without it at boot, before the service has started
     guard) if [ "$ENABLE" = 1 ] && [ "$KILL_SWITCH" = 1 ]; then killswitch_on; fi ;;
-    off) killswitch_off; echo "kill switch removed"; routing_cleanup ;;
-    status)
-        echo "engine: $ENGINE  enabled: $ENABLE  kill switch: $KILL_SWITCH ($(nft list table inet mu300_vpn >/dev/null 2>&1 && echo active || echo inactive))"
-        engines_ok || echo "$MISSING"
-        ip -br addr show "$TUN" 2>/dev/null || echo "$TUN: down"
-        if ip link show "$TUN" >/dev/null 2>&1; then
-            printf 'exit IP: '; (wget -qO- -T 8 http://api.ipify.org 2>/dev/null || curl -s -m 8 http://api.ipify.org 2>/dev/null || echo unreachable); echo
-        fi ;;
+    # off: the switch to 0 and the service stopped first, so no engine is running when the kill switch comes down
+    off)
+        set_enable 0 || echo "could not write ENABLE=0 to $CONF" >&2
+        svc stop; svc disable
+        killswitch_off; echo "kill switch removed"; routing_cleanup ;;
+    on) vpn_on ;;
+    restart)
+        [ "$ENABLE" = 1 ] || { echo "the VPN is off: mu300-vpn on" >&2; exit 1; }
+        svc restart ;;
+    status) vpn_status ;;
+    profile) shift; profile_cmd "$@" ;;
+    settings) shift; settings_cmd "$@" ;;
     engines)
         for e in "$XRAY" "$HEV" "$BIN"; do printf '%s %s\n' "$e" "$([ -x "$e" ] && echo ok || echo missing)"; done
         engines_ok || { echo "$MISSING" >&2; exit 1; } ;;
-    *) echo "usage: $0 gen|run|check [ID]|guard|off|status|engines" >&2; exit 2 ;;
+    *) echo "usage: $0 on|off|restart|status|profile ...|settings ...|engines|check [ID]|gen|run|guard" >&2; exit 2 ;;
 esac
