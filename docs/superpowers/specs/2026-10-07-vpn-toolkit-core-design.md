@@ -134,17 +134,17 @@ The kill switch lets only marked traffic out on an uplink, and rule 9000 keeps i
   with `jq` into every outbound. Raw JSON also gets our SOCKS inbound in place of its own `inbounds` (nothing listens
   on the LAN), and server names in `vnext`/`servers` are resolved by the core and replaced by addresses (the name
   stays as `serverName` where TLS/REALITY had none) - Xray's own resolver sits behind the tunnel it is building.
+  What else of the config survives is an allowlist (Security).
 * **sing-box**: `route.default_mark`. Raw JSON: `jq` replaces `inbounds` with our TUN (gvisor, `sbtun`,
   `auto_route`, `strict_route`, the LAN excluded - as generated today), sets `default_mark`, `auto_detect_interface`,
   and adds a `mu300-bootstrap` UDP DNS server (BOOTSTRAP_DNS) used as `default_domain_resolver` unless the config
-  names its own. Checked with `sing-box check`.
-* **mihomo**: `routing-mark: 720`. The YAML's top-level `tun`, `dns`, `routing-mark`, `interface-name`,
-  `auto-redirect`, `external-controller*`, `external-ui*`, `secret`, `allow-lan`, `bind-address`, `listeners`,
-  `iptables`, `tproxy-port`, `redir-port` blocks are removed (awk: a top-level key and its indented block) and ours
-  appended: TUN `mh-mu300`, stack from the profile's `MIHOMO_STACK` (default gvisor), `auto-route: false`,
-  `auto-detect-interface: false`, no DNS hijack; `dns` with `proxy-server-nameserver`/`default-nameserver` =
-  BOOTSTRAP_DNS, `nameserver` = REMOTE_DNS, `respect-rules: true`; `allow-lan: false`; `external-controller` only
-  when MIHOMO_CONTROLLER is set. Checked with `mihomo -t`.
+  names its own. The rest is held to an allowlist (Security). Checked with `sing-box check`.
+* **mihomo**: `routing-mark: 720`. The YAML is reduced to the top-level keys the Security section allows (awk: a
+  top-level key and its indented block; every other block is removed) and ours appended: TUN `mh-mu300`, stack from
+  the profile's `MIHOMO_STACK` (default gvisor), `auto-route: false`, `auto-detect-interface: false`, no DNS hijack;
+  `dns` with `proxy-server-nameserver`/`default-nameserver` = BOOTSTRAP_DNS, `nameserver` = REMOTE_DNS,
+  `respect-rules: true`; `allow-lan: false`; `bind-address: '127.0.0.1'`; `external-controller` only when
+  MIHOMO_CONTROLLER is set. Checked with `mihomo -t`.
 * **wireguard**: `wg set wg-mu300 fwmark 0x2d0`. `wg.conf`'s wg-quick keys (Address, DNS, MTU, Table, Pre/PostUp/Down,
   SaveConfig) are stripped for `wg setconf`, the Endpoint name is resolved, Address goes on with `ip addr`, MTU
   default 1420, DNS (first) to `$RUN/dns`. A peer without `0.0.0.0/0` in AllowedIPs gets a warning (traffic outside
@@ -220,8 +220,53 @@ Per system, at every start of `mu300-vpn` (any command), idempotent, and only wh
 * No secret reaches stdout, stderr or the log except through `profile export` (and `settings get` of a non-secret
   set); error messages name the profile id, never the link. `profile show` shows the server host and port only.
 * OpenVPN: `--script-security 2` with only our `--up` script; every script directive of the file removed.
-* mihomo: external controller off unless MIHOMO_CONTROLLER says so, and then only on loopback; `allow-lan: false`.
-* xray raw JSON: its inbounds replaced by our loopback SOCKS. sing-box raw JSON: its inbounds replaced by our TUN.
+* **Raw configs are hostile input.** A raw Xray or sing-box config, and later a mihomo YAML, comes from a user's
+  import, from LuCI or from a subscription, and is run as root. Everything that listens or exposes control is ours;
+  a config is held to an allowlist of what it may contain, never a denylist, because each engine release adds
+  features (some of which listen) faster than a denylist would follow. The engine gets a file rebuilt from the
+  allowed keys only, written 0600 into `$RUN`, and `json_listens_loopback_only` checks that file before it runs:
+  every `listen`, `listen_port` and `external_controller` anywhere in it must be `127.0.0.1`, or the start fails.
+  The check is behind the rewrite, so a later change to a rewrite that lets a listener through fails closed.
+  A refusal names the offending keys (reduced to printable characters, at most 8), never a value. The keys are
+  checked by `drv_check`, so at import (which rolls back), at `profile edit`, at `check`, and again at every start.
+* **What a raw config may do:** pick its outbounds and the servers they reach, route between them with its own
+  rules, and name its DNS servers. That is also its exposure, said plainly: a `direct`/`freedom` outbound (or a DNS
+  server whose detour is one) sends traffic out of the tunnel onto the uplink with the engine's mark, past the kill
+  switch. Split tunnelling is the config's own choice, and the kill switch does not override it; a user who wants
+  everything through the tunnel imports a config that routes everything through the tunnel. A config can also name
+  files the engine reads (sing-box local rule sets, certificate paths), which parse or fail; it can name no file
+  the engine writes.
+* **xray raw JSON.** Kept as the config has them: `outbounds` (each given `sockopt.mark`, server names resolved),
+  `routing`, `dns`, `fakedns`, `observatory`, `burstObservatory` (the last three open nothing). Ours: `inbounds`
+  (one SOCKS inbound on 127.0.0.1:SOCKS_PORT, so no dokodemo-door or other inbound of the config's survives) and
+  `log` (`{"loglevel":"warning","access":"none"}`, no access or error file). Dropped without a word, because panels
+  put them in nearly every config: `api` and `metrics` (each opens a listener), `stats`, `policy` (only meaningful
+  to them), and `remarks` (a subscription's name for the config); a routing rule whose `outboundTag` is the API's
+  tag goes with the API. Anything else - `reverse` (its portals take connections in), `transport`, or a key a later
+  Xray adds - refuses the config.
+* **sing-box raw JSON.** Kept: `dns` (plus our `mu300-bootstrap` server), `outbounds`, and `endpoints` when every
+  endpoint is `wireguard` (its `listen_port` removed, so it dials out from a port the kernel picks). A `tailscale`
+  endpoint, which joins a tailnet whose members can then reach the device, refuses the config. Ours: `inbounds`
+  (our TUN only), `log` (`{"level":"warn","timestamp":false}`, stdout only, so no `output` path). Dropped:
+  `experimental` as a whole (`clash_api`, `v2ray_api`, the `debug` listener, and a `cache_file` path the engine
+  would write). Any other top-level key - `services` (ssm-api, derp, resolved: all listen), `ntp`, `certificate`,
+  a later sing-box's additions - refuses the config. Inside `route`: `rules`, `rule_set`, `final` and
+  `default_domain_resolver` are the config's; `default_mark` and `auto_detect_interface` ours; `default_interface`
+  dropped (the uplink is auto-detected); any other route key refuses the config. A per-outbound `routing_mark` or
+  `bind_interface` the config sets is its own: a mark other than 720 is dropped by the kill switch (closed, not a
+  leak).
+* **mihomo YAML (Task 7 follows this).** Clash files carry many harmless keys, so unknown top-level keys are removed,
+  not refused. Kept: `proxies`, `proxy-groups`, `proxy-providers`, `rules`, `rule-providers`, `sub-rules`, `hosts`,
+  `mode`, `log-level`, `ipv6`, `geodata-mode`, `geodata-loader`, `geox-url`, `profile`, `sniffer`. Written by the
+  driver, whatever the file had: `tun` (ours), `dns` (ours), `routing-mark: 720`, `allow-lan: false`,
+  `bind-address: '127.0.0.1'`, and `external-controller` only as MIHOMO_CONTROLLER, which must be a 127.0.0.1
+  address (no `external-controller-tls`/`-unix`/`-pipe`, no `external-ui*`, and a `secret` only with the
+  controller). `port`, `socks-port`, `mixed-port`, `redir-port` and `tproxy-port` are removed (the TUN is the only
+  inbound; were one ever written, `allow-lan: false` and the bind address keep it on loopback). Everything else is
+  removed with the unlisted keys - among them `listeners`, `tunnels`, `ss-config`, `vmess-config`, `tuic-server`
+  (all listen), `ebpf`, `iptables`, `interface-name`, `ntp` (`write-to-system` would set the clock), `secret`,
+  `external-*`. mihomo runs with its home directory under `$RUN` and without `SAFE_PATHS`, so a provider's `path`
+  or the geodata it downloads stays inside it.
 * The kill switch is unchanged: only marked traffic, NTP and the Wi-Fi client's DHCP leave on an uplink; forwarded
   traffic to an uplink is dropped. Every new driver marks its own sockets, so none of them needs an exception.
 

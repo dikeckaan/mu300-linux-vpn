@@ -16,7 +16,9 @@ drv_engines_ok() { [ -x "$BIN" ]; }
 # the link takes apart (parse_uri exits on a bad one, hence the subshell), or the raw config names an outbound type;
 # the config itself is checked by sing-box in drv_gen
 drv_check() {
-    if singbox_raw; then json_check "$SING_BOX_JSON_TEST" 'a sing-box config with outbounds'; return; fi
+    if singbox_raw; then
+        json_check "$SING_BOX_JSON_TEST" 'a sing-box config with outbounds' && singbox_json_keys_ok; return
+    fi
     ( link_need; parse_uri )
 }
 drv_gen() { if singbox_raw; then gen_singbox_json; else gen_singbox; fi; }
@@ -110,25 +112,48 @@ gen_singbox() {
 # leaves on whichever uplink is up (auto_detect_interface), and a UDP server at BOOTSTRAP_DNS resolves the server
 # names, unless the config names a default_domain_resolver of its own. sing-box looks them up itself, on its marked
 # socket, so no resolve window is needed. A mu300-bootstrap server the config already has (one rewritten before,
-# copied from $RUN) is replaced, not doubled: sing-box refuses two servers with one tag. The config's own control
-# APIs (experimental.clash_api, v2ray_api) are removed too: they can listen on 0.0.0.0, and the VPN keeps control
-# APIs off.
+# copied from $RUN) is replaced, not doubled: sing-box refuses two servers with one tag.
+#
+# What a raw config may contain is a list (the spec's Security section), not whatever sing-box accepts: sing-box adds
+# features that listen (services such as ssm-api and derp, the clash and v2ray APIs, the debug server) faster than a
+# denylist would follow. Top level: dns, outbounds and route are the config's; log is ours (warn, stdout only: an
+# output path from the config would be a file written as root); inbounds and experimental are dropped (experimental
+# holds the control APIs and a cache file path); endpoints are allowed when every one is WireGuard, whose listen_port
+# is dropped so it dials out from a port the kernel picks. A Tailscale endpoint joins a tailnet whose members can
+# reach the device, so it refuses the config, as does any other top-level key. In route: rules, rule_set, final and
+# default_domain_resolver are the config's, default_mark and auto_detect_interface ours, default_interface is
+# dropped (the uplink is auto-detected), and any other key refuses the config.
 SING_BOX_JSON_TEST='.outbounds[0].type | type == "string"'
+SING_BOX_JSON_KEYS='dns outbounds route endpoints log inbounds experimental'
+SING_BOX_ROUTE_KEYS='rules rule_set final default_domain_resolver default_mark auto_detect_interface default_interface'
 singbox_raw() { [ -n "${PDIR:-}" ] && [ -r "$PDIR/config.json" ]; }
+singbox_json_keys_ok() {
+    json_refuse_keys "$PDIR/config.json" . "$SING_BOX_JSON_KEYS" "the profile's sing-box config" || return 1
+    json_refuse_keys "$PDIR/config.json" '.route' "$SING_BOX_ROUTE_KEYS" "the profile's sing-box route" || return 1
+    jq -e '(.endpoints // []) | type == "array" and all(type == "object" and .type == "wireguard")' \
+        "$PDIR/config.json" >/dev/null 2>&1 ||
+        { echo "the profile's sing-box config has an endpoint that is not WireGuard" >&2; return 1; }
+}
 gen_singbox_json() {
     command -v jq >/dev/null 2>&1 || { echo "a raw sing-box config needs jq" >&2; exit 1; }
+    singbox_json_keys_ok || exit 1
     mkdir -p "$RUN"; chmod 700 "$RUN"
     ( umask 077; jq --arg tun "$TUN" --argjson addrs "[$(singbox_addrs)]" --argjson excl "$(json_list "$LAN_CIDRS")" \
         --argjson mark "$((MARK))" --arg boot "$BOOTSTRAP_DNS" '
-        .inbounds = [{"type":"tun","tag":"tun-in","stack":"gvisor","interface_name":$tun,"address":$addrs,"mtu":1400,
-                      "auto_route":true,"strict_route":true,"route_exclude_address":$excl}]
+        {dns, outbounds, route, endpoints} | with_entries(select(.value != null))
+        | .log = {"level":"warn","timestamp":false}
+        | .inbounds = [{"type":"tun","tag":"tun-in","stack":"gvisor","interface_name":$tun,"address":$addrs,"mtu":1400,
+                        "auto_route":true,"strict_route":true,"route_exclude_address":$excl}]
+        | if .endpoints then .endpoints |= map(del(.listen_port)) else . end
+        | .route = ((.route // {}) | del(.default_interface))
         | .route.default_mark = $mark | .route.auto_detect_interface = true
         | .dns.servers = ((.dns.servers // []) | map(select(type != "object" or .tag != "mu300-bootstrap"))
                           | . + [{"type":"udp","tag":"mu300-bootstrap","server":$boot}])
-        | .route.default_domain_resolver = (.route.default_domain_resolver // "mu300-bootstrap")
-        | del(.experimental.clash_api, .experimental.v2ray_api)' \
+        | .route.default_domain_resolver = (.route.default_domain_resolver // "mu300-bootstrap")' \
         "$PDIR/config.json" > "$RUN/config.json" ) ||
         { rm -f "$RUN/config.json"; echo "cannot rewrite the profile's sing-box config" >&2; exit 1; }
     chmod 600 "$RUN/config.json"
+    json_listens_loopback_only "$RUN/config.json" ||
+        { rm -f "$RUN/config.json"; echo "the rewritten sing-box config listens beyond 127.0.0.1" >&2; exit 1; }
     "$BIN" check -c "$RUN/config.json"
 }

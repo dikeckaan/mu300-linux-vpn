@@ -1047,21 +1047,157 @@ class RawJson(ShellTest):
             self.assertEqual(cfg['dns']['servers'], [{"type": "udp", "tag": "mu300-bootstrap", "server": "1.1.1.1"}])
             self.sb.write_text(self.json.dumps(SING_BOX_RAW))
 
-    def test_sing_box_control_apis_are_removed(self):
-        raw = dict(SING_BOX_RAW, experimental={"clash_api": {"external_controller": "0.0.0.0:9090", "secret": "s"},
-                                               "v2ray_api": {"listen": "0.0.0.0:8080"},
-                                               "cache_file": {"enabled": True}})
+    def listeners(self, node, path=''):
+        """Every listen address, listen port and controller in a generated config, wherever it sits, as
+        (path, value)."""
+        found = []
+        if isinstance(node, dict):
+            for k, v in node.items():
+                if k in ('listen', 'listen_port', 'external_controller'):
+                    found.append((f'{path}.{k}', v))
+                found += self.listeners(v, f'{path}.{k}')
+        elif isinstance(node, list):
+            for i, v in enumerate(node):
+                found += self.listeners(v, f'{path}[{i}]')
+        return found
+
+    def refused(self, shell, path, raw, *names):
+        """The config is refused at import, naming each key in names, with no credential in the output and no
+        profile left behind."""
+        path.write_text(self.json.dumps(raw))
+        self.fresh()
+        r = self.cli(shell, 'profile', 'import', path, 'Raw')
+        self.assertNotEqual(r.returncode, 0, (shell, raw))
+        for n in names:
+            self.assertIn(n, r.stderr, (shell, raw))
+        self.assertNotIn(self.UUID, r.stdout + r.stderr)
+        self.assertFalse((self.store / 'profiles/raw').exists())
+        return r
+
+    def test_xray_only_allowed_keys_reach_xray(self):
+        # Everything in this config that listens, exposes control or writes a file is dropped; what a config may
+        # carry (outbounds, routing, dns, fakedns, observatory) comes through unchanged.
+        dns = {"servers": ["1.1.1.1", {"address": "8.8.8.8", "domains": ["geosite:google"]}]}
+        raw = dict(XRAY_RAW,
+                   log={"loglevel": "debug", "access": "/etc/passwd-log", "error": "/etc/err-log"},
+                   inbounds=[{"tag": "api", "listen": "0.0.0.0", "port": 10085, "protocol": "dokodemo-door",
+                              "settings": {"address": "127.0.0.1"}},
+                             {"tag": "s", "listen": "0.0.0.0", "port": 1080, "protocol": "socks"}],
+                   api={"tag": "api", "listen": "0.0.0.0:10086", "services": ["HandlerService", "StatsService"]},
+                   stats={}, metrics={"tag": "metrics", "listen": "0.0.0.0:11111"},
+                   policy={"system": {"statsInboundUplink": True}}, remarks="panel",
+                   dns=dns, fakedns=[{"ipPool": "198.18.0.0/15", "poolSize": 65535}],
+                   observatory={"subjectSelector": ["proxy"]},
+                   routing={"domainStrategy": "AsIs",
+                            "rules": [{"type": "field", "inboundTag": ["api"], "outboundTag": "api"},
+                                      {"type": "field", "ip": ["geoip:private"], "outboundTag": "direct"}]})
+        self.xray.write_text(self.json.dumps(raw))
+        for shell in self.each_shell():
+            self.fresh()
+            r = self.cli(shell, 'profile', 'import', self.xray, 'Raw')
+            self.assertEqual(r.returncode, 0, r.stderr)
+            r = self.gen(shell, 'raw')
+            self.assertEqual(r.returncode, 0, r.stderr)
+            text = (self.tmp / 'run/xray.json').read_text()
+            cfg = self.json.loads(text)
+            self.assertEqual(sorted(cfg), ['dns', 'fakedns', 'inbounds', 'log', 'observatory', 'outbounds',
+                                           'routing'])
+            self.assertEqual([(i['protocol'], i['listen']) for i in cfg['inbounds']], [('socks', '127.0.0.1')])
+            self.assertEqual(cfg['log'], {"loglevel": "warning", "access": "none"})
+            self.assertEqual((cfg['dns'], cfg['fakedns'], cfg['observatory']),
+                             (dns, raw['fakedns'], raw['observatory']))
+            # the rule that led to the API's handler went with it; the config's own routing stays
+            self.assertEqual(cfg['routing'], {"domainStrategy": "AsIs", "rules": [raw['routing']['rules'][1]]})
+            self.assertEqual([o['protocol'] for o in cfg['outbounds']], ['vless', 'freedom'])
+            self.assertNotIn('/etc/', text)
+            self.assertNotIn('dokodemo-door', text)
+            self.assertEqual(self.listeners(cfg), [('.inbounds[0].listen', '127.0.0.1')])
+        self.xray.write_text(self.json.dumps(XRAY_RAW))
+
+    def test_xray_other_keys_refuse_the_config(self):
+        for shell in self.each_shell():
+            self.refused(shell, self.xray, dict(XRAY_RAW, reverse={"portals": [{"tag": "p", "domain": "r.example"}]}),
+                         'reverse')
+            self.refused(shell, self.xray, dict(XRAY_RAW, transport={}, someFutureListener={"listen": "0.0.0.0"}),
+                         'transport', 'someFutureListener')
+            # a key name is printed only as printable characters, never as the file had it
+            r = self.refused(shell, self.xray, dict(XRAY_RAW, **{"x\u001b[31m": 1}))
+            self.assertNotIn('\x1b', r.stderr)
+            # a config.json that changed on disk after the import is refused at start too
+            self.fresh()
+            self.xray.write_text(self.json.dumps(XRAY_RAW))
+            self.assertEqual(self.cli(shell, 'profile', 'import', self.xray, 'Raw').returncode, 0)
+            (self.store / 'profiles/raw/config.json').write_text(self.json.dumps(dict(XRAY_RAW, reverse={})))
+            r = self.gen(shell, 'raw')
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn('reverse', r.stderr)
+            self.assertFalse((self.tmp / 'run/xray.json').exists())
+        self.xray.write_text(self.json.dumps(XRAY_RAW))
+
+    def test_sing_box_only_allowed_keys_reach_sing_box(self):
+        route = {"rules": [{"ip_is_private": True, "outbound": "direct"}],
+                 "rule_set": [{"tag": "ads", "type": "remote", "format": "binary", "url": "https://r.example/a.srs"}],
+                 "final": "proxy", "default_domain_resolver": "x", "default_interface": "wlan0"}
+        raw = dict(SING_BOX_RAW, route=route,
+                   log={"level": "debug", "output": "/etc/x.log"},
+                   inbounds=[{"type": "mixed", "tag": "m", "listen": "::", "listen_port": 2080}],
+                   experimental={"clash_api": {"external_controller": "0.0.0.0:9090", "secret": "s"},
+                                 "v2ray_api": {"listen": "0.0.0.0:8080"},
+                                 "cache_file": {"enabled": True, "path": "/etc/x.db"},
+                                 "debug": {"listen": "0.0.0.0:6060"}},
+                   endpoints=[{"type": "wireguard", "tag": "wg", "listen_port": 51820, "address": ["10.0.0.2/32"],
+                               "private_key": "k", "peers": []}])
         self.sb.write_text(self.json.dumps(raw))
         for shell in self.each_shell():
             self.fresh()
             self.assertEqual(self.cli(shell, 'profile', 'import', self.sb, 'SB').returncode, 0)
-            self.assertEqual(self.gen(shell, 'sb').returncode, 0)
+            r = self.gen(shell, 'sb')
+            self.assertEqual(r.returncode, 0, r.stderr)
             text = (self.tmp / 'run/config.json').read_text()
             cfg = self.json.loads(text)
-            self.assertEqual(cfg['experimental'], {"cache_file": {"enabled": True}})
+            self.assertEqual(sorted(cfg), ['dns', 'endpoints', 'inbounds', 'log', 'outbounds', 'route'])
+            self.assertEqual([i['type'] for i in cfg['inbounds']], ['tun'])
+            self.assertEqual(cfg['log'], {"level": "warn", "timestamp": False})
+            self.assertEqual(cfg['outbounds'], SING_BOX_RAW['outbounds'])
+            self.assertEqual(cfg['dns']['servers'][:-1], SING_BOX_RAW['dns']['servers'])
+            self.assertEqual({k: cfg['route'][k] for k in ('rules', 'rule_set', 'final', 'default_domain_resolver')},
+                             {k: route[k] for k in ('rules', 'rule_set', 'final', 'default_domain_resolver')})
+            self.assertNotIn('default_interface', cfg['route'])
+            # a WireGuard endpoint dials out from a port the kernel picks
+            self.assertEqual(cfg['endpoints'], [{"type": "wireguard", "tag": "wg", "address": ["10.0.0.2/32"],
+                                                 "private_key": "k", "peers": []}])
+            self.assertNotIn('/etc/', text)
             self.assertNotIn('9090', text)
             self.assertNotIn('8080', text)
+            self.assertEqual(self.listeners(cfg), [])
         self.sb.write_text(self.json.dumps(SING_BOX_RAW))
+
+    def test_sing_box_other_keys_refuse_the_config(self):
+        for shell in self.each_shell():
+            self.refused(shell, self.sb, dict(SING_BOX_RAW, services=[{"type": "ssm-api", "listen": "0.0.0.0"}]),
+                         'services')
+            self.refused(shell, self.sb, dict(SING_BOX_RAW, ntp={"enabled": True}, certificate={}),
+                         'ntp', 'certificate')
+            self.refused(shell, self.sb, dict(SING_BOX_RAW, endpoints=[{"type": "tailscale", "tag": "ts"}]),
+                         'not WireGuard')
+            self.refused(shell, self.sb, dict(SING_BOX_RAW, route={"final": "proxy", "find_process": True}),
+                         'route', 'find_process')
+        self.sb.write_text(self.json.dumps(SING_BOX_RAW))
+
+    def test_listener_guard(self):
+        # The check behind the rewrites: a generated file with any listener but our loopback one is refused, so a
+        # later change to a rewrite that let one through fails closed instead of opening a port.
+        f = self.tmp / 'guard.json'
+        for shell in self.each_shell():
+            for doc, ok in (({"inbounds": [{"listen": "127.0.0.1"}]}, True),
+                            ({"outbounds": []}, True),
+                            ({"inbounds": [{"listen": "0.0.0.0"}]}, False),
+                            ({"a": [{"b": {"listen": "::"}}]}, False),
+                            ({"endpoints": [{"listen_port": 51820}]}, False),
+                            ({"experimental": {"clash_api": {"external_controller": "127.0.0.1:9090"}}}, False)):
+                f.write_text(self.json.dumps(doc))
+                r = self.lib(shell, f'json_listens_loopback_only "{f}"')
+                self.assertEqual(r.returncode == 0, ok, (shell, doc, r.stderr))
 
     def test_import_sniffing(self):
         bad = self.tmp / 'bad.json'

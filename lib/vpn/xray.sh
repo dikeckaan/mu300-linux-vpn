@@ -158,8 +158,20 @@ gen_xray() {
 # the tunnel it is building. The name stays as the TLS or REALITY serverName where the config gave none, so the
 # certificate is still checked against it. There is no certificate pin management here: a raw config says itself
 # what it wants verified.
+#
+# What a raw config may contain is a list (the spec's Security section): its outbounds, its routing and its DNS, and
+# fakedns, observatory and burstObservatory, which open nothing. Its inbounds and log are replaced by ours. api, stats,
+# metrics and policy are dropped without a word, because panels put them in nearly every config they hand out: api
+# and metrics open listeners of their own, stats and policy only matter to them (a routing rule that led to the
+# API's handler goes with it). "remarks", a subscription's name for the config, is dropped too. Anything else - reverse,
+# whose portals take connections in, transport, or a key some later Xray adds - refuses the config, naming the key.
 XRAY_JSON_TEST='.outbounds | type == "array"'
+XRAY_JSON_KEYS='outbounds routing dns fakedns observatory burstObservatory'
+XRAY_JSON_DROPPED='inbounds log api stats metrics policy remarks'
 xray_raw() { [ -n "${PDIR:-}" ] && [ -r "$PDIR/config.json" ]; }
+xray_json_keys_ok() {
+    json_refuse_keys "$PDIR/config.json" . "$XRAY_JSON_KEYS $XRAY_JSON_DROPPED" "the profile's Xray config"
+}
 # every server address in the config's vnext and servers, one per line. Names and addresses are told apart in the
 # shell, not with jq's test(): OpenWrt's jq may be built without regular expressions.
 xray_json_addresses() {
@@ -168,6 +180,7 @@ xray_json_addresses() {
 }
 gen_xray_json() {
     command -v jq >/dev/null 2>&1 || { echo "a raw Xray config needs jq" >&2; exit 1; }
+    xray_json_keys_ok || exit 1
     _all=$(xray_json_addresses 2>/dev/null) || { echo "cannot read the servers of the profile's Xray config" >&2; exit 1; }
     # an address goes into a lookup, into JSON and into a routing rule: only what a host name or an address can be
     if printf '%s\n' "$_all" | grep -q '[^A-Za-z0-9._:-]'; then
@@ -191,12 +204,19 @@ gen_xray_json() {
         resolve_close || { echo "could not put the kill switch back after the lookups" >&2; exit 1; }
     fi
     mkdir -p "$RUN"; chmod 700 "$RUN"
-    # Logged at warning, where a link's config logs at info: info is only needed for the pin-mismatch line
-    # drv_start's reader looks for, and a raw config has no managed pin.
-    ( umask 077; jq --argjson port "$SOCKS_PORT" --argjson mark "$((MARK))" --argjson map "{$_map}" '
+    # The output is built from the allowed keys alone, so nothing the config had besides them reaches Xray. Our
+    # SOCKS inbound on 127.0.0.1 is the only inbound. Logged at warning to stdout only (no access or error file: a
+    # path from the config would be a file written as root), where a link's config logs at info: info is only
+    # needed for the pin-mismatch line drv_start's reader looks for, and a raw config has no managed pin.
+    ( umask 077; jq --argjson port "$SOCKS_PORT" --argjson mark "$((MARK))" --argjson map "{$_map}" \
+        --arg keep "$XRAY_JSON_KEYS" '
         def resolved: if type == "object" and (.address | type) == "string" and $map[.address]
                       then .address = $map[.address] else . end;
-        .log = {"loglevel":"warning","access":"none"}
+        ((.api | objects | .tag | strings) // null) as $api
+        | with_entries(select(.key as $k | $keep | split(" ") | any(. == $k)))
+        | if $api != null and (.routing.rules | type) == "array"
+          then .routing.rules |= map(select(type != "object" or .outboundTag != $api)) else . end
+        | .log = {"loglevel":"warning","access":"none"}
         | .inbounds = [{"tag":"socks-in","listen":"127.0.0.1","port":$port,"protocol":"socks",
                         "settings":{"auth":"noauth","udp":true,"ip":"127.0.0.1"}}]
         | .outbounds |= map(
@@ -214,6 +234,8 @@ gen_xray_json() {
               else . end)' "$PDIR/config.json" > "$RUN/xray.json" ) ||
         { rm -f "$RUN/xray.json"; echo "cannot rewrite the profile's Xray config" >&2; exit 1; }
     chmod 600 "$RUN/xray.json"
+    json_listens_loopback_only "$RUN/xray.json" ||
+        { rm -f "$RUN/xray.json"; echo "the rewritten Xray config listens beyond 127.0.0.1" >&2; exit 1; }
     xray_hev_yml
     # the resolved names and the addresses the config gave: rule 9002 keeps every one of them off the tunnel
     for _a in $_ips $_lits; do printf '%s\n' "$_a"; done > "$RUN/server-ip"
@@ -233,6 +255,7 @@ drv_engines_ok() {
 drv_check() {
     if xray_raw; then
         json_check "$XRAY_JSON_TEST" 'an Xray config with outbounds' || return 1
+        xray_json_keys_ok || return 1
         xray_json_addresses >/dev/null 2>&1 || { echo "cannot read the servers of the profile's Xray config" >&2; return 1; }
         return 0
     fi

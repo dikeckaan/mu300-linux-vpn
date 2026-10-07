@@ -202,6 +202,28 @@ json_check() {
     command -v jq >/dev/null 2>&1 || { echo "reading a JSON config needs jq" >&2; return 1; }
     jq -e "$1" "$PDIR/config.json" >/dev/null 2>&1 || { echo "the profile's config.json is not $2" >&2; return 1; }
 }
+# json_refuse_keys FILE FILTER ALLOWED WHAT: fails, naming them, when the object FILTER picks out of FILE has keys
+# that are not in ALLOWED (names separated by spaces). A raw config is held to a list of what it may contain, not
+# checked against a list of what it may not: an engine's next release adds features faster than a denylist would,
+# and some of them listen. Only the key names are printed, never a value (values hold the credentials), and the
+# names are reduced to printable characters and cut short, since the file is not ours. split() with a string is
+# used, not a regular expression: OpenWrt's jq may be built without them.
+json_refuse_keys() {
+    _jk=$(jq -r --arg ok "$3" \
+          "$2"' | if type == "object" then keys_unsorted - ($ok | split(" ")) | .[] else empty end' "$1" 2>/dev/null) || { echo "cannot read $4" >&2; return 1; }
+    [ -z "$_jk" ] && return 0
+    _jk=$(printf '%s\n' "$_jk" | tr -c 'A-Za-z0-9_.\n-' '?' | cut -c1-40 | head -n 8 | tr '\n' ' ')
+    echo "$4 has what the VPN does not run: ${_jk% } (remove it and import the config again)" >&2
+    return 1
+}
+# json_listens_loopback_only FILE: every listen address, listen port and controller anywhere in a generated engine
+# config is our loopback one. Each driver's rewrite already leaves nothing else; this is the check behind it, run on
+# the file the engine gets, so that a later change to a rewrite that let a listener through fails closed instead of
+# opening a port on the LAN or the uplink.
+json_listens_loopback_only() {
+    jq -e '[.. | objects | (.listen, .listen_port, .external_controller) | select(. != null)]
+           | all(. == "127.0.0.1")' "$1" >/dev/null 2>&1
+}
 # link_opt_set KEY VALUE: an option of a link profile (profile set), checked, into its meta; empty removes it.
 # Both go into generated configs, the proxy's port as a JSON number.
 link_opt_set() {
