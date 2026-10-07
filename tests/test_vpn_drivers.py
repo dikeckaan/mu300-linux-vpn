@@ -1047,6 +1047,22 @@ class RawJson(ShellTest):
             self.assertEqual(cfg['dns']['servers'], [{"type": "udp", "tag": "mu300-bootstrap", "server": "1.1.1.1"}])
             self.sb.write_text(self.json.dumps(SING_BOX_RAW))
 
+    def test_sing_box_control_apis_are_removed(self):
+        raw = dict(SING_BOX_RAW, experimental={"clash_api": {"external_controller": "0.0.0.0:9090", "secret": "s"},
+                                               "v2ray_api": {"listen": "0.0.0.0:8080"},
+                                               "cache_file": {"enabled": True}})
+        self.sb.write_text(self.json.dumps(raw))
+        for shell in self.each_shell():
+            self.fresh()
+            self.assertEqual(self.cli(shell, 'profile', 'import', self.sb, 'SB').returncode, 0)
+            self.assertEqual(self.gen(shell, 'sb').returncode, 0)
+            text = (self.tmp / 'run/config.json').read_text()
+            cfg = self.json.loads(text)
+            self.assertEqual(cfg['experimental'], {"cache_file": {"enabled": True}})
+            self.assertNotIn('9090', text)
+            self.assertNotIn('8080', text)
+        self.sb.write_text(self.json.dumps(SING_BOX_RAW))
+
     def test_import_sniffing(self):
         bad = self.tmp / 'bad.json'
         bad.write_text('{"outbounds": [ {"protocol": ')

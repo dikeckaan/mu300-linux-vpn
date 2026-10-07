@@ -110,7 +110,9 @@ gen_singbox() {
 # leaves on whichever uplink is up (auto_detect_interface), and a UDP server at BOOTSTRAP_DNS resolves the server
 # names, unless the config names a default_domain_resolver of its own. sing-box looks them up itself, on its marked
 # socket, so no resolve window is needed. A mu300-bootstrap server the config already has (one rewritten before,
-# copied from $RUN) is replaced, not doubled: sing-box refuses two servers with one tag.
+# copied from $RUN) is replaced, not doubled: sing-box refuses two servers with one tag. The config's own control
+# APIs (experimental.clash_api, v2ray_api) are removed too: they can listen on 0.0.0.0, and the VPN keeps control
+# APIs off.
 SING_BOX_JSON_TEST='.outbounds[0].type | type == "string"'
 singbox_raw() { [ -n "${PDIR:-}" ] && [ -r "$PDIR/config.json" ]; }
 gen_singbox_json() {
@@ -123,7 +125,8 @@ gen_singbox_json() {
         | .route.default_mark = $mark | .route.auto_detect_interface = true
         | .dns.servers = ((.dns.servers // []) | map(select(type != "object" or .tag != "mu300-bootstrap"))
                           | . + [{"type":"udp","tag":"mu300-bootstrap","server":$boot}])
-        | .route.default_domain_resolver = (.route.default_domain_resolver // "mu300-bootstrap")' \
+        | .route.default_domain_resolver = (.route.default_domain_resolver // "mu300-bootstrap")
+        | del(.experimental.clash_api, .experimental.v2ray_api)' \
         "$PDIR/config.json" > "$RUN/config.json" ) ||
         { rm -f "$RUN/config.json"; echo "cannot rewrite the profile's sing-box config" >&2; exit 1; }
     chmod 600 "$RUN/config.json"
