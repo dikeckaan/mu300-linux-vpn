@@ -1,7 +1,8 @@
-# The sing-box driver of mu300-vpn (sourced by load_driver): a VLESS link, run by sing-box with its own TUN inbound
-# (gvisor stack, see FINDINGS 26b). sing-box installs its policy routing itself (auto_route: rule prefs 9000-9010
-# and table 2022, exactly what the core's routes_up does for the other drivers), so DRV_ROUTES=self; and it is
-# exec'd in the foreground, as the service always ran it (DRV_FOREGROUND=1).
+# The sing-box driver of mu300-vpn (sourced by load_driver): a VLESS link ($PDIR/uri) or a raw sing-box config
+# ($PDIR/config.json), run by sing-box with its own TUN inbound (gvisor stack, see FINDINGS 26b). sing-box installs
+# its policy routing itself (auto_route: rule prefs 9000-9010 and table 2022, exactly what the core's routes_up does
+# for the other drivers), so DRV_ROUTES=self for both forms; and it is exec'd in the foreground, as the service always
+# ran it (DRV_FOREGROUND=1).
 DRV_EXTRA=vpn
 DRV_PKG=
 # (sing-box has no certificate pin: TLS_PIN_SHA256 is the xray driver's)
@@ -12,17 +13,21 @@ TUN=sbtun
 
 drv_engines() { printf '%s\n' "$BIN"; }
 drv_engines_ok() { [ -x "$BIN" ]; }
-# the link takes apart (parse_uri exits on a bad one, hence the subshell); the config itself is checked by sing-box
-# in drv_gen
+# the link takes apart (parse_uri exits on a bad one, hence the subshell), or the raw config names an outbound type;
+# the config itself is checked by sing-box in drv_gen
 drv_check() {
+    if singbox_raw; then json_check "$SING_BOX_JSON_TEST" 'a sing-box config with outbounds'; return; fi
     ( link_need; parse_uri )
 }
-drv_gen() { gen_singbox; }
+drv_gen() { if singbox_raw; then gen_singbox_json; else gen_singbox; fi; }
 drv_start() { exec "$BIN" run -c "$RUN/config.json"; }
 drv_alive() { ip link show "$TUN" >/dev/null 2>&1; }
 # exec'd: nothing of its own is left to stop here, and it removes its TUN when it exits
 drv_stop() { :; }
-drv_import() { link_import "$1"; }
+drv_import() {
+    if is_json "$1"; then json_import "$1" "$SING_BOX_JSON_TEST" 'a sing-box config (no outbound with a type)'
+    else link_import "$1"; fi
+}
 drv_set() { link_opt_set "$1" "$2"; }
 
 outbound_json() {
@@ -51,6 +56,12 @@ outbound_json() {
     printf '}'
 }
 
+# The TUN's addresses: IPv6 through the tunnel only when the server side has it. Otherwise programs prefer the
+# (dead) IPv6 route and every connection to a dual-stack host fails first.
+singbox_addrs() {
+    if [ "$IPV6" = 1 ]; then printf '"172.19.0.1/30","fdfe:dcba:9876::1/126"'; else printf '"172.19.0.1/30"'; fi
+}
+
 gen_singbox() {
     link_need
     parse_uri
@@ -67,8 +78,8 @@ gen_singbox() {
     fi
     # IPv6 through the tunnel only when the server side has it: otherwise programs prefer the (dead) IPv6 route and
     # every connection to a dual-stack host fails first, so DNS answers only A records and the TUN gets no IPv6 address
-    if [ "$IPV6" = 1 ]; then strategy=prefer_ipv4; addrs='"172.19.0.1/30","fdfe:dcba:9876::1/126"'
-    else strategy=ipv4_only; addrs='"172.19.0.1/30"'; fi
+    if [ "$IPV6" = 1 ]; then strategy=prefer_ipv4; else strategy=ipv4_only; fi
+    addrs=$(singbox_addrs)
     printf '"final":"remote","strategy":"%s"},\n' "$strategy"
     # "stack":"gvisor", not the default system stack. On this device's 5.4 vendor kernel the system stack
     # takes the connection off the tun and then drops it: sing-box logs one "router: pre-match => sniff" and
@@ -88,6 +99,33 @@ gen_singbox() {
     printf '"route":{"rules":[{"action":"sniff"},{"protocol":"dns","action":"hijack-dns"},{"source_ip_cidr":%s,"ip_is_private":true,"action":"reject"},{"ip_is_private":true,"outbound":"direct"}],' "$excl"
     printf '"final":"proxy","auto_detect_interface":true,"default_mark":%d,"default_domain_resolver":"bootstrap"}}\n' "$MARK"
     } > "$RUN/config.json"
+    chmod 600 "$RUN/config.json"
+    "$BIN" check -c "$RUN/config.json"
+}
+
+# ---- a raw sing-box config ------------------------------------------------------------------------------------
+# A config from a panel keeps its outbounds, DNS and route rules. What the device needs is put over it: its inbounds
+# are replaced by our TUN, as gen_singbox writes it (a panel's mixed or socks inbound on 0.0.0.0 would listen on the
+# LAN and the uplink), every connection sing-box makes carries the mark the kill switch lets out (default_mark), it
+# leaves on whichever uplink is up (auto_detect_interface), and a UDP server at BOOTSTRAP_DNS resolves the server
+# names, unless the config names a default_domain_resolver of its own. sing-box looks them up itself, on its marked
+# socket, so no resolve window is needed. A mu300-bootstrap server the config already has (one rewritten before,
+# copied from $RUN) is replaced, not doubled: sing-box refuses two servers with one tag.
+SING_BOX_JSON_TEST='.outbounds[0].type | type == "string"'
+singbox_raw() { [ -n "${PDIR:-}" ] && [ -r "$PDIR/config.json" ]; }
+gen_singbox_json() {
+    command -v jq >/dev/null 2>&1 || { echo "a raw sing-box config needs jq" >&2; exit 1; }
+    mkdir -p "$RUN"; chmod 700 "$RUN"
+    ( umask 077; jq --arg tun "$TUN" --argjson addrs "[$(singbox_addrs)]" --argjson excl "$(json_list "$LAN_CIDRS")" \
+        --argjson mark "$((MARK))" --arg boot "$BOOTSTRAP_DNS" '
+        .inbounds = [{"type":"tun","tag":"tun-in","stack":"gvisor","interface_name":$tun,"address":$addrs,"mtu":1400,
+                      "auto_route":true,"strict_route":true,"route_exclude_address":$excl}]
+        | .route.default_mark = $mark | .route.auto_detect_interface = true
+        | .dns.servers = ((.dns.servers // []) | map(select(type != "object" or .tag != "mu300-bootstrap"))
+                          | . + [{"type":"udp","tag":"mu300-bootstrap","server":$boot}])
+        | .route.default_domain_resolver = (.route.default_domain_resolver // "mu300-bootstrap")' \
+        "$PDIR/config.json" > "$RUN/config.json" ) ||
+        { rm -f "$RUN/config.json"; echo "cannot rewrite the profile's sing-box config" >&2; exit 1; }
     chmod 600 "$RUN/config.json"
     "$BIN" check -c "$RUN/config.json"
 }

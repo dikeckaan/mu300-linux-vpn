@@ -18,7 +18,8 @@
 #   mu300-vpn restart   the service restarted
 #   mu300-vpn status    profile, kill switch, engine, tunnel, exit IP
 #   mu300-vpn profile list|show|add|import|edit|set|remove|use|export   the profiles (export: the one command
-#                       that prints a profile's credentials)
+#                       that prints a profile's credentials; add, import and edit read the link or the config
+#                       from stdin when it is given as -, which keeps it out of the process list)
 #   mu300-vpn settings [get [KEY] | set KEY VALUE]
 #   mu300-vpn engines   which engine programs it uses (the vpn extra: mu300-extra install vpn)
 set -e
@@ -1009,6 +1010,30 @@ src_name() {
         *) _n=${1##*/}; printf '%s' "${_n%.*}" | tr -d '\000-\037\177' ;;
     esac
 }
+# src_arg SRC: SRC as profile add, import and edit take it, in SRC. "-" means what stdin holds, so that a link or a
+# config never has to be a command-line argument, which every local user can read in the process list (LuCI passes
+# them this way). A link of one line is kept in the shell; anything else goes to a 0600 file under $RUN (SRC_TMP),
+# which is removed again when the command ends, however it ends.
+SRC=; SRC_TMP=
+src_arg() {
+    SRC=$1
+    [ "$1" = - ] || return 0
+    { mkdir -p "$RUN" && chmod 700 "$RUN"; } || { echo "cannot use $RUN" >&2; exit 1; }
+    SRC_TMP=$RUN/stdin.$$
+    trap 'rm -f "$SRC_TMP"' EXIT
+    trap 'rm -f "$SRC_TMP"; exit 1' INT TERM HUP
+    rm -f "$SRC_TMP"
+    ( umask 077; cat > "$SRC_TMP" ) || { echo "cannot read stdin" >&2; exit 1; }
+    # a link: one line that is not a JSON config, without the white space and CRs around it
+    if [ "$(tr -d ' \t\r\n' < "$SRC_TMP" | cut -c1)" != '{' ]; then
+        _l=$(tr -d '\r' < "$SRC_TMP" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//; /^$/d')
+        case $_l in *'
+'*) ;; *://*) SRC=$_l; _l=; rm -f "$SRC_TMP"; SRC_TMP=; return 0 ;; esac
+        _l=
+    fi
+    [ -s "$SRC_TMP" ] || { echo "nothing on stdin" >&2; exit 1; }
+    SRC=$SRC_TMP
+}
 
 # profile_import SRC [NAME] [TYPE]: a new profile from a link or a file; prints its id. The type is sniffed when
 # not given. The driver writes the files and the profile is checked; when either fails, the new directory goes
@@ -1017,7 +1042,8 @@ profile_import() {
     _src=$1; _name=${2:-}; _type=${3:-}
     if [ -z "$_type" ]; then _type=$(sniff_type "$_src") || return 1; fi
     load_driver "$_type" || return 1
-    [ -n "$_name" ] || _name=$(src_name "$_src")
+    # (a config from stdin has no name of its own: the temporary file's would mean nothing)
+    if [ -z "$_name" ] && { [ -z "$SRC_TMP" ] || [ "$_src" != "$SRC_TMP" ]; }; then _name=$(src_name "$_src"); fi
     [ -n "$_name" ] || _name=$_type
     _id=$(profile_new "$_type" "$_name") || return 1
     valid_id "$_id" || return 1
@@ -1078,8 +1104,8 @@ profile_line() {
 }
 
 profile_usage() {
-    echo "usage: mu300-vpn profile list | show ID | add TYPE NAME FILE|URI | import FILE|URI [NAME] |" \
-        "edit ID FILE|URI | set ID KEY VALUE | remove ID | use ID | export ID" >&2
+    echo "usage: mu300-vpn profile list | show ID | add TYPE NAME FILE|URI|- | import FILE|URI|- [NAME] |" \
+        "edit ID FILE|URI|- | set ID KEY VALUE | remove ID | use ID | export ID   (-: from stdin)" >&2
     exit 2
 }
 profile_cmd() {
@@ -1101,16 +1127,16 @@ profile_cmd() {
                 "$(printf '%s' "$_mNAME" | tr '\t' ' ')" "$_mTYPE" "$_mSOURCE" "$_mCREATED" "$(profile_server "$_d")" ;;
         add)
             [ $# -eq 3 ] || profile_usage
-            store_need
-            profile_import "$3" "$2" "$1" || exit 1 ;;
+            store_need; src_arg "$3"
+            profile_import "$SRC" "$2" "$1" || exit 1 ;;
         import)
             [ $# -ge 1 ] && [ $# -le 2 ] || profile_usage
-            store_need
-            profile_import "$1" "${2:-}" || exit 1 ;;
+            store_need; src_arg "$1"
+            profile_import "$SRC" "${2:-}" || exit 1 ;;
         edit)
             [ $# -eq 2 ] || profile_usage
-            profile_arg "$1"; store_need
-            profile_edit "$1" "$2" || exit 1
+            profile_arg "$1"; store_need; src_arg "$2"
+            profile_edit "$1" "$SRC" || exit 1
             echo "profile $1 changed"
             # the running VPN on the new config
             if [ "$1" = "$ACTIVE" ] && [ "$ENABLE" = 1 ]; then svc restart; fi ;;

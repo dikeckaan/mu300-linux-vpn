@@ -1,5 +1,5 @@
-# The xray driver of mu300-vpn (sourced by load_driver): a vless, vmess, trojan or ss link, run by Xray behind
-# hev-socks5-tunnel.
+# The xray driver of mu300-vpn (sourced by load_driver): a vless, vmess, trojan or ss link ($PDIR/uri), or a raw
+# Xray config ($PDIR/config.json), run by Xray behind hev-socks5-tunnel.
 DRV_EXTRA=vpn
 # the per-profile options profile set takes (link_opt_set checks them)
 DRV_KEYS='TLS_PIN_SHA256 UPSTREAM_HTTP_PROXY'
@@ -71,6 +71,23 @@ save_pin() {
     else printf '# fetched by mu300-vpn: the VPN server certificate, standing in for allowInsecure (Xray 26)\nTLS_PIN_SHA256=%s\n' "$1" >> "$CONF"; fi
 }
 
+# hev-socks5-tunnel's config: it owns the TUN and hands every flow to Xray's SOCKS inbound on loopback
+xray_hev_yml() {
+    cat > "$RUN/hev.yml" <<YML
+tunnel:
+  name: $TUN
+  mtu: 8500
+  multi-queue: false
+  ipv4: 198.18.0.1
+socks5:
+  port: $SOCKS_PORT
+  address: 127.0.0.1
+  udp: 'udp'
+misc:
+  log-level: warn
+YML
+}
+
 gen_xray() {
     link_need
     parse_link "$VLESS_URI" || exit 1
@@ -127,22 +144,81 @@ gen_xray() {
     printf '{"tag":"direct","protocol":"freedom","streamSettings":{"sockopt":{"mark":%d}}}]}\n' "$((MARK))"
     } > "$RUN/xray.json"
     chmod 600 "$RUN/xray.json"
-    cat > "$RUN/hev.yml" <<YML
-tunnel:
-  name: $TUN
-  mtu: 8500
-  multi-queue: false
-  ipv4: 198.18.0.1
-socks5:
-  port: $SOCKS_PORT
-  address: 127.0.0.1
-  udp: 'udp'
-misc:
-  log-level: warn
-YML
+    xray_hev_yml
     printf '%s\n' "$SERVER_IP" > "$RUN/server-ip"
     "$XRAY" run -test -c "$RUN/xray.json" >/dev/null || { "$XRAY" run -test -c "$RUN/xray.json" >&2; exit 1; }
     echo "xray config OK ($RUN/xray.json), server $HOST -> $SERVER_IP"
+}
+
+# ---- a raw Xray config ----------------------------------------------------------------------------------------
+# A config from a panel is run as it is, except for what the device cannot leave to it: its inbounds are replaced by
+# our SOCKS inbound on loopback (a panel's config usually listens on 0.0.0.0, which here would be the LAN and the
+# uplink), every outbound gets the mark the kill switch lets out, and the server names in vnext and servers are looked
+# up by the core and replaced by their addresses, for the same reason as with a link: Xray's own resolver sits behind
+# the tunnel it is building. The name stays as the TLS or REALITY serverName where the config gave none, so the
+# certificate is still checked against it. There is no certificate pin management here: a raw config says itself
+# what it wants verified.
+XRAY_JSON_TEST='.outbounds | type == "array"'
+xray_raw() { [ -n "${PDIR:-}" ] && [ -r "$PDIR/config.json" ]; }
+# every server address in the config's vnext and servers, one per line. Names and addresses are told apart in the
+# shell, not with jq's test(): OpenWrt's jq may be built without regular expressions.
+xray_json_addresses() {
+    jq -r '.outbounds[]? | objects | .settings | objects | (.vnext, .servers) | arrays | .[] | objects
+           | .address | strings' "$PDIR/config.json"
+}
+gen_xray_json() {
+    command -v jq >/dev/null 2>&1 || { echo "a raw Xray config needs jq" >&2; exit 1; }
+    _all=$(xray_json_addresses 2>/dev/null) || { echo "cannot read the servers of the profile's Xray config" >&2; exit 1; }
+    # an address goes into a lookup, into JSON and into a routing rule: only what a host name or an address can be
+    if printf '%s\n' "$_all" | grep -q '[^A-Za-z0-9._:-]'; then
+        echo "a server in the profile's Xray config is not a host name or an address" >&2; exit 1
+    fi
+    _names=; _lits=
+    for _a in $(printf '%s\n' "$_all" | sort -u); do
+        case $_a in *:*) _lits="$_lits $_a" ;; *[!0-9.]*) _names="$_names $_a" ;; *) _lits="$_lits $_a" ;; esac
+    done
+    # Every name is resolved inside one window (behind the kill switch), and it closes before anything else runs,
+    # whether a lookup failed or not.
+    _map=; _ips=
+    if [ -n "$_names" ]; then
+        resolve_window || { resolve_close; echo "could not open the resolve window" >&2; exit 1; }
+        for _h in $_names; do
+            _ip=$(vpn_resolve "$_h") || _ip=
+            [ -n "$_ip" ] || { resolve_close; echo "cannot resolve the VPN server $_h" >&2; exit 1; }
+            _map="$_map${_map:+,}$(json_str "$_h"):$(json_str "$_ip")"; _ips="$_ips $_ip"
+            echo "server $_h -> $_ip"
+        done
+        resolve_close || { echo "could not put the kill switch back after the lookups" >&2; exit 1; }
+    fi
+    mkdir -p "$RUN"; chmod 700 "$RUN"
+    # Logged at warning, where a link's config logs at info: info is only needed for the pin-mismatch line
+    # drv_start's reader looks for, and a raw config has no managed pin.
+    ( umask 077; jq --argjson port "$SOCKS_PORT" --argjson mark "$((MARK))" --argjson map "{$_map}" '
+        def resolved: if type == "object" and (.address | type) == "string" and $map[.address]
+                      then .address = $map[.address] else . end;
+        .log = {"loglevel":"warning","access":"none"}
+        | .inbounds = [{"tag":"socks-in","listen":"127.0.0.1","port":$port,"protocol":"socks",
+                        "settings":{"auth":"noauth","udp":true,"ip":"127.0.0.1"}}]
+        | .outbounds |= map(
+            ([(.settings.vnext, .settings.servers) | arrays | .[] | objects | .address | strings
+              | select($map[.])] | first) as $n
+            | .streamSettings.sockopt.mark = $mark
+            | if (.settings.vnext | type) == "array" then .settings.vnext |= map(resolved) else . end
+            | if (.settings.servers | type) == "array" then .settings.servers |= map(resolved) else . end
+            | if $n and ((.streamSettings.security // "") == "tls")
+                    and ((.streamSettings.tlsSettings.serverName // "") == "")
+              then .streamSettings.tlsSettings.serverName = $n
+              elif $n and ((.streamSettings.security // "") == "reality")
+                    and ((.streamSettings.realitySettings.serverName // "") == "")
+              then .streamSettings.realitySettings.serverName = $n
+              else . end)' "$PDIR/config.json" > "$RUN/xray.json" ) ||
+        { rm -f "$RUN/xray.json"; echo "cannot rewrite the profile's Xray config" >&2; exit 1; }
+    chmod 600 "$RUN/xray.json"
+    xray_hev_yml
+    # the resolved names and the addresses the config gave: rule 9002 keeps every one of them off the tunnel
+    for _a in $_ips $_lits; do printf '%s\n' "$_a"; done > "$RUN/server-ip"
+    "$XRAY" run -test -c "$RUN/xray.json" >/dev/null || { "$XRAY" run -test -c "$RUN/xray.json" >&2; exit 1; }
+    echo "xray config OK ($RUN/xray.json)"
 }
 
 drv_engines() { printf '%s\n' "$XRAY" "$HEV"; }
@@ -152,10 +228,21 @@ drv_engines_ok() {
     # there (the core runs it on the sing-box driver)
     case ${PURI:-${VLESS_URI:-}} in vless://*) [ -x "$BIN" ] ;; *) return 1 ;; esac
 }
-# the link takes apart and its transport is one the stream settings can express (Xray itself checks in drv_gen)
-drv_check() { ( link_need; parse_link "$VLESS_URI" || exit 1; PIN=; VCN=; xray_stream_json >/dev/null ); }
-drv_gen() { gen_xray; }
-drv_import() { link_import "$1" 'vless vmess trojan ss'; }
+# the link takes apart and its transport is one the stream settings can express, or the raw config has outbounds
+# whose servers can be read (Xray itself checks in drv_gen)
+drv_check() {
+    if xray_raw; then
+        json_check "$XRAY_JSON_TEST" 'an Xray config with outbounds' || return 1
+        xray_json_addresses >/dev/null 2>&1 || { echo "cannot read the servers of the profile's Xray config" >&2; return 1; }
+        return 0
+    fi
+    ( link_need; parse_link "$VLESS_URI" || exit 1; PIN=; VCN=; xray_stream_json >/dev/null )
+}
+drv_gen() { if xray_raw; then gen_xray_json; else gen_xray; fi; }
+drv_import() {
+    if is_json "$1"; then json_import "$1" "$XRAY_JSON_TEST" 'an Xray config (no outbounds list)'
+    else link_import "$1" 'vless vmess trojan ss'; fi
+}
 drv_set() { link_opt_set "$1" "$2"; }
 
 # Two processes and the routing between them, torn down together: if either dies the service exits, the routes

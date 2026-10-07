@@ -869,3 +869,251 @@ class Cli(ShellTest):
                 for r in outs:
                     self.assertNotIn(self.UUID, r.stdout + r.stderr, (link, r.args))
                 self.enable(0)
+
+
+XRAY_RAW = {
+    "log": {"loglevel": "debug"},
+    "inbounds": [{"port": 1080, "listen": "0.0.0.0", "protocol": "socks"}],
+    "outbounds": [
+        {"tag": "proxy", "protocol": "vless",
+         "settings": {"vnext": [{"address": "srv.example", "port": 443,
+                                 "users": [{"id": "11111111-2222-3333-4444-555555555555", "encryption": "none"}]}]},
+         "streamSettings": {"network": "tcp", "security": "tls", "tlsSettings": {"alpn": ["h2"]}}},
+        {"tag": "direct", "protocol": "freedom"}],
+    "routing": {"rules": [{"type": "field", "ip": ["geoip:private"], "outboundTag": "direct"}]}}
+
+SING_BOX_RAW = {
+    "log": {"level": "info"},
+    "dns": {"servers": [{"type": "tls", "tag": "dot", "server": "1.1.1.1"}]},
+    "inbounds": [{"type": "mixed", "tag": "mixed-in", "listen": "0.0.0.0", "listen_port": 2080}],
+    "outbounds": [{"type": "trojan", "tag": "proxy", "server": "tr.example", "server_port": 443,
+                   "password": "11111111-2222-3333-4444-555555555555"},
+                  {"type": "direct", "tag": "direct"}],
+    "route": {"final": "proxy", "default_domain_resolver": "x"}}
+
+
+class RawJson(ShellTest):
+    """Raw Xray and sing-box configs: imported as they are, and rewritten at every start so that only the device's
+    own inbound listens (no SOCKS port on the LAN), every connection the engine makes carries the mark the kill switch
+    lets out, and server names are looked up by the core. Also "-" as the source: a link or a config on stdin."""
+
+    UUID = '11111111-2222-3333-4444-555555555555'
+
+    def setUp(self):
+        super().setUp()
+        import json
+        self.json = json
+        self.conf = self.tmp / 'vpn.conf'
+        self.conf.write_text('ENABLE=0\nKILL_SWITCH=0\n')
+        self.store = self.tmp / 'vpn'
+        self.ev = self.tmp / 'events'
+        self.stub('ip', 'exit 0')
+        self.stub('svc', 'exit 0')
+        self.stub('nft', 'case "$1" in -f) cat >/dev/null; echo "nft -f" >> "$STUBLOG/events" ;; esac; exit 0')
+        self.stub('getent', 'echo "getent $2" >> "$STUBLOG/events"\n'
+                            'case $2 in srv.example) echo "203.0.113.5     STREAM $2" ;;'
+                            ' tr.example) echo "203.0.113.6     STREAM $2" ;; esac')
+        self.stub('xray', 'echo "$*" >> "$STUBLOG/xray.args"')
+        self.stub('sing-box', 'echo "$*" >> "$STUBLOG/sing-box.args"')
+        self.xray = self.tmp / 'xray.json'
+        self.xray.write_text(json.dumps(XRAY_RAW))
+        self.sb = self.tmp / 'sb.json'
+        self.sb.write_text(json.dumps(SING_BOX_RAW))
+
+    def env(self, **extra):
+        base = dict(MU300_VPN_CONF=self.conf, MU300_VPN_RUN=self.tmp / 'run', MU300_VPN_LIB=LIB,
+                    MU300_LAN_CONF=self.tmp / 'no', MU300_BIN=BIN, MU300_OPT=self.tmp / 'opt',
+                    MU300_DISK=self.tmp / 'disk', MU300_VPN_SVC=self.stubs / 'svc')
+        base.update(extra)
+        return super().env(**base)
+
+    def lib(self, shell, code):
+        return self.sh(shell, f'. "{BIN}/mu300-vpn"; {code}', MU300_LIB=1)
+
+    def cli(self, shell, *args, stdin=None):
+        return self.script(shell, BIN / 'mu300-vpn', *args, stdin=stdin)
+
+    def fresh(self):
+        shutil.rmtree(self.store, ignore_errors=True)
+        shutil.rmtree(self.tmp / 'run', ignore_errors=True)
+        for p in ('events', 'xray.args', 'sing-box.args'):
+            (self.tmp / p).unlink(missing_ok=True)
+
+    def gen(self, shell, pid, pre=''):
+        return self.lib(shell, f'{pre}profile_load {pid}; load_driver "$PTYPE"; XRAY="{self.stubs}/xray"; '
+                               f'BIN="{self.stubs}/sing-box"; drv_gen')
+
+    def test_xray_config_is_rewritten(self):
+        for shell in self.each_shell():
+            self.fresh()
+            r = self.cli(shell, 'profile', 'import', self.xray, 'Raw')
+            self.assertEqual((r.returncode, r.stdout.strip()), (0, 'raw'), r.stderr)
+            pdir = self.store / 'profiles/raw'
+            self.assertEqual(self.kv(pdir / 'meta')['TYPE'], 'xray')
+            self.assertEqual(stat.S_IMODE((pdir / 'config.json').stat().st_mode), 0o600)
+            self.assertFalse((pdir / 'uri').exists())
+            r = self.gen(shell, 'raw')
+            self.assertEqual(r.returncode, 0, r.stderr)
+            cfg = self.json.loads((self.tmp / 'run/xray.json').read_text())
+            self.assertEqual(cfg['inbounds'], [{"tag": "socks-in", "listen": "127.0.0.1", "port": 10808,
+                                                "protocol": "socks",
+                                                "settings": {"auth": "noauth", "udp": True, "ip": "127.0.0.1"}}])
+            self.assertEqual(cfg['log'], {"loglevel": "warning", "access": "none"})
+            for out in cfg['outbounds']:
+                self.assertEqual(out['streamSettings']['sockopt']['mark'], 720, out['tag'])
+            proxy, direct = cfg['outbounds']
+            self.assertEqual(proxy['settings']['vnext'][0]['address'], '203.0.113.5')
+            self.assertNotIn('_name', proxy['settings']['vnext'][0])
+            self.assertEqual(proxy['streamSettings']['tlsSettings'], {'alpn': ['h2'], 'serverName': 'srv.example'})
+            # nothing is added to an outbound that has no servers
+            self.assertNotIn('settings', direct)
+            self.assertEqual(cfg['routing'], XRAY_RAW['routing'])
+            self.assertEqual((self.tmp / 'run/server-ip').read_text().split(), ['203.0.113.5'])
+            self.assertIn(f'run -test -c {self.tmp}/run/xray.json', (self.tmp / 'xray.args').read_text())
+            self.assertTrue((self.tmp / 'run/hev.yml').exists())
+            self.assertNotIn(self.UUID, r.stdout + r.stderr)
+            r = self.cli(shell, 'profile', 'show', 'raw')
+            self.assertIn('server\tsrv.example:443', r.stdout.splitlines())
+            r = self.cli(shell, 'check', 'raw')
+            self.assertEqual((r.returncode, r.stdout.strip()), (0, 'profile raw: OK'), r.stderr)
+            self.assertNotIn(self.UUID, r.stdout + r.stderr)
+
+    def test_xray_names_kept_literals_and_the_resolve_window(self):
+        raw = dict(XRAY_RAW)
+        raw['outbounds'] = [
+            {"protocol": "vless", "settings": {"vnext": [{"address": "srv.example", "port": 443, "users": []}]},
+             "streamSettings": {"security": "reality", "realitySettings": {"serverName": "cover.example"}}},
+            {"protocol": "trojan", "settings": {"servers": [{"address": "tr.example", "port": 443, "password": "x"},
+                                                            {"address": "198.51.100.7", "port": 443,
+                                                             "password": "y"}]},
+             "streamSettings": {"security": "tls"}}]
+        self.xray.write_text(self.json.dumps(raw))
+        for shell in self.each_shell():
+            self.fresh()
+            self.assertEqual(self.cli(shell, 'profile', 'import', self.xray, 'Raw').returncode, 0)
+            # behind the kill switch: one window around both lookups
+            r = self.gen(shell, 'raw', 'ENABLE=1; KILL_SWITCH=1; ')
+            self.assertEqual(r.returncode, 0, r.stderr)
+            ev = self.ev.read_text().splitlines()
+            self.assertEqual(ev, ['nft -f', 'getent srv.example', 'getent tr.example', 'nft -f'])
+            cfg = self.json.loads((self.tmp / 'run/xray.json').read_text())
+            vl, tr = cfg['outbounds']
+            # a serverName the config has is its own
+            self.assertEqual(vl['streamSettings']['realitySettings']['serverName'], 'cover.example')
+            self.assertEqual(tr['streamSettings']['tlsSettings']['serverName'], 'tr.example')
+            self.assertEqual([s['address'] for s in tr['settings']['servers']], ['203.0.113.6', '198.51.100.7'])
+            self.assertEqual(sorted((self.tmp / 'run/server-ip').read_text().split()),
+                             ['198.51.100.7', '203.0.113.5', '203.0.113.6'])
+            # a name that does not resolve: nothing is written to run, and the kill switch is back
+            self.fresh()
+            raw2 = dict(XRAY_RAW, outbounds=[{"protocol": "vless", "settings": {"vnext": [
+                {"address": "nx.example", "port": 1, "users": []}]}}])
+            self.xray.write_text(self.json.dumps(raw2))
+            self.assertEqual(self.cli(shell, 'profile', 'import', self.xray, 'Raw').returncode, 0)
+            r = self.gen(shell, 'raw', 'ENABLE=1; KILL_SWITCH=1; ')
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn('cannot resolve the VPN server nx.example', r.stderr)
+            self.assertEqual(self.ev.read_text().splitlines(), ['nft -f', 'getent nx.example', 'nft -f'])
+            self.xray.write_text(self.json.dumps(raw))
+
+    def test_sing_box_config_is_rewritten(self):
+        for shell in self.each_shell():
+            self.fresh()
+            r = self.cli(shell, 'profile', 'import', self.sb, 'SB')
+            self.assertEqual((r.returncode, r.stdout.strip()), (0, 'sb'), r.stderr)
+            self.assertEqual(self.kv(self.store / 'profiles/sb/meta')['TYPE'], 'sing-box')
+            r = self.gen(shell, 'sb')
+            self.assertEqual(r.returncode, 0, r.stderr)
+            cfg = self.json.loads((self.tmp / 'run/config.json').read_text())
+            self.assertEqual(cfg['inbounds'], [{"type": "tun", "tag": "tun-in", "stack": "gvisor",
+                                                "interface_name": "sbtun", "address": ["172.19.0.1/30"],
+                                                "mtu": 1400, "auto_route": True, "strict_route": True,
+                                                "route_exclude_address": ["192.168.77.0/24"]}])
+            self.assertEqual(cfg['route']['default_mark'], 720)
+            self.assertIs(cfg['route']['auto_detect_interface'], True)
+            self.assertEqual(cfg['route']['final'], 'proxy')
+            # the config's own resolver is kept
+            self.assertEqual(cfg['route']['default_domain_resolver'], 'x')
+            self.assertEqual(cfg['dns']['servers'], SING_BOX_RAW['dns']['servers'] +
+                             [{"type": "udp", "tag": "mu300-bootstrap", "server": "1.1.1.1"}])
+            self.assertEqual(cfg['outbounds'], SING_BOX_RAW['outbounds'])
+            self.assertIn(f'check -c {self.tmp}/run/config.json', (self.tmp / 'sing-box.args').read_text())
+            self.assertNotIn(self.UUID, r.stdout + r.stderr)
+            # without a resolver of its own, ours
+            raw = dict(SING_BOX_RAW, route={"final": "proxy"})
+            raw.pop('dns')
+            self.sb.write_text(self.json.dumps(raw))
+            self.assertEqual(self.cli(shell, 'profile', 'edit', 'sb', self.sb).returncode, 0)
+            self.assertEqual(self.gen(shell, 'sb').returncode, 0)
+            cfg = self.json.loads((self.tmp / 'run/config.json').read_text())
+            self.assertEqual(cfg['route']['default_domain_resolver'], 'mu300-bootstrap')
+            self.assertEqual(cfg['dns']['servers'], [{"type": "udp", "tag": "mu300-bootstrap", "server": "1.1.1.1"}])
+            self.sb.write_text(self.json.dumps(SING_BOX_RAW))
+
+    def test_import_sniffing(self):
+        bad = self.tmp / 'bad.json'
+        bad.write_text('{"outbounds": [ {"protocol": ')
+        noout = self.tmp / 'noout.json'
+        noout.write_text('{"inbounds": []}')
+        for shell in self.each_shell():
+            self.fresh()
+            r = self.cli(shell, 'profile', 'import', self.xray)
+            self.assertEqual((r.returncode, r.stdout.strip()), (0, 'xray'), r.stderr)
+            r = self.cli(shell, 'profile', 'import', self.sb)
+            self.assertEqual((r.returncode, r.stdout.strip()), (0, 'sb'), r.stderr)
+            lines = self.cli(shell, 'profile', 'list').stdout.splitlines()
+            self.assertIn(' \txray\txray\txray', lines)
+            self.assertIn(' \tsb\tsing-box\tsb', lines)
+            for f, args in ((bad, ['import']), (noout, ['import']), (bad, ['add', 'xray', 'B']),
+                            (bad, ['add', 'sing-box', 'B']), (self.xray, ['add', 'sing-box', 'B']),
+                            (noout, ['add', 'xray', 'B'])):
+                r = self.cli(shell, 'profile', *args, f)
+                self.assertNotEqual(r.returncode, 0, (f, args))
+                self.assertEqual(sorted(p.name for p in (self.store / 'profiles').iterdir()), ['sb', 'xray'],
+                                 (f, args))
+            # a raw profile is never run on sing-box in xray's place, whatever the kill switch says
+            r = self.lib(shell, 'profile_load xray; load_driver xray; KILL_SWITCH=1; ENGINE=sing-box; '
+                                'vless_on_sing_box; echo "driver=$DRIVER"')
+            self.assertIn('driver=xray', r.stdout, r.stderr)
+
+    def test_stdin(self):
+        link = f'vless://{self.UUID}@vpn.example.com:443?security=tls&type=tcp#Home'
+        for shell in self.each_shell():
+            self.fresh()
+            r = self.cli(shell, 'profile', 'import', '-', stdin=link + '\n')
+            self.assertEqual((r.returncode, r.stdout.strip()), (0, 'home'), r.stderr)
+            self.assertEqual((self.store / 'profiles/home/uri').read_text(), link + '\n')
+            r = self.cli(shell, 'profile', 'import', '-', 'Raw', stdin=self.xray.read_text())
+            self.assertEqual((r.returncode, r.stdout.strip()), (0, 'raw'), r.stderr)
+            self.assertEqual(self.json.loads((self.store / 'profiles/raw/config.json').read_text()), XRAY_RAW)
+            # with no name: the type, not the name of a temporary file
+            r = self.cli(shell, 'profile', 'import', '-', stdin=self.sb.read_text())
+            self.assertEqual((r.returncode, r.stdout.strip()), (0, 'sing-box'), r.stderr)
+            r = self.cli(shell, 'profile', 'add', 'xray', 'Two', '-', stdin='  \r\n' + link + '\r\n\n')
+            self.assertEqual((r.returncode, r.stdout.strip()), (0, 'two'), r.stderr)
+            self.assertEqual((self.store / 'profiles/two/uri').read_text(), link + '\n')
+            # edit from stdin: the link replaced by a config, and back
+            r = self.cli(shell, 'profile', 'edit', 'home', '-', stdin=self.xray.read_text())
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertTrue((self.store / 'profiles/home/config.json').exists())
+            self.assertFalse((self.store / 'profiles/home/uri').exists())
+            r = self.cli(shell, 'profile', 'edit', 'home', '-', stdin=link)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual((self.store / 'profiles/home/uri').read_text(), link + '\n')
+            self.assertFalse((self.store / 'profiles/home/config.json').exists())
+            # refused: nothing on stdin, two links, garbage - and nothing of it left anywhere
+            for data in ('', link + '\n' + link + '\n', 'garbage\n'):
+                r = self.cli(shell, 'profile', 'import', '-', stdin=data)
+                self.assertNotEqual(r.returncode, 0, repr(data))
+                self.assertNotIn(self.UUID, r.stdout + r.stderr)
+            self.assertEqual(sorted(p.name for p in (self.store / 'profiles').iterdir()),
+                             ['home', 'raw', 'sing-box', 'two'])
+            self.assertEqual([p.name for p in (self.tmp / 'run').iterdir()] if (self.tmp / 'run').exists() else [],
+                             [])
+
+    def kv(self, path):
+        out = {}
+        for line in path.read_text().splitlines():
+            k, _, v = line.partition('=')
+            out[k] = v.strip("'")
+        return out

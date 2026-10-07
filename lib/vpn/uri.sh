@@ -1,5 +1,6 @@
 # mu300-vpn's link parsing and JSON helpers, sourced by mu300-vpn when it loads (tests call parse_uri and json_str
-# straight after sourcing it). Nothing here runs anything: it only takes a link apart and writes JSON strings.
+# straight after sourcing it). Nothing here runs anything: it only takes a link apart, writes JSON strings, and
+# stores a link or a JSON config in a profile.
 
 # json_str VALUE : JSON string literal
 json_str() { printf '"%s"' "$(printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g')"; }
@@ -182,6 +183,24 @@ link_import() {
     ( parse_link "$1" ) >/dev/null || return 1
     ( umask 077; printf '%s\n' "$1" > "$PDIR/uri.new.$$" ) && mv "$PDIR/uri.new.$$" "$PDIR/uri" && return 0
     rm -f "$PDIR/uri.new.$$"; return 1
+}
+# is_json FILE: the file's first character that is not white space is "{" (a JSON config rather than a link or
+# some other kind of file)
+is_json() { [ -f "$1" ] && [ -r "$1" ] && [ "$(tr -d ' \t\r\n' < "$1" | cut -c1)" = '{' ]; }
+# json_import SRC TEST WHAT: a JSON config file into the profile ($PDIR/config.json, 0600, through a temporary file
+# and mv) when jq says TEST of it is true. WHAT names the kind of config in the refusal; the file itself is never
+# repeated, since it holds the credentials.
+json_import() {
+    [ -n "${PDIR:-}" ] && [ -d "$PDIR" ] || { echo "no profile to import into" >&2; return 1; }
+    command -v jq >/dev/null 2>&1 || { echo "reading a JSON config needs jq" >&2; return 1; }
+    jq -e "$2" "$1" >/dev/null 2>&1 || { echo "not $3" >&2; return 1; }
+    ( umask 077; cat "$1" > "$PDIR/config.json.new.$$" ) && mv "$PDIR/config.json.new.$$" "$PDIR/config.json" && return 0
+    rm -f "$PDIR/config.json.new.$$"; return 1
+}
+# json_check TEST WHAT: the profile's config.json, as json_import checked it
+json_check() {
+    command -v jq >/dev/null 2>&1 || { echo "reading a JSON config needs jq" >&2; return 1; }
+    jq -e "$1" "$PDIR/config.json" >/dev/null 2>&1 || { echo "the profile's config.json is not $2" >&2; return 1; }
 }
 # link_opt_set KEY VALUE: an option of a link profile (profile set), checked, into its meta; empty removes it.
 # Both go into generated configs, the proxy's port as a JSON number.
