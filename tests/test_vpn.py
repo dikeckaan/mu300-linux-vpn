@@ -32,6 +32,19 @@ class Vpn(ShellTest):
                        MU300_VPN_RUN=self.tmp / 'run-vpn', MU300_LAN_CONF=self.tmp / 'no-lan.conf',
                        MU300_BIN=BIN, MU300_SYSROOT=self.root)
 
+    def test_enabled_prints_enable_and_touches_no_network(self):
+        """mu300-power asks `mu300-vpn enabled` before it starts a VPN it stopped; no exit-IP lookup, no nft."""
+        for name in ('wget', 'curl', 'nft'):
+            self.stub(name, f'echo "{name} $*" >> "$STUBLOG/net"')
+        for shell in self.each_shell():
+            for conf, want in (('ENABLE=1\n', '1'), ('ENABLE=0\n', '0'), ('', '0')):
+                self.conf.write_text(conf)
+                (self.root / 'run/mu300/device').write_text('f50\n')
+                r = self.sh(shell, f'"{BIN}/mu300-vpn" enabled', MU300_VPN_CONF=self.conf, MU300_VPN_RUN=self.tmp / 'run-vpn',
+                            MU300_LAN_CONF=self.tmp / 'no-lan.conf', MU300_BIN=BIN, MU300_SYSROOT=self.root)
+                self.assertEqual((r.returncode, r.stdout.strip()), (0, want), r.stderr)
+            self.assertFalse((self.tmp / 'net').exists())
+
     def test_own_lan_always_local(self):
         cases = [
             # (vpn.conf, device, br-lan address, LAN_CIDRS wanted)
