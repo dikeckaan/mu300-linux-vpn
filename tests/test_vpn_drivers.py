@@ -699,16 +699,13 @@ class Cli(ShellTest):
             self.assertEqual(r.stdout, self.LINK + '\n')
 
     def test_refused_imports_leave_nothing(self):
-        wg = self.tmp / 'wg.conf'
-        wg.write_text('[Interface]\nPrivateKey = x\n')
         for shell in self.each_shell():
             self.fresh()
             for args, msg in ((['import', 'ss://' + b64('aes-256-gcm:pw') + '@h:1?plugin=obfs'], 'ss plugins'),
                               (['import', 'https://example.com/x'], 'not a kind of link'),
                               (['add', 'sing-box', 'X', vmess_link()], 'not a link this profile type takes'),
                               (['add', 'l2tp', 'X', self.LINK], 'l2tp: not available in this version'),
-                              (['add', 'nosuch', 'X', self.LINK], 'nosuch: no driver'),
-                              (['import', str(wg)], 'wireguard: no driver')):
+                              (['add', 'nosuch', 'X', self.LINK], 'nosuch: no driver')):
                 r = self.vpn(shell, 'profile', *args)
                 self.assertNotEqual(r.returncode, 0, args)
                 self.assertIn(msg, r.stderr, args)
@@ -1117,3 +1114,295 @@ class RawJson(ShellTest):
             k, _, v = line.partition('=')
             out[k] = v.strip("'")
         return out
+
+
+WG_PRIV = 'P' * 43 + '='
+WG_PUB = 'B' * 43 + '='
+WG_PSK = 'S' * 43 + '='
+WG_CONF = f"""[Interface]
+PrivateKey = {WG_PRIV}
+Address = 10.7.0.2/32, fd00:7::2/128
+DNS = 10.7.0.1, example.org
+MTU = 1380
+PostUp = iptables -A FORWARD -i %i -j ACCEPT
+Table = off
+
+[Peer]
+PublicKey = {WG_PUB}
+PresharedKey = {WG_PSK}
+Endpoint = wg.example:51820
+AllowedIPs = 0.0.0.0/0, ::/0
+PersistentKeepalive = 25
+"""
+
+
+class WireGuard(ShellTest):
+    """The wireguard driver: the wg-quick file is reduced to what wg setconf takes, the Endpoint name is looked up
+    by the core, the interface is made with ip and marked with wg, and no key is ever printed."""
+
+    def setUp(self):
+        super().setUp()
+        self.conf = self.tmp / 'vpn.conf'
+        self.conf.write_text('ENABLE=0\nKILL_SWITCH=0\n')
+        self.store = self.tmp / 'vpn'
+        self.ev = self.tmp / 'events'
+        self.ip_stub()
+        self.stub('wg', 'echo "$*" >> "$STUBLOG/wg.log"\n'
+                        'case "$*" in\n'
+                        f'  "show wg-mu300 latest-handshakes") printf "{WG_PUB}\\t%s\\n" "$(( $(date +%s) - 30 ))" ;;\n'
+                        f'  "show wg-mu300 transfer") printf "{WG_PUB}\\t100\\t200\\n" ;;\n'
+                        'esac; exit 0')
+        self.stub('svc', 'exit 0')
+        self.stub('nft', 'case "$1" in -f) cat >/dev/null; echo "nft -f" >> "$STUBLOG/events" ;; esac; exit 0')
+        self.stub('getent', 'echo "getent $2" >> "$STUBLOG/events"\n'
+                            'case $2 in wg.example) echo "203.0.113.7     STREAM $2" ;; esac')
+        self.src = self.tmp / 'x.conf'
+        self.src.write_text(WG_CONF)
+
+    def kv(self, path):
+        out = {}
+        for line in path.read_text().splitlines():
+            k, _, v = line.partition('=')
+            out[k] = v.strip("'")
+        return out
+
+    def iplog(self):
+        # (sourcing mu300-vpn asks ip about the LAN too: only what the driver does is of interest)
+        return [l for l in (self.tmp / 'ip.log').read_text().splitlines() if l.split()[0] in ('link', 'addr')]
+
+    def ip_stub(self, kernel=True):
+        # "link show" finds nothing (no tunnel yet); "link add ... type wireguard" works only on a kernel that has it
+        add = 'exit 0' if kernel else 'exit 2'
+        self.stub('ip', 'echo "$*" >> "$STUBLOG/ip.log"\n'
+                        'case "$*" in\n'
+                        '  "link show"*) exit 1 ;;\n'
+                        f'  "link add"*) {add} ;;\n'
+                        'esac; exit 0')
+
+    def env(self, **extra):
+        base = dict(MU300_VPN_CONF=self.conf, MU300_VPN_RUN=self.tmp / 'run', MU300_VPN_LIB=LIB,
+                    MU300_LAN_CONF=self.tmp / 'no', MU300_BIN=BIN, MU300_OPT=self.tmp / 'opt',
+                    MU300_DISK=self.tmp / 'disk', MU300_VPN_SVC=self.stubs / 'svc',
+                    MU300_WG_SYSMOD=self.tmp / 'no-module')
+        base.update(extra)
+        return super().env(**base)
+
+    def lib(self, shell, code):
+        return self.sh(shell, f'. "{BIN}/mu300-vpn"; {code}', MU300_LIB=1)
+
+    def cli(self, shell, *args, stdin=None):
+        return self.script(shell, BIN / 'mu300-vpn', *args, stdin=stdin)
+
+    def fresh(self):
+        shutil.rmtree(self.store, ignore_errors=True)
+        shutil.rmtree(self.tmp / 'run', ignore_errors=True)
+        for p in ('events', 'ip.log', 'wg.log'):
+            (self.tmp / p).unlink(missing_ok=True)
+
+    def setup_profile(self, shell, text=WG_CONF):
+        self.fresh()
+        self.src.write_text(text)
+        r = self.cli(shell, 'profile', 'import', self.src, 'Wg')
+        self.assertEqual((r.returncode, r.stdout.strip()), (0, 'wg'), r.stderr)
+
+    def run_lib(self, shell, code, pre=''):
+        return self.lib(shell, f'{pre}profile_load wg; load_driver "$PTYPE"; {code}')
+
+    def no_keys(self, r):
+        for secret in (WG_PRIV, WG_PSK, 'PPPPPPPP', 'SSSSSSSS'):
+            self.assertNotIn(secret, r.stdout + r.stderr)
+
+    def test_import_sniffs_and_stores_0600(self):
+        for shell in self.each_shell():
+            self.setup_profile(shell)
+            pdir = self.store / 'profiles/wg'
+            self.assertEqual(self.kv(pdir / 'meta')['TYPE'], 'wireguard')
+            self.assertEqual(stat.S_IMODE((pdir / 'wg.conf').stat().st_mode), 0o600)
+            self.assertEqual((pdir / 'wg.conf').read_text(), WG_CONF)
+            r = self.cli(shell, 'profile', 'show', 'wg')
+            self.assertIn('server\twg.example:51820', r.stdout.splitlines())
+            self.no_keys(r)
+            r = self.cli(shell, 'check', 'wg')
+            self.assertEqual((r.returncode, r.stdout.strip()), (0, 'profile wg: OK'), r.stderr)
+            self.no_keys(r)
+            # the same from stdin, with the section and keys in any case
+            self.fresh()
+            r = self.cli(shell, 'profile', 'import', '-', 'Low',
+                         stdin=WG_CONF.replace('[Interface]', '[interface]').replace('PrivateKey', 'PRIVATEKEY'))
+            self.assertEqual((r.returncode, r.stdout.strip()), (0, 'low'), r.stderr)
+
+    def test_gen_reduces_the_config(self):
+        for shell in self.each_shell():
+            self.setup_profile(shell)
+            r = self.run_lib(shell, 'drv_gen')
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.no_keys(r)
+            run = self.tmp / 'run'
+            gen = (run / 'wg.conf').read_text()
+            for gone in ('Address', 'DNS', 'MTU', 'PostUp', 'Table', 'iptables', 'wg.example'):
+                self.assertNotIn(gone, gen)
+            self.assertIn('Endpoint = 203.0.113.7:51820', gen.splitlines())
+            for kept in (f'PrivateKey = {WG_PRIV}', f'PublicKey = {WG_PUB}', f'PresharedKey = {WG_PSK}',
+                         'AllowedIPs = 0.0.0.0/0, ::/0', 'PersistentKeepalive = 25', '[Peer]'):
+                self.assertIn(kept, gen.splitlines())
+            self.assertEqual(stat.S_IMODE((run / 'wg.conf').stat().st_mode), 0o600)
+            self.assertEqual((run / 'wg.addr').read_text().split(), ['10.7.0.2/32', 'fd00:7::2/128'])
+            self.assertEqual((run / 'wg.mtu').read_text().strip(), '1380')
+            self.assertEqual((run / 'dns').read_text().strip(), '10.7.0.1')
+            self.assertEqual((run / 'server-ip').read_text().split(), ['203.0.113.7'])
+
+    def test_keys_spelled_differently(self):
+        text = (WG_CONF.replace('Address = ', 'address=').replace('DNS = ', 'dns\t=\t')
+                .replace('MTU = 1380', 'mtu = 1400   # tuned').replace('PostUp', 'POSTUP')
+                .replace('Endpoint = wg.example:51820', 'endpoint=[2001:db8::7]:51820'))
+        for shell in self.each_shell():
+            self.setup_profile(shell, text)
+            r = self.run_lib(shell, 'drv_gen')
+            self.assertEqual(r.returncode, 0, r.stderr)
+            run = self.tmp / 'run'
+            gen = (run / 'wg.conf').read_text()
+            for gone in ('ddress', 'dns', 'mtu', 'POSTUP', 'iptables'):
+                self.assertNotIn(gone, gen)
+            # a literal address is kept, and nothing is looked up
+            self.assertIn('endpoint = [2001:db8::7]:51820', gen.splitlines())
+            self.assertEqual((run / 'server-ip').read_text().split(), ['2001:db8::7'])
+            self.assertFalse(self.ev.exists())
+            self.assertEqual((run / 'wg.mtu').read_text().strip(), '1400')
+            self.assertEqual((run / 'dns').read_text().strip(), '10.7.0.1')
+
+    def test_start_alive_stop(self):
+        for shell in self.each_shell():
+            self.setup_profile(shell)
+            self.assertEqual(self.run_lib(shell, 'drv_gen').returncode, 0)
+            for p in ('ip.log', 'wg.log'):
+                (self.tmp / p).unlink(missing_ok=True)
+            r = self.run_lib(shell, 'drv_start && echo STARTED; echo "tun=$TUN"')
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn('tunnel up on wg-mu300', r.stdout)
+            self.assertIn('tun=wg-mu300', r.stdout)
+            self.no_keys(r)
+            ip = self.iplog()
+            wg = (self.tmp / 'wg.log').read_text().splitlines()
+            self.assertEqual(ip, ['link del wg-mu300', 'link add wg-mu300 type wireguard',
+                                  'addr add 10.7.0.2/32 dev wg-mu300', 'link set wg-mu300 mtu 1380 up'])
+            self.assertEqual(wg, [f'setconf wg-mu300 {self.tmp}/run/wg.conf', 'set wg-mu300 fwmark 0x2d0'])
+            # with IPV6=1 the IPv6 address goes on too
+            (self.tmp / 'ip.log').unlink()
+            r = self.run_lib(shell, 'IPV6=1; drv_start')
+            self.assertIn('addr add fd00:7::2/128 dev wg-mu300', (self.tmp / 'ip.log').read_text())
+            # alive follows the interface; stop removes it and the runtime copy of the config
+            r = self.run_lib(shell, 'drv_alive || echo "alive=$?"')
+            self.assertIn('alive=1', r.stdout)
+            (self.tmp / 'ip.log').unlink()
+            r = self.run_lib(shell, 'drv_stop; echo "stop=$?"')
+            self.assertIn('stop=0', r.stdout)
+            self.assertEqual(self.iplog(), ['link del wg-mu300'])
+            self.assertFalse((self.tmp / 'run/wg.conf').exists())
+
+    def test_start_fails_closed(self):
+        for shell in self.each_shell():
+            self.setup_profile(shell)
+            self.assertEqual(self.run_lib(shell, 'drv_gen').returncode, 0)
+            # a wg that rejects the config says so without quoting it
+            self.stub('wg', f'echo "Key is not the correct length: {WG_PRIV}" >&2; exit 1')
+            r = self.run_lib(shell, 'drv_start && echo STARTED')
+            self.assertNotIn('STARTED', r.stdout)
+            self.assertIn('wg setconf rejected the config', r.stderr)
+            self.no_keys(r)
+            self.stub('wg', 'exit 0')
+            self.ip_stub(kernel=False)
+            r = self.run_lib(shell, 'drv_start && echo STARTED')
+            self.assertNotIn('STARTED', r.stdout)
+            self.assertIn('cannot create wg-mu300', r.stderr)
+            self.ip_stub()
+
+    def test_check_warns_about_the_default_route(self):
+        text = WG_CONF.replace('AllowedIPs = 0.0.0.0/0, ::/0', 'AllowedIPs = 10.0.0.0/8')
+        for shell in self.each_shell():
+            self.setup_profile(shell, text)
+            r = self.cli(shell, 'check', 'wg')
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn('0.0.0.0/0', r.stderr)
+            self.assertIn('warning', r.stderr)
+            self.no_keys(r)
+
+    def test_refused_imports(self):
+        cases = {
+            'no PrivateKey': (WG_CONF.replace(f'PrivateKey = {WG_PRIV}\n', ''), 'no PrivateKey'),
+            'no [Interface]': ('[Peer]\n' + WG_CONF.split('[Peer]\n')[1], 'no [Interface]'),
+            'no peer': (WG_CONF.split('[Peer]')[0], 'no [Peer]'),
+            'no peer key': (WG_CONF.replace(f'PublicKey = {WG_PUB}\n', ''), 'without a PublicKey'),
+            'no endpoint': (WG_CONF.replace('Endpoint = wg.example:51820\n', ''), 'without an Endpoint'),
+            'bad endpoint': (WG_CONF.replace('wg.example:51820', 'wg.example'), 'Endpoint that is not'),
+            'option as host': (WG_CONF.replace('wg.example:51820', '-x:51820'), 'Endpoint that is not'),
+            'bad key': (WG_CONF.replace(WG_PRIV, 'short'), 'PrivateKey that is not a WireGuard key'),
+            'bad mtu': (WG_CONF.replace('1380', '12'), 'MTU'),
+            'bad address': (WG_CONF.replace('10.7.0.2/32', '10.7.0.2;reboot'), 'Address'),
+        }
+        for shell in self.each_shell():
+            for name, (text, msg) in cases.items():
+                self.fresh()
+                self.src.write_text(text)
+                r = self.cli(shell, 'profile', 'add', 'wireguard', 'X', self.src)
+                self.assertNotEqual(r.returncode, 0, name)
+                self.assertIn(msg, r.stderr, name)
+                self.no_keys(r)
+                profiles = self.store / 'profiles'
+                self.assertEqual(list(profiles.iterdir()) if profiles.exists() else [], [], name)
+
+    def test_a_kernel_without_wireguard_fails_the_check(self):
+        self.ip_stub(kernel=False)
+        for shell in self.each_shell():
+            self.fresh()
+            r = self.cli(shell, 'profile', 'import', self.src, 'Wg')
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn('this kernel has no WireGuard', r.stderr)
+            # the module is loaded: the probe is not needed
+            (self.tmp / 'no-module').mkdir(exist_ok=True)
+            r = self.cli(shell, 'profile', 'import', self.src, 'Wg')
+            self.assertEqual(r.returncode, 0, r.stderr)
+            (self.tmp / 'no-module').rmdir()
+
+    def test_engines(self):
+        for shell in self.each_shell():
+            r = self.lib(shell, 'load_driver wireguard; echo "[$DRV_EXTRA] [$DRV_PKG] [$TUN] [$DRV_ROUTES]"; '
+                                'drv_engines; drv_engines_ok && echo "ok=$?"')
+            self.assertIn('[] [wireguard-tools] [wg-mu300] [core]', r.stdout)
+            self.assertIn(f'{self.stubs}/wg', r.stdout.splitlines())
+            # wg is there and the probe's temporary interface can be made
+            self.assertIn('ok=0', r.stdout)
+            self.assertIn('link add wg-mu300-t type wireguard', (self.tmp / 'ip.log').read_text())
+            self.assertIn('link del wg-mu300-t', (self.tmp / 'ip.log').read_text())
+            # no wg: not ok, whatever the kernel says
+            (self.stubs / 'wg').rename(self.tmp / 'wg.away')
+            r = self.lib(shell, 'load_driver wireguard; drv_engines_ok || echo "ok=$?"')
+            (self.tmp / 'wg.away').rename(self.stubs / 'wg')
+            self.assertIn('ok=1', r.stdout)
+
+    def test_status_shows_no_keys(self):
+        for shell in self.each_shell():
+            self.setup_profile(shell)
+            r = self.run_lib(shell, 'drv_status')
+            self.assertEqual(r.returncode, 0, r.stderr)
+            lines = r.stdout.splitlines()
+            self.assertEqual(len(lines), 2, r.stdout)
+            self.assertRegex(lines[0], r'^handshake: (29|3\d)s ago$')
+            self.assertEqual(lines[1], 'transfer: 100 bytes received, 200 bytes sent')
+            self.no_keys(r)
+            self.assertNotIn(WG_PUB, r.stdout + r.stderr)
+
+    def test_names_are_looked_up_in_the_resolve_window(self):
+        for shell in self.each_shell():
+            self.setup_profile(shell)
+            r = self.run_lib(shell, 'drv_gen', 'ENABLE=1; KILL_SWITCH=1; ')
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(self.ev.read_text().splitlines(), ['nft -f', 'getent wg.example', 'nft -f'])
+            # a name that does not resolve: nothing is written, and the kill switch is back
+            self.fresh()
+            self.src.write_text(WG_CONF.replace('wg.example', 'nx.example'))
+            self.assertEqual(self.cli(shell, 'profile', 'import', self.src, 'Wg').returncode, 0)
+            r = self.run_lib(shell, 'drv_gen', 'ENABLE=1; KILL_SWITCH=1; ')
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn('cannot resolve the VPN server nx.example', r.stderr)
+            self.assertEqual(self.ev.read_text().splitlines(), ['nft -f', 'getent nx.example', 'nft -f'])
+            self.assertFalse((self.tmp / 'run/wg.conf').exists())
