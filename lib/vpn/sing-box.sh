@@ -13,11 +13,13 @@ TUN=sbtun
 
 drv_engines() { printf '%s\n' "$BIN"; }
 drv_engines_ok() { [ -x "$BIN" ]; }
-# the link takes apart (parse_uri exits on a bad one, hence the subshell), or the raw config names an outbound type;
-# the config itself is checked by sing-box in drv_gen
+# the link takes apart (parse_uri exits on a bad one, hence the subshell), or the raw config rebuilds; sing-box
+# itself checks the rebuilt file in drv_gen
 drv_check() {
     if singbox_raw; then
-        json_check "$SING_BOX_JSON_TEST" 'a sing-box config with outbounds' && singbox_json_keys_ok; return
+        # the rebuild gen runs, into a file of the profile's own (0700) directory that is removed again
+        singbox_json_rebuild "$PDIR/.check.$$" || return 1
+        rm -f "$PDIR/.check.$$"; return 0
     fi
     ( link_need; parse_uri )
 }
@@ -116,44 +118,124 @@ gen_singbox() {
 #
 # What a raw config may contain is a list (the spec's Security section), not whatever sing-box accepts: sing-box adds
 # features that listen (services such as ssm-api and derp, the clash and v2ray APIs, the debug server) faster than a
-# denylist would follow. Top level: dns, outbounds and route are the config's; log is ours (warn, stdout only: an
-# output path from the config would be a file written as root); inbounds and experimental are dropped (experimental
-# holds the control APIs and a cache file path); endpoints are allowed when every one is WireGuard, whose listen_port
-# is dropped so it dials out from a port the kernel picks. A Tailscale endpoint joins a tailnet whose members can
-# reach the device, so it refuses the config, as does any other top-level key. In route: rules, rule_set, final and
-# default_domain_resolver are the config's, default_mark and auto_detect_interface ours, default_interface is
-# dropped (the uplink is auto-detected), and any other key refuses the config.
+# denylist would follow. The file sing-box gets is a new document built from what the list accepts (json_rebuild),
+# after json_strict has refused anything jq and sing-box's decoder could read differently.
+# - Top level: dns, outbounds, route and endpoints are the config's; log is ours (warn, stdout only: an output path
+#   from the config would be a file written as root); inbounds and experimental are dropped (experimental holds the
+#   control APIs and a cache file path); any other key refuses the config. In route: rules, rule_set, final and
+#   default_domain_resolver are the config's, default_mark and auto_detect_interface ours, default_interface is
+#   dropped (the uplink is auto-detected), and any other key refuses the config.
+# - Outbounds: only the types in SING_BOX_JSON_TYPES. tor runs a program; a type not listed may be one a later
+#   sing-box adds. Endpoints: only WireGuard, with system false and without listen_port and the interface name, so
+#   it neither makes an interface nor listens; a Tailscale endpoint would join a tailnet whose members could reach
+#   the device. Connections arriving through an endpoint are rejected by a first route rule of ours: the peer is the
+#   config author's, and must not reach the LAN or the device. DNS servers: only the types in SING_BOX_JSON_DNS
+#   (tailscale, resolved and dhcp hang on what is not ours), and only in the format of sing-box 1.12 and later.
+# - The dial fields in SING_BOX_JSON_DIAL are removed wherever they sit in an outbound, endpoint or DNS server: they
+#   bind to an interface or an address, or set a mark, and the mark is ours.
+# - Every detour (and a rule set's download_detour), a selector's or urltest's outbounds and default, a route rule's
+#   outbound and route.final name an outbound or endpoint the config has; a DNS server's domain_resolver names one
+#   of its DNS servers.
+# - No key from JSON_DENY anywhere in what is kept, and no key spelled differently from a name the checks read
+#   (SING_BOX_JSON_NAMES). A local rule set's path names a file sing-box reads; no type that is allowed writes one,
+#   so no path is refused.
 SING_BOX_JSON_TEST='.outbounds[0].type | type == "string"'
-SING_BOX_JSON_KEYS='dns outbounds route endpoints log inbounds experimental'
-SING_BOX_ROUTE_KEYS='rules rule_set final default_domain_resolver default_mark auto_detect_interface default_interface'
+SING_BOX_JSON_KEYS='dns outbounds route endpoints'
+SING_BOX_JSON_DROPPED='log inbounds experimental'
+SING_BOX_ROUTE_KEYS='rules rule_set final default_domain_resolver'
+SING_BOX_ROUTE_DROPPED='default_mark auto_detect_interface default_interface'
+SING_BOX_JSON_TYPES='direct block socks http shadowsocks vmess vless trojan hysteria hysteria2 tuic shadowtls anytls ssh selector urltest dns'
+# refused types a refusal names; any other is "a type it does not know" (a value is never printed)
+SING_BOX_JSON_KNOWN='tor wireguard naive tailscale'
+SING_BOX_JSON_DNS='local udp tcp tls https quic h3 hosts fakeip'
+SING_BOX_JSON_DNS_KNOWN='tailscale resolved dhcp'
+SING_BOX_JSON_DIAL='routing_mark bind_interface inet4_bind_address inet6_bind_address reuse_addr netns protect_path udp_fragment tcp_fast_open tcp_multi_path'
+SING_BOX_JSON_NAMES='type tag detour download_detour outbound outbounds default server servers domain_resolver inbound rules rule_set final system'
+SING_BOX_JSON_REBUILD='
+($keep | split(" ")) as $keep | ($drop | split(" ")) as $drop | ($rkeep | split(" ")) as $rkeep
+| ($rdrop | split(" ")) as $rdrop | ($deny | split(" ")) as $deny | ($types | split(" ")) as $types
+| ($known | split(" ")) as $known | ($dnst | split(" ")) as $dnst | ($dnsknown | split(" ")) as $dnsknown
+| ($dial | split(" ")) as $dial | ($names | split(" ")) as $names
+| ([keys_unsorted[] | select(mu_in($keep + $drop) | not) | "top-level key " + mu_safe]
+   + [.route | objects | keys_unsorted[] | select(mu_in($rkeep + $rdrop) | not) | "route key " + mu_safe]) as $ptop
+| with_entries(select(.key | mu_in($keep)))
+| if (.route | type) == "object" then .route |= with_entries(select(.key | mu_in($rkeep))) else . end
+| if (.outbounds | type) == "array" then .outbounds |= map(mu_strip($dial)) else . end
+| if (.endpoints | type) == "array" then .endpoints |= map(if type == "object" then
+      with_entries(select(.key | mu_fold | mu_in(["listen_port", "name", "interface_name", "system"]) | not))
+      | mu_strip($dial) | .system = false else . end) else . end
+| if (.dns | type) == "object" and (.dns.servers | type) == "array" then .dns.servers |= map(mu_strip($dial)) else . end
+| . as $b
+| ($b.outbounds | if type == "array" then . else [] end) as $outs
+| ($b.endpoints | if type == "array" then . else [] end) as $eps
+| (($b.dns | objects | .servers | arrays) // []) as $dnss
+| [($outs + $eps)[] | objects | .tag | strings] as $tags
+| ([$dnss[] | objects | .tag | strings] + ["mu300-bootstrap"]) as $dnstags
+| def known_tag: type == "string" and mu_in($tags);
+  ($ptop
+   + (if ($b.outbounds | type) == "array" then [] else ["no outbounds list"] end)
+   + [$outs[] | if type != "object" then "an outbound that is not an object"
+                else (.type | mu_type) as $t
+                | if $t | mu_in($types) then empty
+                  elif $t | mu_in($known) then "outbound type " + $t
+                  else "an outbound type it does not know" end end]
+   + (if $b.endpoints == null or ($b.endpoints | type) == "array" then [] else ["endpoints that are not a list"] end)
+   + [$eps[] | if type == "object" and (.type | mu_type) == "wireguard"
+               then (if (.tag | type) == "string" then empty else "an endpoint without a tag" end)
+               elif type == "object" and ((.type | mu_type) | mu_in($known))
+               then "an endpoint that is not WireGuard (" + (.type | mu_type) + ")"
+               else "an endpoint that is not WireGuard" end]
+   + [$dnss[] | if type != "object" then "a DNS server that is not an object"
+                elif .type == null then "a DNS server without a type (the format before sing-box 1.12)"
+                else (.type | mu_type) as $t
+                | if $t | mu_in($dnst) then empty
+                  elif $t | mu_in($dnsknown) then "DNS server type " + $t
+                  else "a DNS server type it does not know" end end]
+   + [$b | mu_keys_in($deny)[] | "key " + .]
+   + [$b | mu_misspelled($names)[] | "a key spelled differently from " + .]
+   + [($outs + $eps + $dnss)[] | objects | .. | objects | .detour | select(. != null and (known_tag | not))
+      | "a detour to a tag that is none of its outbounds"]
+   + [$b.route | objects | .rule_set | arrays | .[] | objects | .download_detour
+      | select(. != null and (known_tag | not)) | "a rule set download_detour to a tag that is none of its outbounds"]
+   + [$outs[] | objects | select((.type | mu_type) | mu_in(["selector", "urltest"]))
+      | ((.outbounds | arrays | .[]), .default) | select(. != null and (known_tag | not))
+      | "a selector or urltest naming a tag that is none of its outbounds"]
+   + [$b.route | objects | (.rules | arrays | .. | objects | .outbound), .final
+      | select(. != null and (known_tag | not)) | "a route rule or final naming a tag that is none of its outbounds"]
+   + [$dnss[] | objects | .domain_resolver | select(. != null) | (if type == "object" then .server else . end)
+      | select((type == "string" and mu_in($dnstags)) | not)
+      | "a DNS server domain_resolver that is none of its DNS servers"]
+  ) as $p
+| if ($p | length) > 0 then {"refuse": ($p | unique)}
+  else {"config": ($b
+    | .log = {"level": "warn", "timestamp": false}
+    | .inbounds = [{"type": "tun", "tag": "tun-in", "stack": "gvisor", "interface_name": $tun, "address": $addrs,
+                    "mtu": 1400, "auto_route": true, "strict_route": true, "route_exclude_address": $excl}]
+    | .route = (.route // {})
+    | ([$eps[] | .tag]) as $eptags
+    | if ($eptags | length) > 0
+      then .route.rules = [{"inbound": $eptags, "action": "reject"}] + (.route.rules // []) else . end
+    | .route.default_mark = $mark | .route.auto_detect_interface = true
+    | .dns.servers = ((.dns.servers // []) | map(select(type != "object" or .tag != "mu300-bootstrap"))
+                      | . + [{"type": "udp", "tag": "mu300-bootstrap", "server": $boot}])
+    | .route.default_domain_resolver = (.route.default_domain_resolver // "mu300-bootstrap"))} end'
 singbox_raw() { [ -n "${PDIR:-}" ] && [ -r "$PDIR/config.json" ]; }
-singbox_json_keys_ok() {
-    json_refuse_keys "$PDIR/config.json" . "$SING_BOX_JSON_KEYS" "the profile's sing-box config" || return 1
-    json_refuse_keys "$PDIR/config.json" '.route' "$SING_BOX_ROUTE_KEYS" "the profile's sing-box route" || return 1
-    jq -e '(.endpoints // []) | type == "array" and all(type == "object" and .type == "wireguard")' \
-        "$PDIR/config.json" >/dev/null 2>&1 ||
-        { echo "the profile's sing-box config has an endpoint that is not WireGuard" >&2; return 1; }
+# singbox_json_rebuild OUT: the profile's config.json, rebuilt (see above) into OUT, or a refusal
+singbox_json_rebuild() {
+    json_rebuild "$PDIR/config.json" "$1" "the profile's sing-box config" "$SING_BOX_JSON_REBUILD" \
+        --arg tun "$TUN" --argjson addrs "[$(singbox_addrs)]" --argjson excl "$(json_list "$LAN_CIDRS")" \
+        --argjson mark "$((MARK))" --arg boot "$BOOTSTRAP_DNS" --arg keep "$SING_BOX_JSON_KEYS" \
+        --arg drop "$SING_BOX_JSON_DROPPED" --arg rkeep "$SING_BOX_ROUTE_KEYS" --arg rdrop "$SING_BOX_ROUTE_DROPPED" \
+        --arg deny "$JSON_DENY" --arg types "$SING_BOX_JSON_TYPES" --arg known "$SING_BOX_JSON_KNOWN" \
+        --arg dnst "$SING_BOX_JSON_DNS" --arg dnsknown "$SING_BOX_JSON_DNS_KNOWN" --arg dial "$SING_BOX_JSON_DIAL" \
+        --arg names "$SING_BOX_JSON_NAMES"
 }
 gen_singbox_json() {
     command -v jq >/dev/null 2>&1 || { echo "a raw sing-box config needs jq" >&2; exit 1; }
-    singbox_json_keys_ok || exit 1
     mkdir -p "$RUN"; chmod 700 "$RUN"
-    ( umask 077; jq --arg tun "$TUN" --argjson addrs "[$(singbox_addrs)]" --argjson excl "$(json_list "$LAN_CIDRS")" \
-        --argjson mark "$((MARK))" --arg boot "$BOOTSTRAP_DNS" '
-        {dns, outbounds, route, endpoints} | with_entries(select(.value != null))
-        | .log = {"level":"warn","timestamp":false}
-        | .inbounds = [{"type":"tun","tag":"tun-in","stack":"gvisor","interface_name":$tun,"address":$addrs,"mtu":1400,
-                        "auto_route":true,"strict_route":true,"route_exclude_address":$excl}]
-        | if .endpoints then .endpoints |= map(del(.listen_port)) else . end
-        | .route = ((.route // {}) | del(.default_interface))
-        | .route.default_mark = $mark | .route.auto_detect_interface = true
-        | .dns.servers = ((.dns.servers // []) | map(select(type != "object" or .tag != "mu300-bootstrap"))
-                          | . + [{"type":"udp","tag":"mu300-bootstrap","server":$boot}])
-        | .route.default_domain_resolver = (.route.default_domain_resolver // "mu300-bootstrap")' \
-        "$PDIR/config.json" > "$RUN/config.json" ) ||
-        { rm -f "$RUN/config.json"; echo "cannot rewrite the profile's sing-box config" >&2; exit 1; }
-    chmod 600 "$RUN/config.json"
+    singbox_json_rebuild "$RUN/config.json" || exit 1
     json_listens_loopback_only "$RUN/config.json" ||
         { rm -f "$RUN/config.json"; echo "the rewritten sing-box config listens beyond 127.0.0.1" >&2; exit 1; }
+    # sing-box checks the rebuilt file, the one it will run; the profile's own file is never given to it
     "$BIN" check -c "$RUN/config.json"
 }

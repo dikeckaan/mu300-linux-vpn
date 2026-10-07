@@ -890,9 +890,10 @@ SING_BOX_RAW = {
 
 
 class RawJson(ShellTest):
-    """Raw Xray and sing-box configs: imported as they are, and rewritten at every start so that only the device's
-    own inbound listens (no SOCKS port on the LAN), every connection the engine makes carries the mark the kill switch
-    lets out, and server names are looked up by the core. Also "-" as the source: a link or a config on stdin."""
+    """Raw Xray and sing-box configs: imported as they are, parsed strictly, and rebuilt at every start from what an
+    allowlist accepts, so that only the device's own inbound listens (no SOCKS port on the LAN), every connection the
+    engine makes carries the mark the kill switch lets out, server names are looked up by the core, and the engine
+    checks and runs only the rebuilt file. Also "-" as the source: a link or a config on stdin."""
 
     UUID = '11111111-2222-3333-4444-555555555555'
 
@@ -980,9 +981,9 @@ class RawJson(ShellTest):
         raw['outbounds'] = [
             {"protocol": "vless", "settings": {"vnext": [{"address": "srv.example", "port": 443, "users": []}]},
              "streamSettings": {"security": "reality", "realitySettings": {"serverName": "cover.example"}}},
-            {"protocol": "trojan", "settings": {"servers": [{"address": "tr.example", "port": 443, "password": "x"},
-                                                            {"address": "198.51.100.7", "port": 443,
-                                                             "password": "y"}]},
+            {"tag": "direct", "protocol": "trojan",
+             "settings": {"servers": [{"address": "tr.example", "port": 443, "password": "x"},
+                                      {"address": "198.51.100.7", "port": 443, "password": "y"}]},
              "streamSettings": {"security": "tls"}}]
         self.xray.write_text(self.json.dumps(raw))
         for shell in self.each_shell():
@@ -1004,7 +1005,7 @@ class RawJson(ShellTest):
             # a name that does not resolve: nothing is written to run, and the kill switch is back
             self.fresh()
             raw2 = dict(XRAY_RAW, outbounds=[{"protocol": "vless", "settings": {"vnext": [
-                {"address": "nx.example", "port": 1, "users": []}]}}])
+                {"address": "nx.example", "port": 1, "users": []}]}}, {"tag": "direct", "protocol": "freedom"}])
             self.xray.write_text(self.json.dumps(raw2))
             self.assertEqual(self.cli(shell, 'profile', 'import', self.xray, 'Raw').returncode, 0)
             r = self.gen(shell, 'raw', 'ENABLE=1; KILL_SWITCH=1; ')
@@ -1047,13 +1048,20 @@ class RawJson(ShellTest):
             self.assertEqual(cfg['dns']['servers'], [{"type": "udp", "tag": "mu300-bootstrap", "server": "1.1.1.1"}])
             self.sb.write_text(self.json.dumps(SING_BOX_RAW))
 
+    @staticmethod
+    def fold(key):
+        """A key as the drivers' mu_fold compares it, and as Go's decoder matches it to a field: ASCII lowercased,
+        after the long s and the Kelvin sign, which Go folds onto "s" and "k"."""
+        key = key.replace('\u017f', 's').replace('\u212a', 'k')
+        return ''.join(c.lower() if c.isascii() else c for c in key)
+
     def listeners(self, node, path=''):
-        """Every listen address, listen port and controller in a generated config, wherever it sits, as
-        (path, value)."""
+        """Every listen address, listen port and controller in a generated config, wherever it sits and however
+        its key is spelled, as (path, value)."""
         found = []
         if isinstance(node, dict):
             for k, v in node.items():
-                if k in ('listen', 'listen_port', 'external_controller'):
+                if self.fold(k) in ('listen', 'listen_port', 'external_controller'):
                     found.append((f'{path}.{k}', v))
                 found += self.listeners(v, f'{path}.{k}')
         elif isinstance(node, list):
@@ -1062,9 +1070,9 @@ class RawJson(ShellTest):
         return found
 
     def refused(self, shell, path, raw, *names):
-        """The config is refused at import, naming each key in names, with no credential in the output and no
-        profile left behind."""
-        path.write_text(self.json.dumps(raw))
+        """The config (a dict, or the file's text as it is) is refused at import, naming each key in names, with no
+        credential in the output and no profile left behind."""
+        path.write_text(raw if isinstance(raw, str) else self.json.dumps(raw))
         self.fresh()
         r = self.cli(shell, 'profile', 'import', path, 'Raw')
         self.assertNotEqual(r.returncode, 0, (shell, raw))
@@ -1160,12 +1168,15 @@ class RawJson(ShellTest):
             self.assertEqual(cfg['log'], {"level": "warn", "timestamp": False})
             self.assertEqual(cfg['outbounds'], SING_BOX_RAW['outbounds'])
             self.assertEqual(cfg['dns']['servers'][:-1], SING_BOX_RAW['dns']['servers'])
+            # a connection arriving through the endpoint is rejected first, then the config's own rules
+            self.assertEqual(cfg['route']['rules'][0], {"inbound": ["wg"], "action": "reject"})
             self.assertEqual({k: cfg['route'][k] for k in ('rules', 'rule_set', 'final', 'default_domain_resolver')},
-                             {k: route[k] for k in ('rules', 'rule_set', 'final', 'default_domain_resolver')})
+                             dict({k: route[k] for k in ('rules', 'rule_set', 'final', 'default_domain_resolver')},
+                                  rules=[{"inbound": ["wg"], "action": "reject"}] + route['rules']))
             self.assertNotIn('default_interface', cfg['route'])
-            # a WireGuard endpoint dials out from a port the kernel picks
+            # a WireGuard endpoint dials out from a port the kernel picks, and makes no interface of its own
             self.assertEqual(cfg['endpoints'], [{"type": "wireguard", "tag": "wg", "address": ["10.0.0.2/32"],
-                                                 "private_key": "k", "peers": []}])
+                                                 "private_key": "k", "peers": [], "system": False}])
             self.assertNotIn('/etc/', text)
             self.assertNotIn('9090', text)
             self.assertNotIn('8080', text)
@@ -1194,10 +1205,196 @@ class RawJson(ShellTest):
                             ({"inbounds": [{"listen": "0.0.0.0"}]}, False),
                             ({"a": [{"b": {"listen": "::"}}]}, False),
                             ({"endpoints": [{"listen_port": 51820}]}, False),
-                            ({"experimental": {"clash_api": {"external_controller": "127.0.0.1:9090"}}}, False)):
+                            ({"experimental": {"clash_api": {"external_controller": "127.0.0.1:9090"}}}, False),
+                            # no listen_port at all, even next to a loopback listen
+                            ({"inbounds": [{"listen": "127.0.0.1", "listen_port": 1080}]}, False),
+                            # keys are matched as the engines match them, without regard to case
+                            ({"a": {"Listen": "0.0.0.0"}}, False),
+                            ({"a": {"LISTEN": "127.0.0.1"}}, True),
+                            ({"a": {"Listen_Port": 1}}, False),
+                            ({"a": {"li\u017ften": "0.0.0.0"}}, False)):
                 f.write_text(self.json.dumps(doc))
                 r = self.lib(shell, f'json_listens_loopback_only "{f}"')
                 self.assertEqual(r.returncode == 0, ok, (shell, doc, r.stderr))
+
+    def test_socket_options_are_ours(self):
+        # A raw config's own socket options are removed wherever they sit; the mark is ours.
+        out = {"tag": "proxy", "protocol": "vless",
+               "settings": {"vnext": [{"address": "srv.example", "port": 443,
+                                       "users": [{"id": self.UUID, "encryption": "none"}]}]},
+               "sendThrough": "192.168.77.1",
+               "streamSettings": {"network": "tcp", "security": "tls", "tlsSettings": {"serverName": "srv.example"},
+                                  "sockopt": {"mark": 720, "interface": "wlan0"},
+                                  "xhttpSettings": {"path": "/x", "SockOpt": {"mark": 1}}}}
+        chained = {"tag": "chained", "protocol": "trojan",
+                   "settings": {"servers": [{"address": "203.0.113.9", "port": 443, "password": self.UUID}]},
+                   "streamSettings": {"sockopt": {"dialerProxy": "proxy", "interface": "wlan0"}}}
+        wg = {"tag": "wg", "protocol": "wireguard", "settings": {"secretKey": "k", "peers": []}}
+        raw = dict(XRAY_RAW, outbounds=[out, chained, wg, {"tag": "direct", "protocol": "freedom"}])
+        sb = dict(SING_BOX_RAW,
+                  outbounds=[dict(SING_BOX_RAW['outbounds'][0], routing_mark=720, bind_interface="wlan0",
+                                  inet4_bind_address="192.168.77.1", Reuse_Addr=True,
+                                  tls={"enabled": True, "tcp_fast_open": True}),
+                             {"type": "direct", "tag": "direct", "netns": "/run/netns/x"}],
+                  dns={"servers": [{"type": "tls", "tag": "dot", "server": "1.1.1.1", "bind_interface": "wlan0",
+                                    "detour": "proxy"}]})
+        for shell in self.each_shell():
+            self.fresh()
+            self.xray.write_text(self.json.dumps(raw))
+            self.assertEqual(self.cli(shell, 'profile', 'import', self.xray, 'Raw').returncode, 0)
+            r = self.gen(shell, 'raw')
+            self.assertEqual(r.returncode, 0, r.stderr)
+            cfg = self.json.loads((self.tmp / 'run/xray.json').read_text())
+            o, c, w, d = cfg['outbounds']
+            self.assertEqual(o['streamSettings']['sockopt'], {"mark": 720})
+            self.assertNotIn('sendThrough', o)
+            # a transport's path is kept: it is a URL path, not a file
+            self.assertEqual(o['streamSettings']['xhttpSettings'], {"path": "/x"})
+            # dialerProxy only chains through the config's own outbound, so it stays
+            self.assertEqual(c['streamSettings']['sockopt'], {"mark": 720, "dialerProxy": "proxy"})
+            self.assertEqual(d['streamSettings']['sockopt'], {"mark": 720})
+            self.assertIs(w['settings']['noKernelTun'], True)
+            self.assertFalse((self.tmp / 'run/xray.base.json').exists())
+            self.sb.write_text(self.json.dumps(sb))
+            self.assertEqual(self.cli(shell, 'profile', 'import', self.sb, 'SB').returncode, 0)
+            r = self.gen(shell, 'sb')
+            self.assertEqual(r.returncode, 0, r.stderr)
+            text = (self.tmp / 'run/config.json').read_text()
+            cfg = self.json.loads(text)
+            for k in ('routing_mark', 'bind_interface', 'inet4_bind_address', 'Reuse_Addr', 'tcp_fast_open', 'netns',
+                      'wlan0'):
+                self.assertNotIn(k, text)
+            self.assertEqual(cfg['outbounds'][0], dict(SING_BOX_RAW['outbounds'][0], tls={"enabled": True}))
+            self.assertEqual(cfg['dns']['servers'][0], {"type": "tls", "tag": "dot", "server": "1.1.1.1",
+                                                        "detour": "proxy"})
+            self.assertEqual(cfg['route']['default_mark'], 720)
+        self.xray.write_text(self.json.dumps(XRAY_RAW))
+        self.sb.write_text(self.json.dumps(SING_BOX_RAW))
+
+    def test_tags_must_be_the_configs_own(self):
+        sb_out = SING_BOX_RAW['outbounds']
+        xr_out = XRAY_RAW['outbounds']
+        for shell in self.each_shell():
+            # known: kept
+            ok = dict(SING_BOX_RAW, outbounds=[dict(sb_out[0], detour="direct"), sb_out[1]])
+            self.sb.write_text(self.json.dumps(ok))
+            self.fresh()
+            self.assertEqual(self.cli(shell, 'profile', 'import', self.sb, 'SB').returncode, 0)
+            self.assertEqual(self.gen(shell, 'sb').returncode, 0)
+            cfg = self.json.loads((self.tmp / 'run/config.json').read_text())
+            self.assertEqual(cfg['outbounds'][0]['detour'], 'direct')
+            # unknown: refused, the tag never printed
+            for raw in (dict(SING_BOX_RAW, outbounds=[dict(sb_out[0], detour="nowhere-tag"), sb_out[1]]),
+                        dict(SING_BOX_RAW, dns={"servers": [{"type": "udp", "tag": "d", "server": "1.1.1.1",
+                                                             "detour": "nowhere-tag"}]}),
+                        dict(SING_BOX_RAW, route={"final": "nowhere-tag"}),
+                        dict(SING_BOX_RAW, route={"rules": [{"ip_is_private": True, "outbound": "nowhere-tag"}]}),
+                        dict(SING_BOX_RAW, outbounds=sb_out + [{"type": "selector", "tag": "s",
+                                                                "outbounds": ["proxy", "nowhere-tag"]}]),
+                        dict(SING_BOX_RAW, dns={"servers": [{"type": "tls", "tag": "d", "server": "dns.example",
+                                                             "domain_resolver": "nowhere-tag"}]})):
+                r = self.refused(shell, self.sb, raw)
+                self.assertNotIn('nowhere-tag', r.stderr)
+            r = self.refused(shell, self.sb, dict(SING_BOX_RAW, outbounds=[dict(sb_out[0], detour="x"), sb_out[1]]),
+                             'detour')
+            self.refused(shell, self.xray, dict(XRAY_RAW, outbounds=[dict(xr_out[0], proxySettings={"tag": "nowhere"}),
+                                                                     xr_out[1]]), 'proxySettings')
+            self.refused(shell, self.xray, dict(XRAY_RAW, outbounds=[
+                dict(xr_out[0], streamSettings={"sockopt": {"dialerProxy": "nowhere"}}), xr_out[1]]), 'dialerProxy')
+            self.refused(shell, self.xray, dict(XRAY_RAW, routing={"rules": [{"type": "field", "outboundTag": "x"}]}),
+                         'outboundTag')
+            ok = dict(XRAY_RAW, outbounds=[dict(xr_out[0], proxySettings={"tag": "direct"}), xr_out[1]])
+            self.xray.write_text(self.json.dumps(ok))
+            self.fresh()
+            self.assertEqual(self.cli(shell, 'profile', 'import', self.xray, 'Raw').returncode, 0)
+            self.assertEqual(self.gen(shell, 'raw').returncode, 0)
+            cfg = self.json.loads((self.tmp / 'run/xray.json').read_text())
+            self.assertEqual(cfg['outbounds'][0]['proxySettings'], {"tag": "direct"})
+        self.xray.write_text(self.json.dumps(XRAY_RAW))
+        self.sb.write_text(self.json.dumps(SING_BOX_RAW))
+
+    def test_only_strict_json(self):
+        # What jq and the engine's decoder could read differently is refused before anything else looks at it.
+        x = self.json.dumps(XRAY_RAW)
+        big = dict(XRAY_RAW, routing={"rules": [{"type": "field", "domain": ["d%07d.example" % i for i in
+                                                                               range(60000)],
+                                                 "outboundTag": "direct"}]})
+        for shell in self.each_shell():
+            # the same key twice, at the top and deeper, with a scalar or an object
+            self.refused(shell, self.xray, x[:-1] + ', "outbounds": []}', 'twice')
+            self.refused(shell, self.xray, x.replace('"protocol": "freedom"',
+                                                     '"protocol": "freedom", "protocol": "dokodemo-door"'), 'twice')
+            self.refused(shell, self.xray, x.replace('"streamSettings": {',
+                                                     '"streamSettings": {"sockopt": {"mark": 1}}, "streamSettings": {'),
+                         'twice')
+            # keys that fold to one name, and a lone key spelled differently from one the checks read
+            self.refused(shell, self.xray, x.replace('"protocol": "freedom"',
+                                                     '"protocol": "freedom", "Protocol": "dokodemo-door"'),
+                         'case', 'protocol')
+            self.refused(shell, self.sb, dict(SING_BOX_RAW, outbounds=[dict(SING_BOX_RAW['outbounds'][0],
+                                                                            Type="tor")]), 'case', 'type')
+            self.refused(shell, self.xray, x.replace('"protocol": "freedom"', '"Protocol": "dokodemo-door"'),
+                         'protocol')
+            self.refused(shell, self.sb, dict(SING_BOX_RAW, outbounds=[dict(SING_BOX_RAW['outbounds'][0],
+                                                                            transport={"Listen": "0.0.0.0"})]),
+                         'listen')
+            # Go folds the long s onto "s" and the Kelvin sign onto "k"
+            self.refused(shell, self.sb, dict(SING_BOX_RAW, outbounds=[dict(SING_BOX_RAW['outbounds'][0],
+                                                                            **{"li\u017ften": "0.0.0.0"})]), 'listen')
+            # not JSON: a comment, a trailing comma, a second document, nan, a top level that is not an object
+            self.refused(shell, self.xray, x[:-1] + ' // a comment\n}', 'not one JSON object')
+            self.refused(shell, self.xray, x[:-1] + ' /* a comment */}', 'not one JSON object')
+            self.refused(shell, self.xray, x[:-1] + ',}', 'not one JSON object')
+            self.refused(shell, self.xray, x.replace('"direct"}]', '"direct"},]', 1), 'not one JSON object')
+            self.refused(shell, self.xray, x + x, 'not one JSON object')
+            self.refused(shell, self.xray, x.replace('443', 'nan', 1), 'number')
+            self.refused(shell, self.xray, '[' + x + ']')
+            # larger than 1 MiB
+            self.refused(shell, self.xray, big, '1 MiB')
+            # a config.json that became a duplicate-key file on disk is refused at start too, and nothing is written
+            self.fresh()
+            self.xray.write_text(x)
+            self.assertEqual(self.cli(shell, 'profile', 'import', self.xray, 'Raw').returncode, 0)
+            (self.store / 'profiles/raw/config.json').write_text(x[:-1] + ', "outbounds": []}')
+            r = self.gen(shell, 'raw')
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn('twice', r.stderr)
+            self.assertEqual(list((self.tmp / 'run').iterdir()), [])
+        self.assertGreater(len(self.json.dumps(big)), 1 << 20)
+        self.xray.write_text(self.json.dumps(XRAY_RAW))
+        self.sb.write_text(self.json.dumps(SING_BOX_RAW))
+
+    def test_types_are_a_list(self):
+        sb_out = SING_BOX_RAW['outbounds']
+        xr_out = XRAY_RAW['outbounds']
+        for shell in self.each_shell():
+            self.refused(shell, self.sb, dict(SING_BOX_RAW, outbounds=sb_out + [
+                {"type": "tor", "tag": "t", "executable_path": "/bin/sh", "torrc": {"x": self.UUID}}]), 'tor')
+            # a type it does not know is not printed: it is a value, and could be anything
+            r = self.refused(shell, self.sb, dict(SING_BOX_RAW, outbounds=sb_out + [{"type": self.UUID, "tag": "u"}]),
+                             'does not know')
+            self.refused(shell, self.sb, dict(SING_BOX_RAW, outbounds=[sb_out[0], {"type": "direct", "tag": "direct",
+                                                                                  "override_address": "10.0.0.1"}]),
+                         'override_address')
+            self.refused(shell, self.sb, dict(SING_BOX_RAW, dns={"servers": [{"type": "tailscale", "tag": "ts",
+                                                                              "endpoint": "ts"}]}), 'tailscale')
+            self.refused(shell, self.sb, dict(SING_BOX_RAW, dns={"servers": [{"tag": "old",
+                                                                              "address": "tls://1.1.1.1"}]}),
+                         'without a type')
+            self.refused(shell, self.sb, dict(SING_BOX_RAW, route={"rules": [{"action": "route-options",
+                                                                              "override_port": 53}]}), 'override_port')
+            self.refused(shell, self.xray, dict(XRAY_RAW, outbounds=xr_out + [
+                {"tag": "in", "protocol": "dokodemo-door", "settings": {"address": "127.0.0.1"}}]), 'dokodemo-door')
+            self.refused(shell, self.xray, dict(XRAY_RAW, outbounds=xr_out + [{"tag": "l", "protocol": "Loopback"}]),
+                         'loopback')
+            self.refused(shell, self.xray, dict(XRAY_RAW, outbounds=[xr_out[0], dict(xr_out[1], settings={
+                "redirect": "127.0.0.1:22"})]), 'redirect')
+            self.refused(shell, self.xray, dict(XRAY_RAW, outbounds=[xr_out[0], dict(xr_out[1], settings={
+                "reverse": {"tag": "r"}})]), 'reverse')
+            r = self.refused(shell, self.xray, dict(XRAY_RAW, outbounds=xr_out + [{"tag": "u", "protocol": self.UUID}]),
+                             'does not know')
+        self.xray.write_text(self.json.dumps(XRAY_RAW))
+        self.sb.write_text(self.json.dumps(SING_BOX_RAW))
 
     def test_import_sniffing(self):
         bad = self.tmp / 'bad.json'

@@ -985,9 +985,10 @@ sniff_type() {
         *://*) echo "not a kind of link this version knows (vless, vmess, trojan, ss)" >&2; return 1 ;;
     esac
     [ -f "$1" ] && [ -r "$1" ] || { echo "neither a link nor a readable file" >&2; return 1; }
-    # JSON: Xray's outbounds name a "protocol", sing-box's a "type"
+    # JSON: Xray's outbounds name a "protocol", sing-box's a "type". It is read strictly first (size, one object,
+    # no key twice), so that the type is told from what the driver will read, too.
     if [ "$(tr -d ' \t\r\n' < "$1" | cut -c1)" = '{' ]; then
-        command -v jq >/dev/null 2>&1 || { echo "reading a JSON config needs jq" >&2; return 1; }
+        json_strict "$1" "the config" || return 1
         _t=$(jq -r 'if (.outbounds | type) != "array" then empty
                     elif any(.outbounds[]; type == "object" and has("protocol")) then "xray"
                     elif any(.outbounds[]; type == "object" and has("type")) then "sing-box" else empty end' \

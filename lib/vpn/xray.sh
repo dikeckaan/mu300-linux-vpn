@@ -159,32 +159,102 @@ gen_xray() {
 # certificate is still checked against it. There is no certificate pin management here: a raw config says itself
 # what it wants verified.
 #
-# What a raw config may contain is a list (the spec's Security section): its outbounds, its routing and its DNS, and
-# fakedns, observatory and burstObservatory, which open nothing. Its inbounds and log are replaced by ours. api, stats,
-# metrics and policy are dropped without a word, because panels put them in nearly every config they hand out: api
-# and metrics open listeners of their own, stats and policy only matter to them (a routing rule that led to the
-# API's handler goes with it). "remarks", a subscription's name for the config, is dropped too. Anything else - reverse,
-# whose portals take connections in, transport, or a key some later Xray adds - refuses the config, naming the key.
+# What a raw config may contain is a list (the spec's Security section), and the file Xray gets is a new document
+# built from what the list accepts (json_rebuild): json_strict has already refused anything jq and Xray's decoder
+# could read differently.
+# - Top level: outbounds, routing, dns, fakedns, observatory and burstObservatory are the config's. inbounds and log
+#   are ours. api, stats, metrics and policy are dropped without a word, because panels put them in nearly every
+#   config they hand out: api and metrics open listeners of their own, stats and policy only matter to them (a
+#   routing rule that led to the API's handler goes with it). "remarks", a subscription's name for the config, is
+#   dropped too. Anything else - reverse, whose portals take connections in, transport, a key some later Xray adds -
+#   refuses the config, naming the key.
+# - Outbounds: only the protocols in XRAY_JSON_PROTOCOLS (compared lowercased, as Xray compares them). dokodemo-door
+#   and loopback are inbound plumbing; reverse, anywhere, takes connections in; freedom's redirect sends everything
+#   to an address of the config's choosing. sockopt and sendThrough are removed wherever they sit: they bind to an
+#   interface or an address, or set a mark, and the mark is ours. Every outbound gets sockopt {"mark": 720}, and the
+#   dialerProxy its sockopt had, which only chains it through another of the config's outbounds. A WireGuard
+#   outbound gets noKernelTun, or it would make an interface and ip rules of its own.
+# - proxySettings.tag, dialerProxy and every routing rule's outboundTag name an outbound the config has. A dns.servers
+#   entry is a string, or an object reduced to the keys in XRAY_JSON_DNS_KEYS.
+# - No key from JSON_DENY anywhere in what is kept, and no key spelled differently from a name the checks read
+#   (XRAY_JSON_NAMES): "Protocol" would be the protocol to Xray, but not to them.
+# A transport's path (ws, httpupgrade, xhttp) is a URL path, not a file, so no path is refused; no outbound type
+# that is allowed writes a file.
 XRAY_JSON_TEST='.outbounds | type == "array"'
 XRAY_JSON_KEYS='outbounds routing dns fakedns observatory burstObservatory'
 XRAY_JSON_DROPPED='inbounds log api stats metrics policy remarks'
+XRAY_JSON_PROTOCOLS='vless vmess trojan shadowsocks socks http wireguard hysteria freedom blackhole dns'
+# refused protocols a refusal names; any other is "a protocol it does not know" (a value is never printed)
+XRAY_JSON_KNOWN='dokodemo-door loopback tun mtproto'
+XRAY_JSON_DNS_KEYS='address port domains expectIPs skipFallback clientIP queryStrategy tag timeoutMs'
+XRAY_JSON_NAMES='protocol tag settings streamSettings proxySettings dialerProxy vnext servers address outboundTag noKernelTun security tlsSettings realitySettings serverName rules'
+XRAY_JSON_REBUILD='
+($keep | split(" ")) as $keep | ($drop | split(" ")) as $drop | ($deny | split(" ") + ["reverse"]) as $deny
+| ($protos | split(" ")) as $protos | ($known | split(" ")) as $known | ($dnskeys | split(" ")) as $dnskeys
+| ($names | split(" ")) as $names
+| [keys_unsorted[] | select(mu_in($keep + $drop) | not) | "top-level key " + mu_safe] as $ptop
+| ((.api | objects | .tag | strings) // null) as $api
+| with_entries(select(.key | mu_in($keep)))
+| if $api != null and (.routing | type) == "object" and (.routing.rules | type) == "array"
+  then .routing.rules |= map(select(type != "object" or .outboundTag != $api)) else . end
+| if (.outbounds | type) == "array" then .outbounds |= map(
+    if type != "object" then . else
+      ((.streamSettings | objects | .sockopt | objects | .dialerProxy) // null) as $dp
+      | mu_strip(["sockopt", "sendthrough"])
+      | if (.protocol | mu_type) == "wireguard" then .settings.noKernelTun = true else . end
+      | .streamSettings.sockopt = ({"mark": $mark} + (if $dp != null then {"dialerProxy": $dp} else {} end))
+    end) else . end
+| if (.dns | type) == "object" and (.dns.servers | type) == "array"
+  then .dns.servers |= map(if type == "object" then with_entries(select(.key | mu_in($dnskeys))) else . end) else . end
+| . as $b
+| ($b.outbounds | if type == "array" then . else [] end) as $outs
+| [$outs[] | objects | .tag | strings] as $tags
+| def known_tag: type == "string" and mu_in($tags);
+  ($ptop
+   + (if ($b.outbounds | type) == "array" then [] else ["no outbounds list"] end)
+   + [$outs[] | if type != "object" then "an outbound that is not an object"
+                else (.protocol | mu_type) as $t
+                | if $t | mu_in($protos) then empty
+                  elif $t | mu_in($known) then "outbound protocol " + $t
+                  else "an outbound protocol it does not know" end end]
+   + [$b | mu_keys_in($deny)[] | "key " + .]
+   + [$b | mu_misspelled($names)[] | "a key spelled differently from " + .]
+   + [$outs[] | objects | (.proxySettings | objects | .tag), .streamSettings.sockopt.dialerProxy
+      | select(. != null and (known_tag | not)) | "proxySettings or dialerProxy naming an outbound it does not have"]
+   + [$b.routing | objects | .rules | arrays | .[] | objects | .outboundTag
+      | select(. != null and (known_tag | not)) | "a routing rule whose outboundTag is not one of its outbounds"]
+  ) as $p
+| if ($p | length) > 0 then {"refuse": ($p | unique)}
+  else {"config": ($b
+    | .log = {"loglevel": "warning", "access": "none"}
+    | .inbounds = [{"tag": "socks-in", "listen": "127.0.0.1", "port": $port, "protocol": "socks",
+                    "settings": {"auth": "noauth", "udp": true, "ip": "127.0.0.1"}}])} end'
 xray_raw() { [ -n "${PDIR:-}" ] && [ -r "$PDIR/config.json" ]; }
-xray_json_keys_ok() {
-    json_refuse_keys "$PDIR/config.json" . "$XRAY_JSON_KEYS $XRAY_JSON_DROPPED" "the profile's Xray config"
+# xray_json_rebuild OUT: the profile's config.json, rebuilt (see above) into OUT, or a refusal
+xray_json_rebuild() {
+    json_rebuild "$PDIR/config.json" "$1" "the profile's Xray config" "$XRAY_JSON_REBUILD" \
+        --argjson port "$SOCKS_PORT" --argjson mark "$((MARK))" --arg keep "$XRAY_JSON_KEYS" \
+        --arg drop "$XRAY_JSON_DROPPED" --arg deny "$JSON_DENY" --arg protos "$XRAY_JSON_PROTOCOLS" \
+        --arg known "$XRAY_JSON_KNOWN" --arg dnskeys "$XRAY_JSON_DNS_KEYS" --arg names "$XRAY_JSON_NAMES"
 }
-# every server address in the config's vnext and servers, one per line. Names and addresses are told apart in the
-# shell, not with jq's test(): OpenWrt's jq may be built without regular expressions.
+# xray_json_addresses FILE: every server address in a rebuilt config's vnext and servers, one per line. Names and
+# addresses are told apart in the shell, not with jq's test(): OpenWrt's jq may be built without regular expressions.
 xray_json_addresses() {
     jq -r '.outbounds[]? | objects | .settings | objects | (.vnext, .servers) | arrays | .[] | objects
-           | .address | strings' "$PDIR/config.json"
+           | .address | strings' "$1"
 }
 gen_xray_json() {
     command -v jq >/dev/null 2>&1 || { echo "a raw Xray config needs jq" >&2; exit 1; }
-    xray_json_keys_ok || exit 1
-    _all=$(xray_json_addresses 2>/dev/null) || { echo "cannot read the servers of the profile's Xray config" >&2; exit 1; }
+    mkdir -p "$RUN"; chmod 700 "$RUN"
+    rm -f "$RUN/xray.json"
+    # Everything from here on reads the rebuilt document, never the profile's file again.
+    _base=$RUN/xray.base.json
+    xray_json_rebuild "$_base" || exit 1
+    _all=$(xray_json_addresses "$_base" 2>/dev/null) ||
+        { rm -f "$_base"; echo "cannot read the servers of the profile's Xray config" >&2; exit 1; }
     # an address goes into a lookup, into JSON and into a routing rule: only what a host name or an address can be
     if printf '%s\n' "$_all" | grep -q '[^A-Za-z0-9._:-]'; then
-        echo "a server in the profile's Xray config is not a host name or an address" >&2; exit 1
+        rm -f "$_base"; echo "a server in the profile's Xray config is not a host name or an address" >&2; exit 1
     fi
     _names=; _lits=
     for _a in $(printf '%s\n' "$_all" | sort -u); do
@@ -194,35 +264,23 @@ gen_xray_json() {
     # whether a lookup failed or not.
     _map=; _ips=
     if [ -n "$_names" ]; then
-        resolve_window || { resolve_close; echo "could not open the resolve window" >&2; exit 1; }
+        resolve_window || { resolve_close; rm -f "$_base"; echo "could not open the resolve window" >&2; exit 1; }
         for _h in $_names; do
             _ip=$(vpn_resolve "$_h") || _ip=
-            [ -n "$_ip" ] || { resolve_close; echo "cannot resolve the VPN server $_h" >&2; exit 1; }
+            [ -n "$_ip" ] || { resolve_close; rm -f "$_base"; echo "cannot resolve the VPN server $_h" >&2; exit 1; }
             _map="$_map${_map:+,}$(json_str "$_h"):$(json_str "$_ip")"; _ips="$_ips $_ip"
             echo "server $_h -> $_ip"
         done
-        resolve_close || { echo "could not put the kill switch back after the lookups" >&2; exit 1; }
+        resolve_close || { rm -f "$_base"; echo "could not put the kill switch back after the lookups" >&2; exit 1; }
     fi
-    mkdir -p "$RUN"; chmod 700 "$RUN"
-    # The output is built from the allowed keys alone, so nothing the config had besides them reaches Xray. Our
-    # SOCKS inbound on 127.0.0.1 is the only inbound. Logged at warning to stdout only (no access or error file: a
-    # path from the config would be a file written as root), where a link's config logs at info: info is only
-    # needed for the pin-mismatch line drv_start's reader looks for, and a raw config has no managed pin.
-    ( umask 077; jq --argjson port "$SOCKS_PORT" --argjson mark "$((MARK))" --argjson map "{$_map}" \
-        --arg keep "$XRAY_JSON_KEYS" '
+    # The names in vnext and servers become the addresses looked up; the name stays as the TLS or REALITY
+    # serverName where the config gave none.
+    ( umask 077; jq --argjson map "{$_map}" '
         def resolved: if type == "object" and (.address | type) == "string" and $map[.address]
                       then .address = $map[.address] else . end;
-        ((.api | objects | .tag | strings) // null) as $api
-        | with_entries(select(.key as $k | $keep | split(" ") | any(. == $k)))
-        | if $api != null and (.routing.rules | type) == "array"
-          then .routing.rules |= map(select(type != "object" or .outboundTag != $api)) else . end
-        | .log = {"loglevel":"warning","access":"none"}
-        | .inbounds = [{"tag":"socks-in","listen":"127.0.0.1","port":$port,"protocol":"socks",
-                        "settings":{"auth":"noauth","udp":true,"ip":"127.0.0.1"}}]
-        | .outbounds |= map(
+        .outbounds |= map(
             ([(.settings.vnext, .settings.servers) | arrays | .[] | objects | .address | strings
               | select($map[.])] | first) as $n
-            | .streamSettings.sockopt.mark = $mark
             | if (.settings.vnext | type) == "array" then .settings.vnext |= map(resolved) else . end
             | if (.settings.servers | type) == "array" then .settings.servers |= map(resolved) else . end
             | if $n and ((.streamSettings.security // "") == "tls")
@@ -231,8 +289,9 @@ gen_xray_json() {
               elif $n and ((.streamSettings.security // "") == "reality")
                     and ((.streamSettings.realitySettings.serverName // "") == "")
               then .streamSettings.realitySettings.serverName = $n
-              else . end)' "$PDIR/config.json" > "$RUN/xray.json" ) ||
-        { rm -f "$RUN/xray.json"; echo "cannot rewrite the profile's Xray config" >&2; exit 1; }
+              else . end)' "$_base" > "$RUN/xray.json" ) 2>/dev/null ||
+        { rm -f "$RUN/xray.json" "$_base"; echo "cannot rewrite the profile's Xray config" >&2; exit 1; }
+    rm -f "$_base"
     chmod 600 "$RUN/xray.json"
     json_listens_loopback_only "$RUN/xray.json" ||
         { rm -f "$RUN/xray.json"; echo "the rewritten Xray config listens beyond 127.0.0.1" >&2; exit 1; }
@@ -250,14 +309,16 @@ drv_engines_ok() {
     # there (the core runs it on the sing-box driver)
     case ${PURI:-${VLESS_URI:-}} in vless://*) [ -x "$BIN" ] ;; *) return 1 ;; esac
 }
-# the link takes apart and its transport is one the stream settings can express, or the raw config has outbounds
-# whose servers can be read (Xray itself checks in drv_gen)
+# the link takes apart and its transport is one the stream settings can express, or the raw config rebuilds and its
+# servers can be read (Xray itself checks the rebuilt file in drv_gen)
 drv_check() {
     if xray_raw; then
-        json_check "$XRAY_JSON_TEST" 'an Xray config with outbounds' || return 1
-        xray_json_keys_ok || return 1
-        xray_json_addresses >/dev/null 2>&1 || { echo "cannot read the servers of the profile's Xray config" >&2; return 1; }
-        return 0
+        # the rebuild gen runs, into a file of the profile's own (0700) directory that is removed again
+        _chk=$PDIR/.check.$$
+        xray_json_rebuild "$_chk" || return 1
+        xray_json_addresses "$_chk" >/dev/null 2>&1 ||
+            { rm -f "$_chk"; echo "cannot read the servers of the profile's Xray config" >&2; return 1; }
+        rm -f "$_chk"; return 0
     fi
     ( link_need; parse_link "$VLESS_URI" || exit 1; PIN=; VCN=; xray_stream_json >/dev/null )
 }

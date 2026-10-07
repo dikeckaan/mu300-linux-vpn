@@ -187,42 +187,109 @@ link_import() {
 # is_json FILE: the file's first character that is not white space is "{" (a JSON config rather than a link or
 # some other kind of file)
 is_json() { [ -f "$1" ] && [ -r "$1" ] && [ "$(tr -d ' \t\r\n' < "$1" | cut -c1)" = '{' ]; }
+
+# ---- raw JSON configs: hostile input --------------------------------------------------------------------------
+# A raw Xray or sing-box config comes from a user, a panel or a subscription, and the engine runs it as root. It is
+# parsed once, strictly (json_strict), and a new document is built from what an allowlist accepts (json_rebuild with
+# the driver's program); the engine only ever reads that document. Nothing here uses jq's regular expressions
+# (test, match, sub and the rest): OpenWrt's jq may be built without them. jq's own error output is never shown,
+# because it quotes pieces of the file, and the file holds the credentials.
+#
+# mu_fold is how Go's encoding/json, which both engines use, compares a key with a field name: without regard to
+# case. ascii_downcase alone is not quite that, since Go also folds two non-ASCII letters onto ASCII ones (U+017F,
+# the long s, onto "s", and U+212A, the Kelvin sign, onto "k"), so "liſten" would reach the engine as "listen". Both
+# are mapped first. mu_safe is a name as a refusal may print it: letters, digits, "_", "." and "-", at most 40 of
+# them, everything else "?". mu_strip removes every key whose folded name is in a list, at any depth. mu_keys_in
+# gives the listed names that occur as a key anywhere, and mu_misspelled the listed names that occur spelled some
+# other way (a lone "Protocol" is the engine's "protocol", but not the "protocol" the checks here read).
+JQ_LIB='
+def mu_fold: explode | map(if . == 383 then 115 elif . == 8490 then 107 else . end) | implode | ascii_downcase;
+def mu_safe: explode | map(if (. >= 48 and . <= 57) or (. >= 65 and . <= 90) or (. >= 97 and . <= 122)
+                           or . == 95 or . == 46 or . == 45 then . else 63 end) | .[:40] | implode;
+def mu_in($l): . as $x | any($l[]; . == $x);
+def mu_strip($l): if type == "object" then with_entries(select(.key | mu_fold | mu_in($l) | not) | .value |= mu_strip($l))
+                  elif type == "array" then map(mu_strip($l)) else . end;
+def mu_keys_in($l): [.. | objects | keys_unsorted[] | mu_fold | select(mu_in($l))] | unique;
+def mu_misspelled($l): [.. | objects | keys_unsorted[] | . as $k | mu_fold as $f
+                        | $l[] | select(mu_fold == $f and . != $k)] | unique;
+def mu_type: if type == "string" then mu_fold else "" end;
+'
+# Keys no raw config may have anywhere in what is kept of it, compared folded. listen, listen_port and
+# external_controller open ports; executable_path, data_directory, torrc and extra_args start programs or name
+# directories the engine writes; redirect (Xray's freedom) and override_address/override_port (sing-box's direct and
+# route options) send a connection somewhere other than where the config's own routing says. A refusal names the
+# key from this list, never the value.
+JSON_DENY='listen listen_port external_controller executable_path data_directory torrc extra_args redirect override_address override_port'
+
+# json_size_ok FILE: at most 1 MiB, checked before jq reads the file at all
+json_size_ok() {
+    _js=$(wc -c < "$1" 2>/dev/null | tr -d ' \t') || return 1
+    [ -n "$_js" ] && [ "$_js" -le 1048576 ]
+}
+# json_strict FILE WHAT: FILE is one JSON object that every reader reads the same way, or a message and 1. jq reads
+# things that are not JSON (nan, infinity) and keeps the last of two equal keys without a word, where Go's decoder
+# keeps the last too but matches field names without regard to case: {"type":"x","Type":"y"} is "x" to jq and "y" to
+# the engine. So: the size first; then exactly one document, an object; no number that is not finite; no key twice
+# in one object (jq's event stream of the file has one event more for every value a later equal key replaced, so it
+# is longer than the stream of what jq kept); and no two keys of one object that fold to the same name.
+json_strict() {
+    [ -f "$1" ] && [ -r "$1" ] || { echo "cannot read $2" >&2; return 1; }
+    command -v jq >/dev/null 2>&1 || { echo "reading a JSON config needs jq" >&2; return 1; }
+    json_size_ok "$1" || { echo "$2 is larger than 1 MiB" >&2; return 1; }
+    jq -n -e '[inputs] | length == 1 and (.[0] | type == "object")' "$1" >/dev/null 2>&1 ||
+        { echo "$2 is not one JSON object (comments, trailing commas and a second document are not JSON)" >&2; return 1; }
+    jq -e '[.. | numbers | select(isnan or isinfinite)] | length == 0' "$1" >/dev/null 2>&1 ||
+        { echo "$2 has a number that is not a JSON number" >&2; return 1; }
+    _ja=$(jq -c --stream . "$1" 2>/dev/null | wc -l) && _jb=$(jq -c tostream "$1" 2>/dev/null | wc -l) &&
+        [ "$_ja" -eq "$_jb" ] ||
+        { echo "$2 has a key twice in one object (jq and the engine would read different values)" >&2; return 1; }
+    _jk=$(jq -r "$JQ_LIB"'[.. | objects | keys_unsorted | map(mu_fold) | group_by(.)[] | select(length > 1) | .[0]
+                          | mu_safe] | unique | .[:8] | join(" ")' "$1" 2>/dev/null) ||
+        { echo "cannot read $2" >&2; return 1; }
+    [ -z "$_jk" ] || { echo "$2 has keys that differ only in case: $_jk" >&2; return 1; }
+}
+# json_rebuild SRC OUT WHAT PROGRAM [JQ ARGS...]: SRC checked by json_strict, then PROGRAM (a driver's) run on it with
+# JQ_LIB and the arguments. PROGRAM gives {"refuse":[reasons]} or {"config":DOC}; DOC goes to OUT (0600, written
+# under umask 077), a refusal to stderr as "WHAT is refused: ...", at most 8 reasons. The reasons are the program's
+# own words and names (mu_safe, or names from its lists), never a value from the file; they are reduced to
+# printable characters once more here all the same. OUT is not left behind when anything fails.
+json_rebuild() {
+    _jr_src=$1; _jr_out=$2; _jr_what=$3; _jr_prog=$4; shift 4
+    rm -f "$_jr_out"
+    json_strict "$_jr_src" "$_jr_what" || return 1
+    if ! ( umask 077; jq "$@" "$JQ_LIB$_jr_prog" "$_jr_src" > "$_jr_out.r" ) 2>/dev/null; then
+        rm -f "$_jr_out.r"; echo "cannot read $_jr_what" >&2; return 1
+    fi
+    _jr_p=$(jq -r '.refuse // empty | .[]' "$_jr_out.r" 2>/dev/null) || _jr_p='?'
+    if [ -n "$_jr_p" ]; then
+        rm -f "$_jr_out.r"
+        _jr_p=$(printf '%s\n' "$_jr_p" | tr -c "A-Za-z0-9_.,'() \n-" '?' | head -n 8 | tr '\n' ';' | sed 's/;$//; s/;/; /g')
+        echo "$_jr_what is refused: $_jr_p (change it and import the config again)" >&2
+        return 1
+    fi
+    if ! ( umask 077; jq '.config' "$_jr_out.r" > "$_jr_out" ) 2>/dev/null; then
+        rm -f "$_jr_out" "$_jr_out.r"; echo "cannot read $_jr_what" >&2; return 1
+    fi
+    rm -f "$_jr_out.r"; chmod 600 "$_jr_out"
+}
 # json_import SRC TEST WHAT: a JSON config file into the profile ($PDIR/config.json, 0600, through a temporary file
-# and mv) when jq says TEST of it is true. WHAT names the kind of config in the refusal; the file itself is never
-# repeated, since it holds the credentials.
+# and mv) when it is strict JSON and jq says TEST of it is true. The file is stored as it came, so that profile
+# export gives it back; what the engine gets is rebuilt from it at every start, and drv_check runs the same rebuild
+# right after the import. WHAT names the kind of config in the refusal; the file itself is never repeated.
 json_import() {
     [ -n "${PDIR:-}" ] && [ -d "$PDIR" ] || { echo "no profile to import into" >&2; return 1; }
-    command -v jq >/dev/null 2>&1 || { echo "reading a JSON config needs jq" >&2; return 1; }
+    json_strict "$1" "the config" || return 1
     jq -e "$2" "$1" >/dev/null 2>&1 || { echo "not $3" >&2; return 1; }
     ( umask 077; cat "$1" > "$PDIR/config.json.new.$$" ) && mv "$PDIR/config.json.new.$$" "$PDIR/config.json" && return 0
     rm -f "$PDIR/config.json.new.$$"; return 1
 }
-# json_check TEST WHAT: the profile's config.json, as json_import checked it
-json_check() {
-    command -v jq >/dev/null 2>&1 || { echo "reading a JSON config needs jq" >&2; return 1; }
-    jq -e "$1" "$PDIR/config.json" >/dev/null 2>&1 || { echo "the profile's config.json is not $2" >&2; return 1; }
-}
-# json_refuse_keys FILE FILTER ALLOWED WHAT: fails, naming them, when the object FILTER picks out of FILE has keys
-# that are not in ALLOWED (names separated by spaces). A raw config is held to a list of what it may contain, not
-# checked against a list of what it may not: an engine's next release adds features faster than a denylist would,
-# and some of them listen. Only the key names are printed, never a value (values hold the credentials), and the
-# names are reduced to printable characters and cut short, since the file is not ours. split() with a string is
-# used, not a regular expression: OpenWrt's jq may be built without them.
-json_refuse_keys() {
-    _jk=$(jq -r --arg ok "$3" \
-          "$2"' | if type == "object" then keys_unsorted - ($ok | split(" ")) | .[] else empty end' "$1" 2>/dev/null) || { echo "cannot read $4" >&2; return 1; }
-    [ -z "$_jk" ] && return 0
-    _jk=$(printf '%s\n' "$_jk" | tr -c 'A-Za-z0-9_.\n-' '?' | cut -c1-40 | head -n 8 | tr '\n' ' ')
-    echo "$4 has what the VPN does not run: ${_jk% } (remove it and import the config again)" >&2
-    return 1
-}
-# json_listens_loopback_only FILE: every listen address, listen port and controller anywhere in a generated engine
-# config is our loopback one. Each driver's rewrite already leaves nothing else; this is the check behind it, run on
-# the file the engine gets, so that a later change to a rewrite that let a listener through fails closed instead of
-# opening a port on the LAN or the uplink.
+# json_listens_loopback_only FILE: the check behind every rebuild, on the file the engine gets. No listen_port and
+# no external_controller at all, and every listen address 127.0.0.1, wherever they sit and however their keys are
+# spelled (folded as the engines fold them). The rebuilds already leave nothing else; a later change to one that let
+# a listener through fails closed here instead of opening a port on the LAN or the uplink.
 json_listens_loopback_only() {
-    jq -e '[.. | objects | (.listen, .listen_port, .external_controller) | select(. != null)]
-           | all(. == "127.0.0.1")' "$1" >/dev/null 2>&1
+    jq -e "$JQ_LIB"'[.. | objects | to_entries[] | select(.key | mu_fold | mu_in(["listen", "listen_port", "external_controller"]))]
+           | all((.key | mu_fold) == "listen" and .value == "127.0.0.1")' "$1" >/dev/null 2>&1
 }
 # link_opt_set KEY VALUE: an option of a link profile (profile set), checked, into its meta; empty removes it.
 # Both go into generated configs, the proxy's port as a JSON number.
