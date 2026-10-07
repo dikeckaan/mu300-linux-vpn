@@ -1758,36 +1758,60 @@ class WireGuard(ShellTest):
 
 
 OVPN_CA = """<ca>
-up not-a-directive
 -----BEGIN CERTIFICATE-----
 CAKEYCAKEYCAKEY
 -----END CERTIFICATE-----
 </ca>"""
+OVPN_KEY = """<key>
+-----BEGIN PRIVATE KEY-----
+PRIVKEYPRIVKEY
+-----END PRIVATE KEY-----
+</key>"""
+OVPN_TLS = """<tls-crypt>
+#
+# 2048 bit OpenVPN static key
+#
+-----BEGIN OpenVPN Static key V1-----
+0123456789abcdefTLSKEY0123456789
+-----END OpenVPN Static key V1-----
+</tls-crypt>"""
+# What a panel or easy-rsa export looks like: the DNS helper scripts, routes and DNS of its own, all left out.
 OVPN_CONF = f"""client
 dev tun0
 proto udp
 remote vpn.example 1194 udp
 remote 198.51.100.2 443 tcp
 up /etc/openvpn/update-resolv-conf
-script-security 3
-plugin /x.so
+down /etc/openvpn/update-resolv-conf
+script-security 2
 redirect-gateway def1
 route 10.0.0.0 255.0.0.0
+dhcp-option DNS 192.0.2.53
 auth-user-pass
 nobind
+cipher AES-256-GCM
+remote-cert-tls server
+verb 3
 {OVPN_CA}
-<key>
-route-up evil
------BEGIN PRIVATE KEY-----
-PRIVKEYPRIVKEY
------END PRIVATE KEY-----
-</key>
+{OVPN_KEY}
+{OVPN_TLS}
 """
+# the directive names our generated config may contain
+OVPN_WRITTEN = {'client', 'tls-client', 'pull', 'remote', 'remote-random', 'proto', 'port', 'resolv-retry', 'nobind',
+                'float', 'persist-key', 'persist-tun', 'cipher', 'data-ciphers', 'data-ciphers-fallback', 'auth',
+                'tls-version-min', 'tls-version-max', 'tls-cipher', 'tls-ciphersuites', 'tls-groups',
+                'remote-cert-tls', 'remote-cert-eku', 'remote-cert-ku', 'verify-x509-name', 'key-direction',
+                'compress', 'tun-mtu', 'mssfix', 'fragment', 'ping', 'ping-restart', 'keepalive',
+                'explicit-exit-notify', 'server-poll-timeout', 'connect-retry', 'connect-retry-max', 'connect-timeout',
+                'hand-window', 'auth-nocache', 'auth-retry', 'reneg-sec', 'sndbuf', 'rcvbuf', 'txqueuelen',
+                'mute-replay-warnings'}
+OVPN_BLOCKS = {'ca', 'cert', 'key', 'tls-auth', 'tls-crypt', 'tls-crypt-v2', 'dh', 'extra-certs', 'pkcs12'}
 
 
 class OpenVpn(ShellTest):
-    """The openvpn driver: the .ovpn is copied without anything that runs a script or sets routes, its names are
-    looked up by the core, openvpn is started with our own options and up script, and no secret is printed."""
+    """The openvpn driver: the .ovpn is parsed into an allowlist and openvpn reads only the config we write, its
+    names are looked up by the core, openvpn is started with our own options and up script, and no secret is
+    printed."""
 
     def setUp(self):
         super().setUp()
@@ -1822,8 +1846,8 @@ class OpenVpn(ShellTest):
         base.update(extra)
         return super().env(**base)
 
-    def lib(self, shell, code):
-        return self.sh(shell, f'. "{BIN}/mu300-vpn"; {code}', MU300_LIB=1)
+    def lib(self, shell, code, stdin=None):
+        return self.sh(shell, f'. "{BIN}/mu300-vpn"; {code}', stdin=stdin, MU300_LIB=1)
 
     def cli(self, shell, *args, stdin=None):
         return self.script(shell, BIN / 'mu300-vpn', *args, stdin=stdin)
@@ -1836,12 +1860,54 @@ class OpenVpn(ShellTest):
 
     def setup_profile(self, shell, text=OVPN_CONF):
         self.fresh()
-        self.src.write_text(text)
+        if isinstance(text, bytes):
+            self.src.write_bytes(text)
+        else:
+            self.src.write_text(text)
         r = self.cli(shell, 'profile', 'import', self.src, 'Vpn')
         self.assertEqual((r.returncode, r.stdout.strip()), (0, 'vpn'), r.stderr)
 
-    def run_lib(self, shell, code, pre=''):
-        return self.lib(shell, f'{pre}profile_load vpn; load_driver "$PTYPE"; {code}')
+    def run_lib(self, shell, code, pre='', stdin=None):
+        return self.lib(shell, f'{pre}profile_load vpn; load_driver "$PTYPE"; {code}', stdin=stdin)
+
+    def refused(self, shell, text, msg=None, name=None):
+        """imports TEXT, which must be refused (with MSG in the message), leaving no profile and no secret said"""
+        self.fresh()
+        if isinstance(text, bytes):
+            self.src.write_bytes(text)
+        else:
+            self.src.write_text(text)
+        r = self.cli(shell, 'profile', 'add', 'openvpn', 'X', self.src)
+        self.assertNotEqual(r.returncode, 0, name or text)
+        if msg:
+            self.assertIn(msg, r.stderr, name or text)
+        for secret in ('PRIVKEY', 'CAKEY', 'TLSKEY', 'hunter2', 'evil'):
+            self.assertNotIn(secret, r.stdout + r.stderr, name or text)
+        profiles = self.store / 'profiles'
+        self.assertEqual(list(profiles.iterdir()) if profiles.exists() else [], [], name or text)
+        return r
+
+    def written(self):
+        """the generated config, parsed: (directive lines as word lists, {block: body lines})"""
+        dirs, blocks, op = [], {}, None
+        for line in (self.run_dir / 'openvpn.conf').read_text().split('\n')[:-1]:
+            if op:
+                if line == f'</{op}>':
+                    op = None
+                else:
+                    blocks[op].append(line)
+                continue
+            if line.startswith('<'):
+                op = line[1:-1]
+                self.assertEqual(line, f'<{op}>')
+                self.assertIn(op, OVPN_BLOCKS)
+                blocks[op] = []
+                continue
+            words = line.split()
+            self.assertIn(words[0], OVPN_WRITTEN, line)
+            dirs.append(words)
+        self.assertIsNone(op)
+        return dirs, blocks
 
     def test_import_sniffs_and_stores_0600(self):
         for shell in self.each_shell():
@@ -1858,69 +1924,203 @@ class OpenVpn(ShellTest):
             self.assertIn('profile vpn: OK', r.stdout)
             # the notes name directives, never values; the missing credentials are pointed out
             self.assertIn('not used', r.stderr)
+            for name in ('up', 'down', 'script-security', 'redirect-gateway', 'route', 'dhcp-option'):
+                self.assertIn(f' {name}', r.stderr)
             self.assertIn('OVPN_USER', r.stderr)
-            for secret in ('PRIVKEY', 'CAKEY', 'update-resolv-conf', '/x.so'):
+            for secret in ('PRIVKEY', 'CAKEY', 'TLSKEY', 'update-resolv-conf', '192.0.2.53', 'def1'):
                 self.assertNotIn(secret, r.stdout + r.stderr)
             self.fresh()
             r = self.cli(shell, 'profile', 'import', '-', 'Low', stdin=OVPN_CONF)
             self.assertEqual((r.returncode, r.stdout.strip()), (0, 'low'), r.stderr)
 
-    def test_gen_removes_what_runs_things(self):
+    def test_gen_writes_only_what_is_allowed(self):
         for shell in self.each_shell():
             self.setup_profile(shell)
             r = self.run_lib(shell, 'drv_gen')
             self.assertEqual(r.returncode, 0, r.stderr)
             gen = (self.run_dir / 'openvpn.conf').read_text()
             self.assertEqual(stat.S_IMODE((self.run_dir / 'openvpn.conf').stat().st_mode), 0o600)
-            lines = gen.splitlines()
-            for gone in ('dev tun0', 'up /etc', 'script-security', 'plugin', 'redirect-gateway', 'route 10',
-                         'auth-user-pass', 'vpn.example'):
+            for gone in ('dev', 'up ', 'down', 'script-security', 'redirect-gateway', 'route', 'dhcp-option',
+                         'auth-user-pass', 'verb', 'vpn.example', 'update-resolv-conf'):
                 self.assertNotIn(gone, gen)
-            for kept in ('client', 'proto udp', 'nobind', 'remote 203.0.113.8 1194 udp', 'remote 198.51.100.2 443 tcp'):
-                self.assertIn(kept, lines)
-            # the blocks are data: every line is there, including the ones that look like directives
-            self.assertIn(OVPN_CA, gen)
-            self.assertIn('route-up evil', lines)
+            dirs, blocks = self.written()
+            self.assertEqual(dirs, [['client'], ['proto', 'udp'], ['remote', '203.0.113.8', '1194', 'udp'],
+                                    ['remote', '198.51.100.2', '443', 'tcp'], ['nobind'], ['cipher', 'AES-256-GCM'],
+                                    ['remote-cert-tls', 'server']])
+            # the blocks are the file's, byte for byte
+            for block in (OVPN_CA, OVPN_KEY, OVPN_TLS):
+                self.assertIn(block + '\n', gen)
+            self.assertEqual(set(blocks), {'ca', 'key', 'tls-crypt'})
             self.assertEqual((self.run_dir / 'server-ip').read_text().split(), ['203.0.113.8', '198.51.100.2'])
             self.assertEqual(self.ev.read_text().split('\n')[:-1], ['getent vpn.example'])
 
     def test_directives_are_read_the_way_openvpn_reads_them(self):
-        text = '''client
-remote a.example 443 tcp-client
-"up" /evil
---down /evil
-  script-security 3
-UP kept-case-sensitive
-management 127.0.0.1 7505
-show-ciphers
-config /etc/other.ovpn
-mark 5
-<connection>
-remote b.example 1195 udp
-route-up /evil
---redirect-gateway
-</connection>
-<connection>
-remote 198.51.100.9
-</connection>
-# up /not-a-directive
-<tls-crypt>
-route 1.2.3.4
-</tls-crypt>
+        # quotes group a word, a leading "--" is allowed, "#" and ";" start a comment only at the start of a word,
+        # and every argument is written again by us
+        text = f'''  client\t
+--nobind
+"persist-key"
+remote 'a.example' 443 tcp-client # the first server
+remote 2001:db8::7 1194 udp6 ; the second
+; comment
+  # comment
+verify-x509-name 'C=US, CN=srv #1; x' subject
+cipher AES-256-GCM#not-a-comment-in-openvpn
+keepalive 10 60
+{OVPN_CA}
 '''
         self.stub('getent', 'echo "getent $2" >> "$STUBLOG/events"\n'
-                            'case $2 in a.example) echo "203.0.113.1     STREAM $2" ;; b.example) echo "203.0.113.2     STREAM $2" ;; esac')
+                            'case $2 in a.example) echo "203.0.113.1     STREAM $2" ;; esac')
+        for shell in self.each_shell():
+            self.fresh()
+            self.src.write_text(text)
+            r = self.cli(shell, 'profile', 'import', self.src, 'Vpn')
+            # "AES-256-GCM#not-a-comment..." is one word in openvpn, and not a cipher name
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn('line 9: cipher takes one algorithm name', r.stderr)
+            self.setup_profile(shell, text.replace('#not-a-comment-in-openvpn', ' #a comment'))
+            r = self.run_lib(shell, 'drv_gen')
+            self.assertEqual(r.returncode, 0, r.stderr)
+            lines = (self.run_dir / 'openvpn.conf').read_text().splitlines()
+            self.assertEqual(lines[:7], ['client', 'nobind', 'persist-key', 'remote 203.0.113.1 443 tcp-client',
+                                         'remote 2001:db8::7 1194 udp6', 'verify-x509-name "C=US, CN=srv #1; x" subject',
+                                         'cipher AES-256-GCM'])
+            self.assertEqual(lines[7:], ['keepalive 10 60'] + OVPN_CA.split('\n'))
+            self.assertEqual((self.run_dir / 'server-ip').read_text().split(), ['203.0.113.1', '2001:db8::7'])
+
+    def test_crlf_file_and_blocks_byte_identical(self):
+        text = OVPN_CONF.replace('\n', '\r\n').encode()
         for shell in self.each_shell():
             self.setup_profile(shell, text)
             r = self.run_lib(shell, 'drv_gen')
             self.assertEqual(r.returncode, 0, r.stderr)
-            lines = (self.run_dir / 'openvpn.conf').read_text().splitlines()
-            self.assertEqual(lines, ['client', 'remote 203.0.113.1 443 tcp-client', 'UP kept-case-sensitive',
-                                     '<connection>', 'remote 203.0.113.2 1195 udp', '</connection>',
-                                     '<connection>', 'remote 198.51.100.9', '</connection>',
-                                     '# up /not-a-directive', '<tls-crypt>', 'route 1.2.3.4', '</tls-crypt>'])
-            self.assertEqual((self.run_dir / 'server-ip').read_text().split(),
-                             ['203.0.113.1', '203.0.113.2', '198.51.100.9'])
+            gen = (self.run_dir / 'openvpn.conf').read_bytes()
+            self.assertNotIn(b'\r', gen)
+            for block in (OVPN_CA, OVPN_KEY, OVPN_TLS):
+                self.assertIn((block + '\n').encode(), gen)
+
+    def test_certificate_text_outside_the_pem_is_left_out(self):
+        ca = OVPN_CA.replace('<ca>\n', '<ca>\nCertificate:\n    Data:\n        Version: 3 (0x2)\n')
+        for shell in self.each_shell():
+            self.setup_profile(shell, OVPN_CONF.replace(OVPN_CA, ca))
+            r = self.run_lib(shell, 'drv_gen')
+            self.assertEqual(r.returncode, 0, r.stderr)
+            gen = (self.run_dir / 'openvpn.conf').read_text()
+            self.assertIn(OVPN_CA, gen)
+            self.assertNotIn('Certificate:', gen)
+            r = self.cli(shell, 'check', 'vpn')
+            self.assertIn('text around the PEM blocks', r.stderr)
+
+    def test_scripts_are_refused_but_dns_helpers(self):
+        base = OVPN_CONF.replace('up /etc/openvpn/update-resolv-conf\ndown /etc/openvpn/update-resolv-conf\n', '')
+        helpers = ('/etc/openvpn/update-resolv-conf', '/etc/openvpn/update-systemd-resolved',
+                   '/etc/openvpn/scripts/update-systemd-resolved')
+        refused = {
+            'up /bin/sh': (base.replace('client\n', 'client\nup /bin/sh\n'), 'line 2: up runs a script'),
+            'down evil': (base.replace('client\n', 'client\ndown /tmp/evil\n'), 'line 2: down runs a script'),
+            'helper with args': (base.replace('client\n', 'client\nup "/etc/openvpn/update-resolv-conf evil"\n'),
+                                 'up runs a script'),
+            'helper and a script': (OVPN_CONF.replace('client\n', 'client\nroute-up /tmp/evil\n'),
+                                    'route-up is not a directive this driver takes'),
+            'script-security 2 alone': (base, 'script-security without one of the known DNS helper scripts'),
+            'script-security 3': (OVPN_CONF.replace('script-security 2', 'script-security 3'),
+                                  'script-security is set by this driver'),
+            'plugin': (OVPN_CONF.replace('client\n', 'client\nplugin /tmp/evil.so\n'), 'plugin is not a directive'),
+            'quoted up': (base.replace('client\n', 'client\n"up" /tmp/evil\n'), 'up runs a script'),
+            'dashed up': (base.replace('client\n', 'client\n--up /tmp/evil\n'), 'up runs a script'),
+        }
+        for shell in self.each_shell():
+            for name, (text, msg) in refused.items():
+                self.refused(shell, text, msg, name)
+            # each known helper, in up or down, with script-security 1 or 2, is taken and left out
+            for helper in helpers:
+                for level in ('1', '2'):
+                    text = base.replace('client\n', f'client\ndown {helper}\n').replace('script-security 2',
+                                                                                          f'script-security {level}')
+                    self.setup_profile(shell, text)
+                    r = self.run_lib(shell, 'drv_gen')
+                    self.assertEqual(r.returncode, 0, (helper, level, r.stderr))
+                    gen = (self.run_dir / 'openvpn.conf').read_text()
+                    self.assertNotIn(helper, gen)
+                    self.assertNotIn('script-security', gen)
+            # and a file without script-security at all
+            self.setup_profile(shell, base.replace('script-security 2\n', ''))
+
+    def test_lexing_is_strict(self):
+        cases = {
+            'semicolon in remote': (OVPN_CONF.replace('vpn.example', 'vpn.example;reboot'), 'remote that is not a plain'),
+            'command in remote': (OVPN_CONF.replace('vpn.example', 'vpn$(touch evil)'), 'remote that is not a plain'),
+            'backtick in remote': (OVPN_CONF.replace('vpn.example', 'vpn`evil`'), 'remote that is not a plain'),
+            'space in quotes': (OVPN_CONF.replace('vpn.example', '"vpn.example evil"'), 'remote that is not a plain'),
+            'dash host': (OVPN_CONF.replace('vpn.example', '-evil.example'), 'remote that is not a plain'),
+            'bad port': (OVPN_CONF.replace('1194', '99999'), 'port'),
+            'bad proto': (OVPN_CONF.replace('443 tcp', '443 sctp'), 'protocol'),
+            'unclosed quote': (OVPN_CONF.replace('nobind', 'cipher "AES-256-GCM'), 'quote that is not closed'),
+            'glued quote': (OVPN_CONF.replace('nobind', 'cipher "AES"-256'), 'quoted word followed by more text'),
+            'quote in word': (OVPN_CONF.replace('nobind', 'cipher AES"x"'), 'quote inside a word'),
+            'backslash': (OVPN_CONF.replace('nobind', 'cipher AES\\x'), 'backslash'),
+            'vertical tab': (OVPN_CONF.replace('nobind', 'nobind\v').encode(), 'control character'),
+            'form feed': (OVPN_CONF.replace('nobind', 'nobind\fup /tmp/evil').encode(), 'control character'),
+            'nul': (OVPN_CONF.replace('nobind', 'nobind\0').encode(), 'control character'),
+            'lone cr': (OVPN_CONF.replace('nobind\n', 'nobind\rup evil\n').encode(), 'carriage return'),
+            'long line': (OVPN_CONF.replace('nobind', 'nobind ' + '#' * 1100), 'longer than 1024'),
+            'too big': (OVPN_CONF + ('#' * 1000 + '\n') * 300, 'larger than 256 KiB'),
+        }
+        for shell in self.each_shell():
+            for name, (text, msg) in cases.items():
+                self.refused(shell, text, msg, name)
+
+    def test_blocks_are_strict(self):
+        cases = {
+            'close with junk': (OVPN_CONF.replace('CAKEYCAKEYCAKEY\n', 'CAKEYCAKEYCAKEY\n</ca>junk\nup evil\n'),
+                                'closing tag inside <ca> that is not exactly </ca>'),
+            'other close tag': (OVPN_CONF.replace('PRIVKEYPRIVKEY\n', 'PRIVKEYPRIVKEY\n</ca>\n'),
+                                'closing tag inside <key>'),
+            'tag with comment': (OVPN_CONF.replace('<ca>', '<ca> # x'), 'not exactly one of the inline blocks'),
+            'up tag': (OVPN_CONF + '<up>\n#!/bin/sh\nevil\n</up>\n', 'inline block <up> that this driver does not take'),
+            'unknown tag': (OVPN_CONF + '<frobnicate>\nevil\n</frobnicate>\n', 'inline block this driver does not know'),
+            'connection': (OVPN_CONF + '<connection>\nremote 198.51.100.9\n</connection>\n', '<connection> blocks'),
+            'auth tag': (OVPN_CONF + '<auth-user-pass>\nalice\nhunter2\n</auth-user-pass>\n', '<auth-user-pass>'),
+            'open block': (OVPN_CONF + '<tls-auth>\n-----BEGIN OpenVPN Static key V1-----\n', 'never closed'),
+            'not pem': (OVPN_CONF.replace('CAKEYCAKEYCAKEY', 'CAKEY CAKEY'), 'not PEM'),
+            'no armour': (OVPN_CONF.replace(OVPN_KEY, '<key>\n</key>'), 'no PEM block in <key>'),
+            'unended armour': (OVPN_CONF.replace('-----END PRIVATE KEY-----\n', ''), 'not ended'),
+            'encrypted key': (OVPN_CONF.replace('PRIVKEYPRIVKEY', 'Proc-Type: 4,ENCRYPTED\nPRIVKEYPRIVKEY'),
+                              'encrypted private key'),
+            'twice': (OVPN_CONF + OVPN_CA + '\n', 'second <ca>'),
+        }
+        for shell in self.each_shell():
+            for name, (text, msg) in cases.items():
+                self.refused(shell, text, msg, name)
+
+    def test_directives_outside_the_allowlist_are_refused(self):
+        # (each with the value a message must not repeat, where it has one of its own)
+        cases = {
+            'setenv': ('setenv FOO evil1', 'evil1'), 'dns-updown': ('dns-updown /tmp/evil2', 'evil2'),
+            'server': ('server 10.8.0.0 255.255.255.0', '255.255'), 'mode': ('mode server', None),
+            'config': ('config /tmp/evil3.ovpn', 'evil3'), 'management': ('management 0.0.0.0 7505', '7505'),
+            'log': ('log /tmp/evil4', 'evil4'), 'ca': ('ca /etc/ssl/ca.pem', 'ca.pem'),
+            'pull-filter': ('pull-filter accept route', 'accept'), 'comp-lzo': ('comp-lzo', None),
+            'mark': ('mark 720', '720'), 'tls-server': ('tls-server', None),
+            'ifconfig': ('ifconfig 10.9.9.1 10.9.9.2', '10.9.9'), 'ignore-unknown-option': ('ignore-unknown-option up', None),
+            'auth-user-pass': ('auth-user-pass /tmp/creds5', 'creds5'), 'remote-cert-tls': ('remote-cert-tls client', None),
+            'auth-retry': ('auth-retry interact', None), 'dev-node': ('dev-node /dev/net/tun', '/dev/net'),
+            'connect-retry': ('connect-retry hunter2', None),
+        }
+        for shell in self.each_shell():
+            for name, (line, value) in cases.items():
+                r = self.refused(shell, OVPN_CONF.replace('nobind\n', f'nobind\n{line}\n'), 'line 14: ', name)
+                if value:
+                    self.assertNotIn(value, r.stderr, name)
+            # an unknown first word is not repeated: it could be a password on a line of its own
+            r = self.refused(shell, OVPN_CONF.replace('nobind\n', 'nobind\nhunter2\n'), 'line 14: has a directive this driver does not know')
+            # a tap profile, no remote, and a file that is not a client
+            self.refused(shell, OVPN_CONF.replace('dev tun0', 'dev tap0'), 'tap')
+            self.refused(shell, OVPN_CONF.replace('dev tun0', 'dev-type tap'), 'tap')
+            self.refused(shell, OVPN_CONF.replace('remote vpn.example 1194 udp\n', '').replace('remote 198.51.100.2 443 tcp\n', ''),
+                         'no remote server')
+            self.refused(shell, OVPN_CONF.replace('client\n', ''), 'not a client profile')
+            self.refused(shell, OVPN_CONF.replace(OVPN_CA, ''), 'no inline <ca>')
 
     def test_start_alive_stop(self):
         for shell in self.each_shell():
@@ -1933,13 +2133,20 @@ route 1.2.3.4
                 self.assertIn(want, r.stdout)
             args = (self.tmp / 'ovpn.args').read_text().splitlines()
             run = self.run_dir
+            # the config first, then every option of ours after it, so that ours win
             self.assertEqual(args, ['--config', f'{run}/openvpn.conf', '--dev', 'tun-mu300', '--dev-type', 'tun',
-                                    '--route-noexec', '--pull-filter', 'ignore', 'redirect-gateway', '--mark', '720',
-                                    '--script-security', '2', '--up', f'{LIB}/openvpn-up',
+                                    '--route-noexec',
+                                    '--pull-filter', 'ignore', 'redirect-gateway', '--pull-filter', 'ignore', 'route ',
+                                    '--pull-filter', 'ignore', 'route-ipv6', '--pull-filter', 'ignore', 'setenv',
+                                    '--pull-filter', 'ignore', 'dhcp-option DOMAIN',
+                                    '--pull-filter', 'ignore', 'block-outside-dns',
+                                    '--mark', '720', '--script-security', '2', '--up', f'{LIB}/openvpn-up',
                                     '--setenv', 'MU300_VPN_RUN', str(run), '--auth-nocache', '--verb', '3'])
+            # pushed DNS still reaches the up script: --route-nopull would drop it
+            self.assertNotIn('--route-nopull', args)
             # the first pushed resolver; the up script marked the session
             self.assertEqual((run / 'dns').read_text().strip(), '10.8.0.1')
-            self.assertEqual((run / 'ovpn-up').read_text().strip() if (run / 'ovpn-up').exists() else 'removed', 'removed')
+            self.assertFalse((run / 'ovpn-up').exists())
             # the runtime copy of the config is gone with the tunnel
             self.assertFalse((run / 'openvpn.conf').exists())
 
@@ -1957,12 +2164,17 @@ route 1.2.3.4
                 r = self.cli(shell, *args)
                 self.assertNotIn('s3cr', r.stdout + r.stderr)
                 self.assertNotIn('OVPN_USER', r.stderr)      # credentials exist: no reminder
-            # started with them
+            # started with a copy in the runtime directory (0600), which goes with the tunnel
             self.assertEqual(self.run_lib(shell, 'drv_gen').returncode, 0)
-            r = self.run_lib(shell, 'drv_start; drv_stop')
+            auth = self.run_dir / 'ovpn.auth'
+            r = self.run_lib(shell, f'drv_start; ls -l "{auth}"; cat "{auth}" | wc -l; drv_stop; '
+                                    f'[ -e "{auth}" ] || echo AUTH-GONE')
             args = (self.tmp / 'ovpn.args').read_text().splitlines()
             i = args.index('--auth-user-pass')
-            self.assertEqual(args[i + 1], str(pdir / 'auth.txt'))
+            self.assertEqual(args[i + 1], str(auth))
+            self.assertGreater(i, args.index('--config'))
+            self.assertIn('-rw------- ', r.stdout)
+            self.assertIn('AUTH-GONE', r.stdout)
             self.assertNotIn('s3cr', r.stdout + r.stderr)
             # one at a time, and an empty value clears
             self.assertEqual(self.cli(shell, 'profile', 'set', 'vpn', 'OVPN_USER', 'bob').returncode, 0)
@@ -1976,6 +2188,12 @@ route 1.2.3.4
             self.assertEqual(r.returncode, 2)
             self.assertFalse((pdir / 'auth.txt').exists())
             self.assertEqual(self.cli(shell, 'profile', 'set', 'vpn', 'MIHOMO_STACK', 'x').returncode, 2)
+            # the driver itself checks the key before it reads stdin
+            r = self.run_lib(shell, 'rc=0; drv_set BOGUS - || rc=$?; echo "rc=$rc"; IFS= read -r x; echo "left=$x"',
+                             stdin='hunter2\n')
+            self.assertIn('rc=2', r.stdout)
+            self.assertIn('left=hunter2', r.stdout)
+            self.assertFalse((pdir / 'auth.txt').exists())
 
     def test_up_script_takes_only_addresses(self):
         for shell in self.each_shell():
@@ -1984,7 +2202,13 @@ route 1.2.3.4
             for opt, want in (('dhcp-option DNS 1.2.3.4;rm -rf x', None), ('dhcp-option DNS $(touch pwned)', None),
                               ('dhcp-option DNS 1.2.3.4 extra', None), ('dhcp-option DNS 999.1.1.1', None),
                               ('dhcp-option DNS example.org', None), ('dhcp-option DOMAIN x', None),
-                              ('dhcp-option DNS 10.8.0.1', '10.8.0.1'), ('dhcp-option DNS 2001:db8::53', '2001:db8::53')):
+                              ('dhcp-option DNS 010.0.0.1', None), ('dhcp-option DNS 1.2.3', None),
+                              ('dhcp-option DNS :::', None), ('dhcp-option DNS 1::2::3', None),
+                              ('dhcp-option DNS 12345::1', None), ('dhcp-option DNS 1:2:3:4:5:6:7:8:9', None),
+                              ('dhcp-option DNS abc:', None), ('dhcp-option DNS ::1.2.3', None),
+                              ('dhcp-option DNS 10.8.0.1', '10.8.0.1'), ('dhcp-option DNS 2001:db8::53', '2001:db8::53'),
+                              ('dhcp-option DNS ::ffff:192.0.2.1', '::ffff:192.0.2.1'),
+                              ('dhcp-option DNS 1:2:3:4:5:6:7:8', '1:2:3:4:5:6:7:8')):
                 shutil.rmtree(self.run_dir); self.run_dir.mkdir()
                 r = self.script(shell, up, 'tun-mu300', foreign_option_1=opt, MU300_VPN_RUN=self.run_dir,
                                 SECRET_ENV='hunter2')
@@ -2005,12 +2229,17 @@ route 1.2.3.4
     def test_a_start_that_fails_returns_1(self):
         for shell in self.each_shell():
             self.setup_profile(shell)
+            (self.store / 'profiles/vpn/auth.txt').write_text('alice\nhunter2\n')
             self.assertEqual(self.run_lib(shell, 'drv_gen').returncode, 0)
             self.openvpn_stub('echo "Options error: bad thing" >&2; exit 1')
             r = self.run_lib(shell, 'drv_start && echo STARTED')
             self.assertNotIn('STARTED', r.stdout)
             self.assertIn('openvpn exited during start', r.stderr)
+            # the keys and the password do not stay behind
+            self.assertFalse((self.run_dir / 'openvpn.conf').exists())
+            self.assertFalse((self.run_dir / 'ovpn.auth').exists())
             # and one that does come up is started
+            self.assertEqual(self.run_lib(shell, 'drv_gen').returncode, 0)
             self.openvpn_stub()
             r = self.run_lib(shell, 'drv_start && echo STARTED; drv_stop')
             self.assertIn('STARTED', r.stdout)
@@ -2026,27 +2255,6 @@ route 1.2.3.4
             r = self.run_lib(shell, 'drv_start; p=$OVPN_PID; drv_stop; kill -0 $p 2>/dev/null && echo SURVIVED; echo done')
             self.assertIn('done', r.stdout)
             self.assertNotIn('SURVIVED', r.stdout)
-
-    def test_refused_imports(self):
-        cases = {
-            'no remote': (OVPN_CONF.replace('remote vpn.example 1194 udp\n', '').replace('remote 198.51.100.2 443 tcp\n', ''),
-                          'no remote server'),
-            'tap': (OVPN_CONF.replace('dev tun0', 'dev tap0'), 'tap'),
-            'open block': (OVPN_CONF + '<tls-auth>\nAAAA\n', 'never closed'),
-            'bad host': (OVPN_CONF.replace('vpn.example', 'vpn.example;reboot'), 'remote that is not a plain'),
-            'bad port': (OVPN_CONF.replace('1194', '99999'), 'port'),
-            'bad proto': (OVPN_CONF.replace('443 tcp', '443 sctp'), 'protocol'),
-        }
-        for shell in self.each_shell():
-            for name, (text, msg) in cases.items():
-                self.fresh()
-                self.src.write_text(text)
-                r = self.cli(shell, 'profile', 'add', 'openvpn', 'X', self.src)
-                self.assertNotEqual(r.returncode, 0, name)
-                self.assertIn(msg, r.stderr, name)
-                self.assertNotIn('PRIVKEY', r.stdout + r.stderr)
-                profiles = self.store / 'profiles'
-                self.assertEqual(list(profiles.iterdir()) if profiles.exists() else [], [], name)
 
     def test_engine_and_package(self):
         for shell in self.each_shell():

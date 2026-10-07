@@ -150,15 +150,43 @@ The kill switch lets only marked traffic out on an uplink, and rule 9000 keeps i
   default 1420, DNS (first) to `$RUN/dns`. A peer without `0.0.0.0/0` in AllowedIPs gets a warning (traffic outside
   it is dropped by WireGuard - closed, not leaked). A kernel without WireGuard (the 5.4 vendor kernel) fails the check
   with that message.
-* **openvpn**: `--mark 720`. The `.ovpn` is copied with every script or local-system directive removed (`up`, `down`,
-  `route-up`, `route-pre-down`, `ipchange`, `tls-verify`, `auth-user-pass-verify`, `learn-address`,
-  `client-connect`, `client-disconnect`, `script-security`, `plugin`, `dev`, `dev-type`, `dev-node`, `daemon`, `log`,
-  `log-append`, `status`, `management*`, `cd`, `chroot`, `user`, `group`, `writepid`, `iproute`, `redirect-gateway`,
-  `route`, `route-ipv6`, `auth-user-pass`), inline `<blocks>` untouched; `remote` names are resolved to addresses.
+* **openvpn**: `--mark 720`. openvpn never reads the user's `.ovpn`: it is parsed with openvpn's own lexical rules
+  and held to an allowlist, and openvpn reads only `$RUN/openvpn.conf` (0600), which we write from what was accepted.
+  * Lexing (no differential with openvpn): refused are NUL and every control character but TAB (CR only as a CRLF
+    line end), a backslash outside the key blocks, lines over 1024 bytes, files over 256 KiB, an unclosed quote, a
+    quote inside a word, an empty quoted word and a quoted word followed by text without a space. Words split on
+    space/TAB, quotes group (no escapes), `#`/`;` start a comment at the start of a word, a leading `--` is allowed.
+  * Blocks: only a line that is exactly `<ca>`, `<cert>`, `<key>`, `<tls-auth>`, `<tls-crypt>`, `<tls-crypt-v2>`,
+    `<dh>`, `<extra-certs>` or `<pkcs12>` opens one, once each; it ends at a line that is exactly the closing tag.
+    Any other line starting with `</` inside a block is refused (openvpn closes on a prefix), as is any other `<...>`
+    line (`<connection>`, `<auth-user-pass>`, `<up>`, `<ca> # x`). The body must be PEM (armour and base64), the `#`
+    lines of a static key in tls-auth/tls-crypt, or base64 for pkcs12; it is written byte for byte (minus CR). Text
+    outside the armour of a certificate block (easy-rsa's dump) is left out with a note.
+  * Directives: `client`, `tls-client`, `pull`, `remote HOST [PORT] [PROTO]`, `remote-random`, `proto`, `port`,
+    `resolv-retry`, `nobind`, `float`, `persist-key`, `persist-tun`, `cipher`, `data-ciphers`, `data-ciphers-fallback`,
+    `auth`, `tls-version-min/max`, `tls-cipher`, `tls-ciphersuites`, `tls-groups`, `remote-cert-tls server`,
+    `remote-cert-eku`, `remote-cert-ku`, `verify-x509-name`, `key-direction`, `compress` (no arg, lz4-v2, stub-v2,
+    lz4, stub), `tun-mtu`, `mssfix`, `fragment`, `ping`, `ping-restart`, `keepalive`, `explicit-exit-notify`,
+    `server-poll-timeout`, `connect-retry(-max)`, `connect-timeout`, `hand-window`, `auth-nocache`,
+    `auth-retry none|nointeract`, `reneg-sec`, `sndbuf`, `rcvbuf`, `txqueuelen`, `mute-replay-warnings`, each with
+    its arguments checked and written again by us. Left out with a note: `route-nopull`, `redirect-gateway`, `route`,
+    `route-ipv6`, `dhcp-option`, `block-outside-dns`, `register-dns`; silently: `verb`, `mute`, `dev tun*`,
+    `dev-type tun`, `auth-user-pass` without an argument (ours is on the command line). `up`/`down` are refused
+    except for the well-known DNS helpers (`/etc/openvpn/update-resolv-conf`, `/etc/openvpn/update-systemd-resolved`,
+    `/etc/openvpn/scripts/update-systemd-resolved`), which are left out with a note, and `script-security 1|2` only
+    along with one of them. Everything else is refused, naming the line and the directive (only names of our own
+    vocabulary; an unknown first word is never repeated) and never an argument. Also refused: a tap profile, no
+    remote, neither `client` nor `tls-client`, no `<ca>`/`<pkcs12>`.
+  * `remote` names are resolved to addresses; the written config is read back by the same parser for `server-ip`.
   Run as `openvpn --config $RUN/openvpn.conf --dev tun-mu300 --dev-type tun --route-noexec --pull-filter ignore
-  redirect-gateway --mark 720 --script-security 2 --up /opt/mu300/lib/vpn/openvpn-up --setenv MU300_VPN_RUN $RUN
-  [--auth-user-pass $PDIR/auth.txt] --auth-nocache`. `openvpn-up` is our own script and the only one: it writes the
-  pushed DNS (`dhcp-option DNS`) to `$RUN/dns` and `$RUN/ovpn-up`. The driver waits for that file.
+  redirect-gateway --pull-filter ignore "route " --pull-filter ignore route-ipv6 --pull-filter ignore setenv
+  --pull-filter ignore "dhcp-option DOMAIN" --pull-filter ignore block-outside-dns --mark 720 --script-security 2
+  --up /opt/mu300/lib/vpn/openvpn-up --setenv MU300_VPN_RUN $RUN --auth-nocache --verb 3 [--auth-user-pass
+  $RUN/ovpn.auth]`: our options after `--config`, so they win. Not `--route-nopull`, which would also drop the pushed
+  `dhcp-option DNS`. `ovpn.auth` is a 0600 copy of the profile's `auth.txt`, removed with the config when openvpn
+  stops or fails to start. `openvpn-up` is our own script and the only one: it writes the first pushed
+  `dhcp-option DNS` that is a proper IPv4 or IPv6 literal to `$RUN/dns`, and `$RUN/ovpn-up`. The driver waits for
+  that file.
 
 ### Names behind the kill switch: the resolve window
 
@@ -219,7 +247,10 @@ Per system, at every start of `mu300-vpn` (any command), idempotent, and only wh
 * IDs `[a-z0-9-]{1,32}` everywhere a path is built from one; profile directories 0700, files 0600, `$RUN` 0700.
 * No secret reaches stdout, stderr or the log except through `profile export` (and `settings get` of a non-secret
   set); error messages name the profile id, never the link. `profile show` shows the server host and port only.
-* OpenVPN: `--script-security 2` with only our `--up` script; every script directive of the file removed.
+* OpenVPN: the `.ovpn` is hostile input too and is never given to openvpn. It is parsed with openvpn's lexical
+  rules (anything the two could read differently is refused) into an allowlist of directives and key blocks, and
+  openvpn reads only the config we write, with our options after it: `--script-security 2` with only our `--up`
+  script; a file that wants any other script is refused (the known DNS helpers excepted, which are left out).
 * **Raw configs are hostile input.** A raw Xray or sing-box config, and later a mihomo YAML, comes from a user's
   import, from LuCI or from a subscription, and is run as root. Everything that listens or exposes control is ours;
   a config is held to an allowlist of what it may contain, never a denylist, because each engine release adds

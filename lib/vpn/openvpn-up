@@ -10,22 +10,53 @@ case $RUN in /*) [ -d "$RUN" ] || exit 1 ;; *) exit 1 ;; esac
 dev=${1:-}
 case $dev in ''|*[!A-Za-z0-9._-]*) exit 1 ;; esac
 
-# whether $1 is an IPv4 address (four numbers up to 255) or an IPv6 literal (hex digits and colons)
-is_addr() {
-    case $1 in
-        ''|*[!0-9A-Fa-f:.]*) return 1 ;;
-        *:*:*) return 0 ;;
-        *.*.*.*) ;;
-        *) return 1 ;;
-    esac
-    _old=$IFS; IFS=.; set -- $1; IFS=$_old
+# whether $1 is an IPv4 address: four numbers up to 255 without leading zeros (which some parsers read as octal)
+is_v4() {
+    case $1 in ''|*[!0-9.]*|.*|*.|*..*) return 1 ;; esac
+    _o4=$IFS; IFS=.; set -f; set -- $1; set +f; IFS=$_o4
     [ $# -eq 4 ] || return 1
     for _o in "$@"; do
-        case $_o in ''|*[!0-9]*) return 1 ;; esac
-        [ "${#_o}" -le 3 ] && [ "$_o" -le 255 ] || return 1
+        case $_o in ''|????*|0?*) return 1 ;; esac
+        [ "$_o" -le 255 ] || return 1
     done
     return 0
 }
+# The number of 16-bit groups in a colon list that has no "::", in _g; an IPv4 address as the last group counts two
+# when _v4ok is 1. False for an empty group, a group of more than four hex digits, or anything else.
+v6_groups() {
+    _g=0
+    [ -n "$1" ] || return 0
+    case $1 in :*|*:) return 1 ;; esac
+    _o6=$IFS; IFS=:; set -f; set -- $1; set +f; IFS=$_o6
+    _last=$#; _i=0
+    for _x in "$@"; do
+        _i=$((_i + 1))
+        case $_x in
+            *.*) [ "$_i" -eq "$_last" ] && [ "$_v4ok" = 1 ] && is_v4 "$_x" || return 1
+                 _g=$((_g + 2)) ;;
+            ''|*[!0-9A-Fa-f]*|?????*) return 1 ;;
+            *) _g=$((_g + 1)) ;;
+        esac
+    done
+    return 0
+}
+# whether $1 is an IPv6 literal: eight groups, or fewer around one "::", with an optional IPv4 tail
+is_v6() {
+    case $1 in ''|*[!0-9A-Fa-f:.]*|*:::*) return 1 ;; *:*) ;; *) return 1 ;; esac
+    case $1 in
+        *::*)
+            _l=${1%%::*}; _r=${1#*::}
+            case $_r in *::*) return 1 ;; esac
+            case $_l in *.*) return 1 ;; esac
+            _v4ok=0; v6_groups "$_l" || return 1; _gl=$_g
+            _v4ok=1; v6_groups "$_r" || return 1
+            [ $((_gl + _g)) -le 7 ] ;;
+        *)
+            _v4ok=1; v6_groups "$1" || return 1
+            [ "$_g" -eq 8 ] ;;
+    esac
+}
+is_addr() { is_v4 "$1" || is_v6 "$1"; }
 
 i=1
 while [ "$i" -le 256 ]; do
