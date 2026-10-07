@@ -1,0 +1,43 @@
+#!/bin/sh
+# openvpn's --up script for mu300-vpn, and the only script it runs. openvpn gives it the device as $1 and the
+# options the server pushed as foreign_option_1 ... N in the environment; the first "dhcp-option DNS ADDRESS" is the
+# tunnel's resolver (the core points the device's lookups at it) and goes to $RUN/dns. $RUN/ovpn-up is what the
+# driver waits for. The environment holds the session's secrets: nothing here prints it, and a pushed value is only
+# ever used after it was checked to be an address.
+umask 077
+RUN=${MU300_VPN_RUN:-}
+case $RUN in /*) [ -d "$RUN" ] || exit 1 ;; *) exit 1 ;; esac
+dev=${1:-}
+case $dev in ''|*[!A-Za-z0-9._-]*) exit 1 ;; esac
+
+# whether $1 is an IPv4 address (four numbers up to 255) or an IPv6 literal (hex digits and colons)
+is_addr() {
+    case $1 in
+        ''|*[!0-9A-Fa-f:.]*) return 1 ;;
+        *:*:*) return 0 ;;
+        *.*.*.*) ;;
+        *) return 1 ;;
+    esac
+    _old=$IFS; IFS=.; set -- $1; IFS=$_old
+    [ $# -eq 4 ] || return 1
+    for _o in "$@"; do
+        case $_o in ''|*[!0-9]*) return 1 ;; esac
+        [ "${#_o}" -le 3 ] && [ "$_o" -le 255 ] || return 1
+    done
+    return 0
+}
+
+i=1
+while [ "$i" -le 256 ]; do
+    eval "set_=\${foreign_option_$i+x}; opt=\${foreign_option_$i:-}"
+    [ -n "$set_" ] || break
+    # exactly three words: a pushed value with anything else in it (";", "$(...)") is not an address
+    set -f; set -- $opt; set +f
+    if [ $# -eq 3 ] && [ "$1" = dhcp-option ] && [ "$2" = DNS ] && is_addr "$3"; then
+        printf '%s\n' "$3" > "$RUN/dns.$$" && mv "$RUN/dns.$$" "$RUN/dns" || exit 1
+        break
+    fi
+    i=$((i + 1))
+done
+printf '%s\n' "$dev" > "$RUN/ovpn-up.$$" && mv "$RUN/ovpn-up.$$" "$RUN/ovpn-up" || exit 1
+exit 0
