@@ -283,10 +283,12 @@ Per system, at every start of `mu300-vpn` (any command), idempotent, and only wh
   `private_key_path` and `client_key_path` (sing-box) and `keyFile` and `certificateFile` (Xray's `certificates`),
   because they read a key from a path of the config's choosing and panels put keys inline; and Xray's unix-socket
   transport (`dsSettings`, and a `network` of `domainsocket` or `ds`). Also refused: a key spelled
-  differently from a field name the checks read (a lone `"Protocol"` is the protocol to Xray, but not to the checks).
-  The case-folding and misspelling checks look at every object, data maps included (HTTP `headers`, Xray's
-  `dns.hosts`), so a config whose header names differ only in case, or that has a `"Network"` key where `network`
-  is read, is refused for it; a panel that emits such a map has to change it.
+  differently from a field name the checks read - for Xray, any key of the outbound shape, at any depth (a lone
+  `"Protocol"` is the protocol to Xray, but not to the checks; `"Settings"`, `"Mark"`, `"downloadsettings"` are
+  refused naming `settings`, `mark`, `downloadSettings`). The case-folding check of the strict parse looks at every
+  object, data maps included (HTTP `headers`, Xray's `dns.hosts`), so a config whose header names differ only in
+  case is refused for it; a panel that emits such a map has to change it. A header name itself is data: any name,
+  with its value checked for type.
   `path` is not refused: a transport's path (ws, httpupgrade, xhttp) is a URL path, a local rule set's path is a
   file sing-box reads, and no type the allowlists accept writes a file (`cache_file` goes with `experimental`).
 * **What a raw config may do:** pick its outbounds and the servers they reach, route between them with its own
@@ -308,14 +310,41 @@ Per system, at every start of `mu300-vpn` (any command), idempotent, and only wh
     Anything else - `reverse` (its portals take connections in), `transport`, a key a later Xray adds - refuses the
     config.
   * Outbound `protocol` (compared lowercased, as Xray does): `vless`, `vmess`, `trojan`, `shadowsocks`, `socks`,
-    `http`, `wireguard`, `hysteria`, `freedom`, `blackhole`, `dns`. Anything else refuses the config;
-    `dokodemo-door` and `loopback` are named. `settings.redirect` (freedom) and `reverse` anywhere refuse it.
-  * Stripped anywhere in an outbound: `sockopt` and `sendThrough` (they bind to an interface or address, or set a
-    mark). The rebuild writes `streamSettings.sockopt = {"mark":720}`, plus the `dialerProxy` the config had, which
-    only chains through another of its outbounds. A `wireguard` outbound gets `settings.noKernelTun = true`, so it
-    makes no interface or ip rules of its own. Xray also dials from inside an outbound (xhttp's
-    `downloadSettings` is a stream configuration of its own, and a `streamSettings` can sit deeper): each of those
-    gets `sockopt = {"mark":720}` too, or that connection would leave unmarked. Server names in `vnext`/`servers` are resolved by the core.
+    `http`, `wireguard`, `freedom`, `blackhole`, `dns`. Anything else refuses the config; `dokodemo-door`,
+    `loopback` and `hysteria` (sing-box has it, Xray-core does not) are named. `settings.redirect` (freedom) and
+    `reverse` anywhere refuse it.
+  * Every outbound is a NEW object, built from a shape per protocol (`XRAY_JSON_SHAPE` in xray.sh is the list; this
+    summarises it): the exact key names Xray reads, each with a type, copied when present; a key not in the shape
+    refuses the config by its path (`settings.foo`, `settings.vnext[0].users[0].bar`), a value of another type by
+    its path and the type it should be ("key settings.vnext[0].port is not a number"), a null value is left out.
+    Outbound: `tag`, `protocol`, `settings`, `streamSettings`, `proxySettings` (`tag`, `transportLayer`), `mux`
+    (`enabled`, `concurrency`, `xudpConcurrency`, `xudpProxyUDP443`). Settings: `vless`/`vmess` `vnext[]` with
+    `address`, `port`, `users[]` (`id`, `encryption`, `flow`, `security`, `level`, and `alterId`/`email`, which
+    v2rayN writes into every user); `trojan`, `shadowsocks`, `socks`, `http` `servers[]` with `address`, `port`
+    and the protocol's credentials (`password`/`method`/`users[]` of `user`/`pass`, `email`, `level`, ss's `uot`,
+    `UoTVersion`); `wireguard` `secretKey`, `address`, `peers[]` (`publicKey`, `preSharedKey`, `endpoint`,
+    `allowedIPs`, `keepAlive`), `mtu`, `reserved`, `workers`, `domainStrategy`; `freedom` `domainStrategy` (one of
+    Xray's AsIs/UseIP*/ForceIP* values, anything else refused), `userLevel`, `fragment`, `noises`; `blackhole`
+    `response.type`; `dns` `network`, `address`, `port`, `nonIPQuery`, `blockTypes`. streamSettings: `network`
+    (one Xray knows, else refused), `security` (`none`, `tls`, `reality`), `tlsSettings` (`serverName`,
+    `fingerprint`, `alpn`, `minVersion`, `maxVersion`, `cipherSuites`, the pins `pinnedPeerCertificateChainSha256`
+    and `pinnedPeerCertSha256`, `verifyPeerCertInNames`/`verifyPeerCertByName`, `curvePreferences`,
+    `enableSessionResumption`, `echConfigList`, `serverNameToVerify`, `show`), `realitySettings` (`serverName`,
+    `fingerprint`, `publicKey`, `shortId`, `spiderX`, `mldsa65Verify`, `show`), and per transport `wsSettings`,
+    `httpupgradeSettings`, `xhttpSettings` (with `xmux` and `extra`, whose `downloadSettings` is a dialer of its
+    own: `address`, `port`, `network`, `security`, the TLS/REALITY/xhttp settings), `grpcSettings`, `kcpSettings`,
+    `tcpSettings`/`rawSettings` (header type `none` or `http`), `httpSettings`, `quicSettings`. A `headers` map
+    keeps the config's own names, values checked for type. Not in the shape, so refused by name: `certificates`,
+    `masterKeyLog`, `dsSettings`, `disableSystemRoot`, `rejectUnknownSni`, `echServerKeys`, and anything a panel
+    or a later Xray adds.
+  * Dropped without a word, in any spelling, wherever they sit: `sockopt` and `sendThrough` (they bind to an
+    interface or address, or set a mark; panels put `sockopt` in every outbound) and `allowInsecure` (Xray 26 has
+    no such option: the engine verifies, and a server that needs a pin gets one by `pinnedPeerCertSha256`, as the
+    link path does). The rebuild writes `streamSettings.sockopt = {"mark":720}`, plus the `dialerProxy` the config
+    had, which only chains through another of its outbounds; xhttp's `downloadSettings` gets `sockopt =
+    {"mark":720}` too, or that connection would leave unmarked. A `wireguard` outbound gets
+    `settings.noKernelTun = true`, so it makes no interface or ip rules of its own. Server names in
+    `vnext`/`servers` are resolved by the core.
   * `proxySettings.tag`, `dialerProxy` and every routing rule's `outboundTag` must name an outbound of the config.
   * `dns.servers`: a string, or an object reduced to `address`, `port`, `domains`, `expectIPs`, `skipFallback`,
     `clientIP`, `queryStrategy`, `tag`, `timeoutMs`.

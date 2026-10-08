@@ -879,6 +879,128 @@ XRAY_RAW = {
         {"tag": "direct", "protocol": "freedom"}],
     "routing": {"rules": [{"type": "field", "ip": ["geoip:private"], "outboundTag": "direct"}]}}
 
+# The shape of a rebuilt Xray outbound, as xray.sh's XRAY_JSON_SHAPE has it ("s" string, "n" number, "b" boolean,
+# "a" any of the three, "h" a string or a list of strings, [x] a list of x, {"*": x} a map of x under any key), plus
+# what the rebuild writes itself: sockopt (the mark and the config's own dialerProxy) and WireGuard's noKernelTun.
+# A copy, kept by hand: test_a_panel_export_is_rebuilt_from_the_shape walks a rebuilt config against it.
+X_SOCKOPT = {"mark": "n", "dialerProxy": "s"}
+X_TLS = {"serverName": "s", "fingerprint": "s", "alpn": ["s"], "minVersion": "s", "maxVersion": "s",
+         "cipherSuites": "s", "pinnedPeerCertificateChainSha256": ["s"], "pinnedPeerCertSha256": "h",
+         "verifyPeerCertInNames": ["s"], "verifyPeerCertByName": "s", "curvePreferences": ["s"],
+         "enableSessionResumption": "b", "echConfigList": "s", "serverNameToVerify": "s", "show": "b"}
+X_REALITY = {"serverName": "s", "fingerprint": "s", "publicKey": "s", "shortId": "s", "spiderX": "s",
+             "mldsa65Verify": "s", "show": "b"}
+X_XHTTP0 = {"path": "s", "host": "s", "headers": {"*": "s"}, "mode": "s", "noGRPCHeader": "b", "noSSEHeader": "b",
+            "xPaddingBytes": "s", "scMaxEachPostBytes": "a", "scMinPostsIntervalMs": "a", "scMaxBufferedPosts": "n",
+            "scStreamUpServerSecs": "a",
+            "xmux": {"maxConcurrency": "a", "maxConnections": "a", "cMaxReuseTimes": "a", "hMaxRequestTimes": "a",
+                     "hMaxReusableSecs": "a", "hKeepAlivePeriod": "n"}}
+X_XHTTP = dict(X_XHTTP0, extra=dict(X_XHTTP0, downloadSettings={
+    "address": "s", "port": "n", "network": "s", "security": "s", "tlsSettings": X_TLS, "realitySettings": X_REALITY,
+    "xhttpSettings": dict(X_XHTTP0, extra=X_XHTTP0), "sockopt": X_SOCKOPT}))
+X_TCP = {"header": {"type": "s", "request": {"version": "s", "method": "s", "path": ["s"], "headers": {"*": "h"}},
+                    "response": {"version": "s", "status": "s", "reason": "s", "headers": {"*": "h"}}}}
+X_STREAM = {
+    "network": "s", "security": "s", "tlsSettings": X_TLS, "realitySettings": X_REALITY,
+    "wsSettings": {"path": "s", "host": "s", "headers": {"*": "s"}, "heartbeatPeriod": "n"},
+    "httpupgradeSettings": {"path": "s", "host": "s", "headers": {"*": "s"}},
+    "xhttpSettings": X_XHTTP,
+    "grpcSettings": {"serviceName": "s", "authority": "s", "multiMode": "b", "user_agent": "s", "idle_timeout": "n",
+                     "health_check_timeout": "n", "permit_without_stream": "b", "initial_windows_size": "n"},
+    "kcpSettings": {"mtu": "n", "tti": "n", "uplinkCapacity": "n", "downlinkCapacity": "n", "congestion": "b",
+                    "readBufferSize": "n", "writeBufferSize": "n", "header": {"type": "s", "domain": "s"}, "seed": "s"},
+    "tcpSettings": X_TCP, "rawSettings": X_TCP,
+    "httpSettings": {"host": ["s"], "path": "s", "method": "s", "headers": {"*": "h"}, "read_idle_timeout": "n",
+                     "health_check_timeout": "n"},
+    "quicSettings": {"security": "s", "key": "s", "header": {"type": "s"}},
+    "sockopt": X_SOCKOPT}
+X_VLESS_USER = {"id": "s", "encryption": "s", "flow": "s", "level": "n", "email": "s", "alterId": "n", "security": "s"}
+X_VMESS_USER = {"id": "s", "security": "s", "level": "n", "email": "s", "alterId": "n"}
+X_SETTINGS = {
+    "vless": {"vnext": [{"address": "s", "port": "n", "users": [X_VLESS_USER]}]},
+    "vmess": {"vnext": [{"address": "s", "port": "n", "users": [X_VMESS_USER]}]},
+    "trojan": {"servers": [{"address": "s", "port": "n", "password": "s", "email": "s", "level": "n"}]},
+    "shadowsocks": {"servers": [{"address": "s", "port": "n", "method": "s", "password": "s", "uot": "b",
+                                 "UoTVersion": "n", "email": "s", "level": "n"}]},
+    "socks": {"servers": [{"address": "s", "port": "n", "users": [{"user": "s", "pass": "s", "level": "n"}]}]},
+    "http": {"servers": [{"address": "s", "port": "n", "users": [{"user": "s", "pass": "s"}]}]},
+    "wireguard": {"secretKey": "s", "address": ["s"],
+                  "peers": [{"publicKey": "s", "preSharedKey": "s", "endpoint": "s", "allowedIPs": ["s"],
+                             "keepAlive": "n"}],
+                  "mtu": "n", "reserved": ["n"], "workers": "n", "domainStrategy": "s", "noKernelTun": "b"},
+    "freedom": {"domainStrategy": "s", "userLevel": "n", "fragment": {"packets": "s", "length": "s", "interval": "s"},
+                "noises": [{"type": "s", "packet": "s", "delay": "s"}]},
+    "blackhole": {"response": {"type": "s"}},
+    "dns": {"network": "s", "address": "s", "port": "n", "nonIPQuery": "s", "blockTypes": ["n"]}}
+
+
+def x_outbound_shape(protocol):
+    return {"tag": "s", "protocol": "s", "settings": X_SETTINGS[protocol], "streamSettings": X_STREAM,
+            "proxySettings": {"tag": "s", "transportLayer": "b"},
+            "mux": {"enabled": "b", "concurrency": "n", "xudpConcurrency": "n", "xudpProxyUDP443": "s"}}
+
+
+# A realistic export (what v2rayN hands out): every protocol the shape has, the keys panels write (alterId, email,
+# show, allowInsecure, sockopt), the api/stats/policy block, routing rules and dns servers with an object entry.
+# Only srv.example and tr.example resolve under the test's getent stub; the rest are literals.
+XRAY_PANEL = {
+    "log": {"loglevel": "warning", "access": "", "error": ""},
+    "remarks": "panel",
+    "inbounds": [{"tag": "socks", "port": 10808, "listen": "0.0.0.0", "protocol": "socks",
+                  "settings": {"auth": "noauth", "udp": True}},
+                 {"tag": "api", "port": 10085, "listen": "127.0.0.1", "protocol": "dokodemo-door",
+                  "settings": {"address": "127.0.0.1"}}],
+    "api": {"tag": "api", "services": ["StatsService"]}, "stats": {},
+    "policy": {"system": {"statsOutboundUplink": True, "statsOutboundDownlink": True}},
+    "outbounds": [
+        {"tag": "proxy", "protocol": "vless",
+         "settings": {"vnext": [{"address": "srv.example", "port": 443,
+                                 "users": [{"id": "11111111-2222-3333-4444-555555555555", "alterId": 0,
+                                            "email": "t@t.tt", "security": "auto", "encryption": "none",
+                                            "flow": "xtls-rprx-vision"}]}]},
+         "streamSettings": {"network": "xhttp", "security": "reality",
+                            "realitySettings": {"serverName": "cover.example", "fingerprint": "chrome",
+                                                "show": False, "publicKey": "pk", "shortId": "0123", "spiderX": "/"},
+                            "xhttpSettings": {"path": "/up", "host": "cover.example", "mode": "auto",
+                                              "headers": {"X-Padding": "x"},
+                                              "extra": {"xmux": {"maxConcurrency": "16-32", "maxConnections": 0,
+                                                                 "cMaxReuseTimes": 0, "hMaxRequestTimes": "600-900",
+                                                                 "hMaxReusableSecs": "1800-3000",
+                                                                 "hKeepAlivePeriod": 0}}},
+                            "sockopt": {"mark": 255, "tcpFastOpen": True}},
+         "mux": {"enabled": False, "concurrency": -1}},
+        {"tag": "vm", "protocol": "vmess",
+         "settings": {"vnext": [{"address": "203.0.113.20", "port": 443,
+                                 "users": [{"id": "11111111-2222-3333-4444-555555555555", "alterId": 0,
+                                            "email": "t@t.tt", "security": "auto"}]}]},
+         "streamSettings": {"network": "ws", "security": "tls",
+                            "tlsSettings": {"allowInsecure": False, "serverName": "vm.example",
+                                            "alpn": ["http/1.1"], "fingerprint": "chrome"},
+                            "wsSettings": {"path": "/ws", "headers": {"Host": "vm.example"}}},
+         "mux": {"enabled": True, "concurrency": 8, "xudpConcurrency": 16, "xudpProxyUDP443": "reject"}},
+        {"tag": "tr", "protocol": "trojan",
+         "settings": {"servers": [{"address": "tr.example", "port": 443, "email": "t@t.tt",
+                                   "password": "11111111-2222-3333-4444-555555555555", "level": 0}]},
+         "streamSettings": {"network": "grpc", "security": "tls",
+                            "tlsSettings": {"allowInsecure": True, "serverName": "tr.example"},
+                            "grpcSettings": {"serviceName": "svc", "multiMode": False, "idle_timeout": 60,
+                                             "health_check_timeout": 20, "permit_without_stream": False,
+                                             "initial_windows_size": 0}}},
+        {"tag": "ss", "protocol": "shadowsocks",
+         "settings": {"servers": [{"address": "203.0.113.21", "port": 8388, "method": "2022-blake3-aes-128-gcm",
+                                   "password": "11111111-2222-3333-4444-555555555555", "email": "t@t.tt"}]},
+         "streamSettings": {"network": "tcp", "tcpSettings": {"header": {"type": "none"}}}},
+        {"tag": "direct", "protocol": "freedom", "settings": {"domainStrategy": "UseIP"}},
+        {"tag": "block", "protocol": "blackhole", "settings": {"response": {"type": "http"}}},
+        {"tag": "dns-out", "protocol": "dns", "settings": {"network": "tcp", "address": "1.1.1.1", "port": 53}}],
+    "routing": {"domainStrategy": "IPIfNonMatch",
+                "rules": [{"type": "field", "inboundTag": ["api"], "outboundTag": "api"},
+                          {"type": "field", "port": "53", "network": "udp", "outboundTag": "dns-out"},
+                          {"type": "field", "ip": ["geoip:private"], "outboundTag": "direct"},
+                          {"type": "field", "domain": ["geosite:category-ads-all"], "outboundTag": "block"}]},
+    "dns": {"hosts": {"dns.google": "8.8.8.8"},
+            "servers": ["1.1.1.1", {"address": "8.8.8.8", "port": 53, "domains": ["geosite:google"]}]}}
+
 SING_BOX_RAW = {
     "log": {"level": "info"},
     "dns": {"servers": [{"type": "tls", "tag": "dot", "server": "1.1.1.1"}]},
@@ -1314,11 +1436,13 @@ class RawJson(ShellTest):
         self.xray.write_text(self.json.dumps(XRAY_RAW))
 
     def test_every_nested_dialer_carries_the_mark(self):
+        # The config's socket options go in any spelling Xray would read them in (SockOpt is sockopt to it), and
+        # ours are written in their place: on the outbound and on xhttp's download dialer.
         out = dict(XRAY_RAW['outbounds'][0])
-        out['streamSettings'] = {"network": "xhttp", "security": "tls", "xhttpSettings": {"path": "/x", "extra": {
+        out['streamSettings'] = {"network": "xhttp", "security": "tls", "SockOpt": {"Mark": 1, "interface": "wlan0"},
+                                 "xhttpSettings": {"path": "/x", "extra": {
             "downloadSettings": {"address": "srv.example", "port": 443, "network": "xhttp",
-                                 "sockopt": {"interface": "wlan0"}, "security": "tls",
-                                 "streamSettings": {"sockopt": {"mark": 1, "interface": "wlan0"}}}}}}
+                                 "SockOpt": {"interface": "wlan0"}, "security": "tls"}}}}
         raw = dict(XRAY_RAW, outbounds=[out, XRAY_RAW['outbounds'][1]])
         for shell in self.each_shell():
             self.fresh()
@@ -1326,18 +1450,166 @@ class RawJson(ShellTest):
             self.assertEqual(self.cli(shell, 'profile', 'import', self.xray, 'Raw').returncode, 0)
             r = self.gen(shell, 'raw')
             self.assertEqual(r.returncode, 0, r.stderr)
-            cfg = self.json.loads((self.tmp / 'run/xray.json').read_text())
+            text = (self.tmp / 'run/xray.json').read_text()
+            cfg = self.json.loads(text)
             ss = cfg['outbounds'][0]['streamSettings']
             self.assertEqual(ss['sockopt'], {"mark": 720})
             dl = ss['xhttpSettings']['extra']['downloadSettings']
             self.assertEqual(dl['sockopt'], {"mark": 720})
-            self.assertEqual(dl['streamSettings']['sockopt'], {"mark": 720})
-            self.assertNotIn('wlan0', (self.tmp / 'run/xray.json').read_text())
+            self.assertNotIn('wlan0', text)
+            self.assertNotIn('SockOpt', text)
+            self.assertNotIn('Mark', text)
+            # a streamSettings inside downloadSettings is not something Xray reads: refused by name, not marked
+            bad = self.json.loads(self.json.dumps(raw))
+            bad['outbounds'][0]['streamSettings']['xhttpSettings']['extra']['downloadSettings']['streamSettings'] = {}
+            self.refused(shell, self.xray, bad, 'downloadSettings.streamSettings')
             # DownloadSettings (any other spelling) would be read by Xray, not by the mark: refused
             bad = self.json.loads(self.json.dumps(raw))
             x = bad['outbounds'][0]['streamSettings']['xhttpSettings']['extra']
             x['DownloadSettings'] = x.pop('downloadSettings')
             self.refused(shell, self.xray, bad, 'downloadSettings')
+        self.xray.write_text(self.json.dumps(XRAY_RAW))
+
+    def test_keys_are_the_shapes_named_exactly(self):
+        # Xray matches a key to a field without regard to case, so a key that is one of the shape's names in another
+        # spelling is refused, naming the shape's key: it would be that field to Xray and nothing to the checks.
+        # (the key is alone in its spelling: next to the exact one, json_strict refuses the pair first)
+        o = XRAY_RAW['outbounds'][0]
+        for shell in self.each_shell():
+            for extra, name in (({"Mark": 1}, 'mark'), ({"Settings": {}}, 'settings'),
+                                ({"StreamSettings": {}}, 'streamSettings'), ({"Protocol": "vless"}, 'protocol'),
+                                ({"streamSettings": {"Network": "ws"}}, 'network'),
+                                ({"streamSettings": {"xhttpSettings": {"extra": {"downloadsettings": {}}}}},
+                                 'downloadSettings')):
+                p = {k: v for k, v in o.items() if k != name}
+                p.update(extra)
+                self.refused(shell, self.xray, dict(XRAY_RAW, outbounds=[p, XRAY_RAW['outbounds'][1]]),
+                             'a key spelled differently from ' + name)
+            # a header name is data: the config's own, kept as it is
+            ws = dict(o, streamSettings={"network": "ws", "wsSettings": {"headers": {"Host": "h", "HOST-x": "y"}}})
+            self.xray.write_text(self.json.dumps(dict(XRAY_RAW, outbounds=[ws, XRAY_RAW['outbounds'][1]])))
+            self.fresh()
+            self.assertEqual(self.cli(shell, 'profile', 'import', self.xray, 'Raw').returncode, 0)
+            self.assertEqual(self.gen(shell, 'raw').returncode, 0)
+            cfg = self.json.loads((self.tmp / 'run/xray.json').read_text())
+            self.assertEqual(cfg['outbounds'][0]['streamSettings']['wsSettings'], {"headers": {"Host": "h", "HOST-x": "y"}})
+        self.xray.write_text(self.json.dumps(XRAY_RAW))
+
+    def test_freedom_domain_strategy(self):
+        o, d = XRAY_RAW['outbounds']
+        for shell in self.each_shell():
+            self.refused(shell, self.xray, dict(XRAY_RAW, outbounds=[o, dict(d, settings={"redirect": "127.0.0.1:22"})]),
+                         'redirect')
+            self.refused(shell, self.xray, dict(XRAY_RAW, outbounds=[o, dict(d, settings={"domainStrategy": "x"})]),
+                         'a domainStrategy it does not know')
+            self.xray.write_text(self.json.dumps(dict(XRAY_RAW, outbounds=[o, dict(d, settings={
+                "domainStrategy": "UseIP", "userLevel": 0,
+                "fragment": {"packets": "tlshello", "length": "100-200", "interval": "10-20"}})])))
+            self.fresh()
+            self.assertEqual(self.cli(shell, 'profile', 'import', self.xray, 'Raw').returncode, 0)
+            self.assertEqual(self.gen(shell, 'raw').returncode, 0)
+            cfg = self.json.loads((self.tmp / 'run/xray.json').read_text())
+            self.assertEqual(cfg['outbounds'][1]['settings'], {
+                "domainStrategy": "UseIP", "userLevel": 0,
+                "fragment": {"packets": "tlshello", "length": "100-200", "interval": "10-20"}})
+        self.xray.write_text(self.json.dumps(XRAY_RAW))
+
+    def test_unknown_keys_and_wrong_types_are_refused_by_name(self):
+        o, d = XRAY_RAW['outbounds']
+        def with_user(**u):
+            return dict(o, settings={"vnext": [{"address": "srv.example", "port": 443, "users": [dict(
+                {"id": self.UUID, "encryption": "none"}, **u)]}]})
+        def with_stream(**s):
+            return dict(o, streamSettings=dict(o['streamSettings'], **s))
+        for shell in self.each_shell():
+            for out, name in ((dict(o, protocol="hysteria"), 'outbound protocol hysteria'),
+                              (dict(o, protocol=self.UUID), 'an outbound protocol it does not know'),
+                              (dict(o, settings={"foo": 1}), 'key settings.foo'),
+                              (with_user(bar=1), 'key settings.vnext[0].users[0].bar'),
+                              (with_stream(certificates=[]), 'key streamSettings.certificates'),
+                              (with_stream(tlsSettings={"certificates": [{"certificate": ["x"]}]}),
+                               'key streamSettings.tlsSettings.certificates'),
+                              (with_stream(tlsSettings={"disableSystemRoot": True}), 'disableSystemRoot'),
+                              (dict(o, mux={"enabled": True, "foo": 1}), 'key mux.foo'),
+                              (dict(o, sendThrough="0.0.0.0", unknownTop=1), 'key unknownTop'),
+                              (dict(o, settings={"vnext": [{"address": "srv.example", "port": "443", "users": []}]}),
+                               'key settings.vnext[0].port is not a number'),
+                              (with_user(level="0"), 'users[0].level is not a number'),
+                              (with_stream(tlsSettings={"alpn": "h2"}), 'tlsSettings.alpn is not a list'),
+                              (with_stream(tlsSettings={"alpn": [1]}), 'tlsSettings.alpn[0] is not a string'),
+                              (with_stream(network=1), 'key streamSettings.network is not a string'),
+                              (with_stream(network="x"), 'a network it does not know'),
+                              (with_stream(security="xtls"), 'a security it does not know'),
+                              (with_stream(tcpSettings={"header": {"type": "srtp"}}), 'TCP header type'),
+                              (dict(o, settings="x"), 'key settings is not an object'),
+                              (dict(o, proxySettings={"tag": "direct", "transportLayer": "yes"}),
+                               'key proxySettings.transportLayer is not a boolean')):
+                r = self.refused(shell, self.xray, dict(XRAY_RAW, outbounds=[out, d]), name)
+                self.assertNotIn('srv.example', r.stderr)
+        self.xray.write_text(self.json.dumps(XRAY_RAW))
+
+    def walk(self, node, shape, path):
+        """node holds only keys of shape, each of shape's type; a map ("*") takes any key."""
+        if isinstance(shape, str):
+            if shape == 'n':
+                self.assertNotIsInstance(node, bool, path)
+            self.assertIsInstance(node, {'s': str, 'n': (int, float), 'b': bool, 'a': (str, int, float, bool),
+                                         'h': (str, list)}[shape], path)
+            if shape == 'h' and isinstance(node, list):
+                for i, v in enumerate(node):
+                    self.assertIsInstance(v, str, f'{path}[{i}]')
+        elif isinstance(shape, list):
+            self.assertIsInstance(node, list, path)
+            for i, v in enumerate(node):
+                self.walk(v, shape[0], f'{path}[{i}]')
+        else:
+            self.assertIsInstance(node, dict, path)
+            for k, v in node.items():
+                if '*' in shape:
+                    self.walk(v, shape['*'], f'{path}.{k}')
+                else:
+                    self.assertIn(k, shape, path)
+                    self.walk(v, shape[k], f'{path}.{k}')
+
+    def test_a_panel_export_is_rebuilt_from_the_shape(self):
+        # What a panel's export turns into: every outbound a new object holding exactly the shape's keys (the same
+        # keys the config had, minus sockopt and allowInsecure), with our mark, the names resolved, and nothing else.
+        def ours(node):
+            if isinstance(node, dict):
+                return {k: ours(v) for k, v in node.items() if self.fold(k) not in ('sockopt', 'allowinsecure')}
+            return [ours(v) for v in node] if isinstance(node, list) else node
+        want = []
+        for o in XRAY_PANEL['outbounds']:
+            o = ours(o)
+            o.setdefault('streamSettings', {})['sockopt'] = {"mark": 720}
+            want.append(o)
+        want[0]['settings']['vnext'][0]['address'] = '203.0.113.5'
+        want[2]['settings']['servers'][0]['address'] = '203.0.113.6'
+        self.xray.write_text(self.json.dumps(XRAY_PANEL))
+        for shell in self.each_shell():
+            self.fresh()
+            r = self.cli(shell, 'profile', 'import', self.xray, 'Raw')
+            self.assertEqual(r.returncode, 0, r.stderr)
+            r = self.gen(shell, 'raw')
+            self.assertEqual(r.returncode, 0, r.stderr)
+            text = (self.tmp / 'run/xray.json').read_text()
+            cfg = self.json.loads(text)
+            self.assertEqual(cfg['outbounds'], want)
+            for i, o in enumerate(cfg['outbounds']):
+                self.walk(o, x_outbound_shape(o['protocol']), f'outbounds[{i}]')
+                self.assertEqual(o['streamSettings']['sockopt'], {"mark": 720}, o['tag'])
+            for gone in ('allowInsecure', 'tcpFastOpen', '255', 'api', 'StatsService', 'remarks', 'dokodemo'):
+                self.assertNotIn(gone, text)
+            self.assertEqual(sorted(cfg), ['dns', 'inbounds', 'log', 'outbounds', 'routing'])
+            self.assertEqual(cfg['routing'], dict(XRAY_PANEL['routing'], rules=XRAY_PANEL['routing']['rules'][1:]))
+            self.assertEqual(cfg['dns'], XRAY_PANEL['dns'])
+            self.assertEqual(self.listeners(cfg), [('.inbounds[0].listen', '127.0.0.1')])
+            self.assertEqual(sorted((self.tmp / 'run/server-ip').read_text().split()),
+                             ['203.0.113.20', '203.0.113.21', '203.0.113.5', '203.0.113.6'])
+            # xray checks the rebuilt file, and only that
+            self.assertEqual((self.tmp / 'xray.args').read_text().splitlines(),
+                             [f'run -test -c {self.tmp}/run/xray.json'])
+            self.assertNotIn(self.UUID, r.stdout + r.stderr)
         self.xray.write_text(self.json.dumps(XRAY_RAW))
 
     def test_the_size_cap_comes_before_any_full_read(self):

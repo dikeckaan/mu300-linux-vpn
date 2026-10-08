@@ -273,7 +273,8 @@ json_rebuild() {
     _jr_p=$(jq -r '.refuse // empty | .[]' "$_jr_out.r" 2>/dev/null) || _jr_p='?'
     if [ -n "$_jr_p" ]; then
         rm -f "$_jr_out.r"
-        _jr_p=$(printf '%s\n' "$_jr_p" | tr -c "A-Za-z0-9_.,'() \n-" '?' | head -n 8 | tr '\n' ';' | sed 's/;$//; s/;/; /g')
+        # (the brackets are a list index in a key path, "users[0].bar"; a lone "[" is literal to every tr)
+        _jr_p=$(printf '%s\n' "$_jr_p" | tr -c "A-Za-z0-9_.,'() []\n-" '?' | head -n 8 | tr '\n' ';' | sed 's/;$//; s/;/; /g')
         echo "$_jr_what is refused: $_jr_p (change it and import the config again)" >&2
         return 1
     fi

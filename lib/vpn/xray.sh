@@ -168,47 +168,172 @@ gen_xray() {
 #   routing rule that led to the API's handler goes with it). "remarks", a subscription's name for the config, is
 #   dropped too. Anything else - reverse, whose portals take connections in, transport, a key some later Xray adds -
 #   refuses the config, naming the key.
-# - Outbounds: only the protocols in XRAY_JSON_PROTOCOLS (compared lowercased, as Xray compares them). dokodemo-door
-#   and loopback are inbound plumbing; reverse, anywhere, takes connections in; freedom's redirect sends everything
-#   to an address of the config's choosing. sockopt and sendThrough are removed wherever they sit: they bind to an
-#   interface or an address, or set a mark, and the mark is ours. Every outbound gets sockopt {"mark": 720}, and the
-#   dialerProxy its sockopt had, which only chains it through another of the config's outbounds. A WireGuard
-#   outbound gets noKernelTun, or it would make an interface and ip rules of its own. Xray dials again from inside
-#   an outbound (xhttp's downloadSettings is a stream configuration of its own, and a streamSettings can sit deeper
-#   still), and those dialers lose their sockopt like the rest, so each of them gets {"mark": 720} too: otherwise
-#   that connection would leave unmarked and be dropped by the kill switch, or worse, be routed by it. A network of
-#   domainsocket (or ds) and dsSettings dial a unix socket of the config's choosing, so they refuse the config.
+# - Outbounds: each one is a NEW object, built from the shape (XRAY_JSON_SHAPE) of its protocol: the keys Xray reads,
+#   named exactly, each with the type the shape says. Only the protocols the shape has settings for (compared
+#   lowercased, as Xray compares them): dokodemo-door and loopback are inbound plumbing; reverse, anywhere, takes
+#   connections in; freedom's redirect sends everything to an address of the config's choosing. A key the shape
+#   does not have refuses the config by its path (settings.foo), a value of the wrong type by its path and the type
+#   it should be, a key spelled differently from a shape key (Settings, Protocol, SockOpt is the exception below)
+#   by the key it collides with: Xray matches field names without regard to case, so "Protocol" would be the
+#   protocol to it, but not to these checks. A null value is left out, as Go's decoder leaves a field at null.
+#   Three keys are dropped without a word wherever they sit, in any spelling: sockopt and sendThrough (they bind to
+#   an interface or an address, or set a mark, and the mark is ours; panels put sockopt in every outbound), and
+#   allowInsecure (Xray 26 has no such option: the engine verifies, and a server that needs a pin gets one through
+#   pinnedPeerCertSha256, as the link path does). Every outbound gets sockopt {"mark": 720}, and the dialerProxy its
+#   sockopt had, which only chains it through another of the config's outbounds. A WireGuard outbound gets
+#   noKernelTun, or it would make an interface and ip rules of its own. Xray dials again from inside an outbound
+#   (xhttp's downloadSettings is a stream configuration of its own), and that dialer gets {"mark": 720} too:
+#   otherwise its connection would leave unmarked and be dropped by the kill switch, or worse, be routed by it.
+#   A network of domainsocket (or ds) and dsSettings dial a unix socket of the config's choosing, so they refuse
+#   the config; so does a network, a security, a TCP header type or a freedom domainStrategy it does not know.
 # - proxySettings.tag, dialerProxy and every routing rule's outboundTag name an outbound the config has. A dns.servers
 #   entry is a string, or an object reduced to the keys in XRAY_JSON_DNS_KEYS.
-# - No key from JSON_DENY anywhere in what is kept, and no key spelled differently from a name the checks read
-#   (XRAY_JSON_NAMES): "Protocol" would be the protocol to Xray, but not to them.
+# - No key from JSON_DENY anywhere in what is kept (named as it is there: redirect, masterkeylog, keyfile...), and in
+#   routing and dns no key spelled differently from one of the shape's names.
 # A transport's path (ws, httpupgrade, xhttp) is a URL path, not a file, so no path is refused; no outbound type
 # that is allowed writes a file.
 XRAY_JSON_TEST='.outbounds | type == "array"'
 XRAY_JSON_KEYS='outbounds routing dns fakedns observatory burstObservatory'
 XRAY_JSON_DROPPED='inbounds log api stats metrics policy remarks'
-XRAY_JSON_PROTOCOLS='vless vmess trojan shadowsocks socks http wireguard hysteria freedom blackhole dns'
 # refused protocols a refusal names; any other is "a protocol it does not know" (a value is never printed)
-XRAY_JSON_KNOWN='dokodemo-door loopback tun mtproto'
+XRAY_JSON_KNOWN='dokodemo-door loopback tun mtproto hysteria'
 XRAY_JSON_DNS_KEYS='address port domains expectIPs skipFallback clientIP queryStrategy tag timeoutMs'
-XRAY_JSON_NAMES='network downloadSettings protocol tag settings streamSettings proxySettings dialerProxy vnext servers address outboundTag noKernelTun security tlsSettings realitySettings serverName rules'
+# The shape of an outbound: jq definitions, a key per field Xray reads, each value a shape of its own. "s" string,
+# "n" number, "b" boolean, "a" any of the three, "h" a string or a list of strings (Xray's StringList), ["s"] a
+# list of strings, [{...}] a list of objects of that shape, {...} an object of that shape, {"*": shape} a map whose
+# keys are the config's own (HTTP headers). The spec's Security section summarises this; this is the list.
+# Beyond what Xray itself reads, the users of vless and vmess take alterId, email, security and level, which
+# v2rayN and v2rayNG write into every user (Xray ignores them); tlsSettings takes both spellings of the pin and the
+# name check (the link path writes pinnedPeerCertSha256 and verifyPeerCertByName); and show (a debug print) is
+# accepted next to the REALITY and TLS settings, because v2rayN writes it.
+XRAY_JSON_SHAPE='
+def mu_hdr: {"*": "s"};
+def mu_hdrl: {"*": "h"};
+def mu_tls: {"serverName": "s", "fingerprint": "s", "alpn": ["s"], "minVersion": "s", "maxVersion": "s",
+  "cipherSuites": "s", "pinnedPeerCertificateChainSha256": ["s"], "pinnedPeerCertSha256": "h",
+  "verifyPeerCertInNames": ["s"], "verifyPeerCertByName": "s", "curvePreferences": ["s"],
+  "enableSessionResumption": "b", "echConfigList": "s", "serverNameToVerify": "s", "show": "b"};
+def mu_reality: {"serverName": "s", "fingerprint": "s", "publicKey": "s", "shortId": "s", "spiderX": "s",
+  "mldsa65Verify": "s", "show": "b"};
+def mu_xhttp0: {"path": "s", "host": "s", "headers": mu_hdr, "mode": "s", "noGRPCHeader": "b", "noSSEHeader": "b",
+  "xPaddingBytes": "s", "scMaxEachPostBytes": "a", "scMinPostsIntervalMs": "a", "scMaxBufferedPosts": "n",
+  "scStreamUpServerSecs": "a",
+  "xmux": {"maxConcurrency": "a", "maxConnections": "a", "cMaxReuseTimes": "a", "hMaxRequestTimes": "a",
+           "hMaxReusableSecs": "a", "hKeepAlivePeriod": "n"}};
+def mu_xhttp: mu_xhttp0 + {"extra": (mu_xhttp0 + {"downloadSettings": {"address": "s", "port": "n", "network": "s",
+  "security": "s", "tlsSettings": mu_tls, "realitySettings": mu_reality,
+  "xhttpSettings": (mu_xhttp0 + {"extra": mu_xhttp0})}})};
+def mu_tcp: {"header": {"type": "s",
+  "request": {"version": "s", "method": "s", "path": ["s"], "headers": mu_hdrl},
+  "response": {"version": "s", "status": "s", "reason": "s", "headers": mu_hdrl}}};
+def mu_stream: {"network": "s", "security": "s", "tlsSettings": mu_tls, "realitySettings": mu_reality,
+  "wsSettings": {"path": "s", "host": "s", "headers": mu_hdr, "heartbeatPeriod": "n"},
+  "httpupgradeSettings": {"path": "s", "host": "s", "headers": mu_hdr},
+  "xhttpSettings": mu_xhttp,
+  "grpcSettings": {"serviceName": "s", "authority": "s", "multiMode": "b", "user_agent": "s", "idle_timeout": "n",
+                   "health_check_timeout": "n", "permit_without_stream": "b", "initial_windows_size": "n"},
+  "kcpSettings": {"mtu": "n", "tti": "n", "uplinkCapacity": "n", "downlinkCapacity": "n", "congestion": "b",
+                  "readBufferSize": "n", "writeBufferSize": "n", "header": {"type": "s", "domain": "s"}, "seed": "s"},
+  "tcpSettings": mu_tcp, "rawSettings": mu_tcp,
+  "httpSettings": {"host": ["s"], "path": "s", "method": "s", "headers": mu_hdrl, "read_idle_timeout": "n",
+                   "health_check_timeout": "n"},
+  "quicSettings": {"security": "s", "key": "s", "header": {"type": "s"}}};
+def mu_vnext_user($u): {"vnext": [{"address": "s", "port": "n", "users": [$u]}]};
+def mu_settings: {
+  "vless": mu_vnext_user({"id": "s", "encryption": "s", "flow": "s", "level": "n", "email": "s", "alterId": "n",
+                          "security": "s"}),
+  "vmess": mu_vnext_user({"id": "s", "security": "s", "level": "n", "email": "s", "alterId": "n"}),
+  "trojan": {"servers": [{"address": "s", "port": "n", "password": "s", "email": "s", "level": "n"}]},
+  "shadowsocks": {"servers": [{"address": "s", "port": "n", "method": "s", "password": "s", "uot": "b",
+                               "UoTVersion": "n", "email": "s", "level": "n"}]},
+  "socks": {"servers": [{"address": "s", "port": "n", "users": [{"user": "s", "pass": "s", "level": "n"}]}]},
+  "http": {"servers": [{"address": "s", "port": "n", "users": [{"user": "s", "pass": "s"}]}]},
+  "wireguard": {"secretKey": "s", "address": ["s"],
+                "peers": [{"publicKey": "s", "preSharedKey": "s", "endpoint": "s", "allowedIPs": ["s"],
+                           "keepAlive": "n"}],
+                "mtu": "n", "reserved": ["n"], "workers": "n", "domainStrategy": "s"},
+  "freedom": {"domainStrategy": "s", "userLevel": "n",
+              "fragment": {"packets": "s", "length": "s", "interval": "s"},
+              "noises": [{"type": "s", "packet": "s", "delay": "s"}]},
+  "blackhole": {"response": {"type": "s"}},
+  "dns": {"network": "s", "address": "s", "port": "n", "nonIPQuery": "s", "blockTypes": ["n"]}};
+def mu_outbound($p): {"tag": "s", "protocol": "s", "settings": mu_settings[$p], "streamSettings": mu_stream,
+  "proxySettings": {"tag": "s", "transportLayer": "b"},
+  "mux": {"enabled": "b", "concurrency": "n", "xudpConcurrency": "n", "xudpProxyUDP443": "s"}};
+'
+# the values a refusal checks beyond the shape (compared folded, as Xray compares them)
+XRAY_JSON_NETWORKS='tcp raw ws websocket grpc gun httpupgrade xhttp splithttp kcp mkcp http h2 h3 quic'
+XRAY_JSON_DOMAIN_STRATEGIES='asis useip useipv4 useipv6 useipv4v6 useipv6v4 forceip forceipv4 forceipv6 forceipv4v6 forceipv6v4'
 XRAY_JSON_REBUILD='
 ($keep | split(" ")) as $keep | ($drop | split(" ")) as $drop | ($deny | split(" ") + ["reverse"]) as $deny
-| ($protos | split(" ")) as $protos | ($known | split(" ")) as $known | ($dnskeys | split(" ")) as $dnskeys
-| ($names | split(" ")) as $names
-| [keys_unsorted[] | select(mu_in($keep + $drop) | not) | "top-level key " + mu_safe] as $ptop
+| ($known | split(" ")) as $known | ($dnskeys | split(" ")) as $dnskeys
+| ($nets | split(" ")) as $nets | ($dstrats | split(" ")) as $dstrats
+| (mu_settings | keys) as $protos
+| ([mu_outbound("") | .settings = mu_settings | .. | objects | keys[] | select(. != "*")]
+   + ["mark", "dialerProxy", "outboundTag", "noKernelTun", "rules"] | unique) as $names
+| ["sockopt", "sendthrough", "allowinsecure"] as $dropped
+| def mu_tail: explode | if length > 40 then [46, 46, 46] + .[-37:] else . end | implode;
+  def mu_bad($p; $w): {"v": null, "p": ["key " + ($p | mu_tail) + " is not " + $w]};
+  def mu_ok: {"v": ., "p": []};
+  def mu_shape($s; $p):
+    if ($s | type) == "string" then
+      if $s == "s" then (if type == "string" then mu_ok else mu_bad($p; "a string") end)
+      elif $s == "n" then (if type == "number" then mu_ok else mu_bad($p; "a number") end)
+      elif $s == "b" then (if type == "boolean" then mu_ok else mu_bad($p; "a boolean") end)
+      elif $s == "h" then (if type == "string" or (type == "array" and all(.[]; type == "string")) then mu_ok
+                           else mu_bad($p; "a string or a list of strings") end)
+      else (if type == "string" or type == "number" or type == "boolean" then mu_ok
+            else mu_bad($p; "a string, a number or a boolean") end) end
+    elif ($s | type) == "array" then
+      if type != "array" then mu_bad($p; "a list")
+      else . as $in | reduce range(0; $in | length) as $i ({"v": [], "p": []};
+             ($in[$i] | mu_shape($s[0]; $p + "[" + ($i | tostring) + "]")) as $r | .v += [$r.v] | .p += $r.p) end
+    elif type != "object" then mu_bad($p; "an object")
+    else . as $in | reduce ($in | keys_unsorted[]) as $k ({"v": {}, "p": []};
+           $in[$k] as $x | (if $p == "" then ($k | mu_safe) else $p + "." + ($k | mu_safe) end) as $kp
+           | if $x == null then .
+             elif $s | has("*") then ($x | mu_shape($s["*"]; $kp)) as $r | .v[$k] = $r.v | .p += $r.p
+             elif $s | has($k) then ($x | mu_shape($s[$k]; $kp)) as $r | .v[$k] = $r.v | .p += $r.p
+             elif $k | mu_fold | mu_in($dropped) then .
+             else ($k | mu_fold) as $f | ([$names[] | select(mu_fold == $f and . != $k)] | .[0]) as $c
+               | if $c != null then .p += ["a key spelled differently from " + $c]
+                 else .p += ["key " + ($kp | mu_tail)] end end) end;
+  def mu_stream_problems:
+    [(.streamSettings | objects),
+     (.streamSettings | objects | .xhttpSettings | objects | .extra | objects | .downloadSettings | objects)
+     | (.network | strings | mu_fold
+        | select((mu_in($nets) or . == "domainsocket" or . == "ds") | not) | "a network it does not know"),
+       (.security | strings | mu_fold | select(mu_in(["", "none", "tls", "reality"]) | not)
+        | "a security it does not know"),
+       ((.tcpSettings, .rawSettings) | objects | .header | objects | .type | strings | mu_fold
+        | select(. != "none" and . != "http") | "a TCP header type it does not know")];
+  def mu_out_rebuild:
+    if type != "object" then {"v": ., "p": ["an outbound that is not an object"]}
+    else ((.streamSettings | objects | .sockopt | objects | .dialerProxy) // null) as $dp
+    | mu_strip(["sockopt", "sendthrough"])
+    | (.protocol | mu_type) as $t
+    | if $t | mu_in($protos) | not
+      then {"v": ., "p": ([if $t | mu_in($known) then "outbound protocol " + $t
+                           else "an outbound protocol it does not know" end]
+                          + [mu_misspelled($names)[] | "a key spelled differently from " + .])}
+      else mu_shape(mu_outbound($t); "") as $r
+      | ($r.v
+         | if $t == "wireguard" then .settings.noKernelTun = true else . end
+         | mu_marks($mark)
+         | .streamSettings.sockopt = ({"mark": $mark} + (if $dp != null then {"dialerProxy": $dp} else {} end))) as $v
+      | {"v": $v, "p": ($r.p + ($v | mu_stream_problems)
+                        + (if $t == "freedom"
+                           then [$v.settings | objects | .domainStrategy | strings | mu_fold
+                                 | select(mu_in($dstrats) | not) | "a domainStrategy it does not know"]
+                           else [] end))} end end;
+  [keys_unsorted[] | select(mu_in($keep + $drop) | not) | "top-level key " + mu_safe] as $ptop
 | ((.api | objects | .tag | strings) // null) as $api
 | with_entries(select(.key | mu_in($keep)))
 | if $api != null and (.routing | type) == "object" and (.routing.rules | type) == "array"
   then .routing.rules |= map(select(type != "object" or .outboundTag != $api)) else . end
-| if (.outbounds | type) == "array" then .outbounds |= map(
-    if type != "object" then . else
-      ((.streamSettings | objects | .sockopt | objects | .dialerProxy) // null) as $dp
-      | mu_strip(["sockopt", "sendthrough"])
-      | mu_marks($mark)
-      | if (.protocol | mu_type) == "wireguard" then .settings.noKernelTun = true else . end
-      | .streamSettings.sockopt = ({"mark": $mark} + (if $dp != null then {"dialerProxy": $dp} else {} end))
-    end) else . end
+| . as $src
+| ($src.outbounds | if type == "array" then map(mu_out_rebuild) else [] end) as $ro
+| if (.outbounds | type) == "array" then .outbounds = [$ro[].v] else . end
 | if (.dns | type) == "object" and (.dns.servers | type) == "array"
   then .dns.servers |= map(if type == "object" then with_entries(select(.key | mu_in($dnskeys))) else . end) else . end
 | . as $b
@@ -217,16 +342,12 @@ XRAY_JSON_REBUILD='
 | def known_tag: type == "string" and mu_in($tags);
   ($ptop
    + (if ($b.outbounds | type) == "array" then [] else ["no outbounds list"] end)
-   + [$outs[] | if type != "object" then "an outbound that is not an object"
-                else (.protocol | mu_type) as $t
-                | if $t | mu_in($protos) then empty
-                  elif $t | mu_in($known) then "outbound protocol " + $t
-                  else "an outbound protocol it does not know" end end]
-   + [$b | mu_keys_in($deny)[] | "key " + .]
-   + [$b | mu_misspelled($names)[] | "a key spelled differently from " + .]
+   + [$ro[].p[]]
+   + [$src | mu_keys_in($deny)[] | "key " + .]
+   + [$b | del(.outbounds) | mu_misspelled($names)[] | "a key spelled differently from " + .]
    + (if [$b | .. | objects | .network | strings | mu_fold | select(. == "domainsocket" or . == "ds")] | length > 0
       then ["network domainsocket"] else [] end)
-   + [$outs[] | objects | (.proxySettings | objects | .tag), .streamSettings.sockopt.dialerProxy
+   + [$outs[] | objects | (.proxySettings | objects | .tag), (.streamSettings | objects | .sockopt | objects | .dialerProxy)
       | select(. != null and (known_tag | not)) | "proxySettings or dialerProxy naming an outbound it does not have"]
    + [$b.routing | objects | .rules | arrays | .[] | objects | .outboundTag
       | select(. != null and (known_tag | not)) | "a routing rule whose outboundTag is not one of its outbounds"]
@@ -239,10 +360,10 @@ XRAY_JSON_REBUILD='
 xray_raw() { [ -n "${PDIR:-}" ] && [ -r "$PDIR/config.json" ]; }
 # xray_json_rebuild OUT: the profile's config.json, rebuilt (see above) into OUT, or a refusal
 xray_json_rebuild() {
-    json_rebuild "$PDIR/config.json" "$1" "the profile's Xray config" "$XRAY_JSON_REBUILD" \
+    json_rebuild "$PDIR/config.json" "$1" "the profile's Xray config" "$XRAY_JSON_SHAPE$XRAY_JSON_REBUILD" \
         --argjson port "$SOCKS_PORT" --argjson mark "$((MARK))" --arg keep "$XRAY_JSON_KEYS" \
-        --arg drop "$XRAY_JSON_DROPPED" --arg deny "$JSON_DENY" --arg protos "$XRAY_JSON_PROTOCOLS" \
-        --arg known "$XRAY_JSON_KNOWN" --arg dnskeys "$XRAY_JSON_DNS_KEYS" --arg names "$XRAY_JSON_NAMES"
+        --arg drop "$XRAY_JSON_DROPPED" --arg deny "$JSON_DENY" --arg known "$XRAY_JSON_KNOWN" \
+        --arg dnskeys "$XRAY_JSON_DNS_KEYS" --arg nets "$XRAY_JSON_NETWORKS" --arg dstrats "$XRAY_JSON_DOMAIN_STRATEGIES"
 }
 # xray_json_addresses FILE: every server address in a rebuilt config's vnext and servers, one per line. Names and
 # addresses are told apart in the shell, not with jq's test(): OpenWrt's jq may be built without regular expressions.
