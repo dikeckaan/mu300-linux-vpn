@@ -3292,3 +3292,245 @@ rules:
             r = self.run_lib(shell, 'drv_status')
             self.assertEqual(r.stdout.splitlines(), ['mode: global', 'proxies: 1'])
             self.no_secrets(r)
+
+
+class EnginesCmd(ShellTest):
+    """mu300-vpn engines: one TSV line per engine, present with its path or missing with how to get it, with the
+    exit status of the active profile's engines; engines install ENGINE runs mu300-extra or this system's package
+    manager (apk on OpenWrt, else apt-get, else pacman)."""
+
+    # the tools the script needs, on a PATH of its own: a real wg, openvpn, mihomo, apt-get or pacman of this
+    # machine must not be found, since the lines and the package command depend on what is there
+    TOOLS = ('sh', 'sed', 'awk', 'grep', 'cat', 'tr', 'cut', 'head', 'tail', 'mkdir', 'chmod', 'rm', 'mv', 'cp',
+             'ln', 'date', 'wc', 'sort', 'uniq', 'od', 'basename', 'dirname', 'readlink', 'stat', 'touch', 'find',
+             'mktemp', 'env', 'id', 'true', 'false', 'sleep', 'printf', 'echo', 'test', 'expr', 'xargs', 'tee',
+             'ls', 'cmp', 'diff', 'uname', 'jq', 'openssl', 'base64', 'dd', 'sync', 'busybox', 'bash', 'dash')
+
+    def setUp(self):
+        super().setUp()
+        self.conf = self.tmp / 'vpn.conf'
+        self.conf.write_text('ENABLE=0\nKILL_SWITCH=0\n')
+        self.store = self.tmp / 'vpn'
+        self.disk = self.tmp / 'disk'
+        self.opt = self.tmp / 'opt'
+        self.sysroot = self.tmp / 'sysroot'
+        self.tools = self.tmp / 'tools'
+        self.tools.mkdir()
+        for t in self.TOOLS:
+            p = shutil.which(t)
+            if p:
+                os.symlink(p, self.tools / t)
+        self.stub('svc', 'exit 0')
+        self.stub('nft', 'exit 0')
+        self.stub('extra', 'echo "extra $*" >> "$STUBLOG/extra.log"; exit 0')
+        self.kernel(True)
+        self.src = self.tmp / 'wg.conf'
+        self.src.write_text(WG_CONF)
+
+    def kernel(self, has):
+        # "link show" finds no tunnel; "link add ... type wireguard" works only on a kernel that has WireGuard
+        add = 'exit 0' if has else 'exit 2'
+        self.stub('ip', 'case "$*" in "link show"*) exit 1 ;; "link add"*) %s ;; esac; exit 0' % add)
+
+    def pkg(self, *names):
+        """only these package managers exist, each noting its call (and failing when told to with PKG_FAIL)"""
+        for n in ('apk', 'apt-get', 'pacman'):
+            (self.stubs / n).unlink(missing_ok=True)
+        for n in names:
+            self.stub(n, f'echo "{n} $*" >> "$STUBLOG/pkg.log"; exit "${{PKG_FAIL:-0}}"')
+        (self.tmp / 'pkg.log').unlink(missing_ok=True)
+
+    def pkglog(self):
+        return (self.tmp / 'pkg.log').read_text().splitlines() if (self.tmp / 'pkg.log').exists() else []
+
+    def engine(self, name, where):
+        """an executable NAME in the vpn extra, the vpn-mihomo extra, /opt/mu300/bin or on PATH; its path"""
+        d = {'vpn': self.disk / 'extra/vpn/bin', 'vpn-mihomo': self.disk / 'extra/vpn-mihomo/bin',
+             'opt': self.opt / 'bin', 'path': self.stubs}[where]
+        d.mkdir(parents=True, exist_ok=True)
+        (d / name).write_text('#!/bin/sh\nexit 0\n')
+        (d / name).chmod(0o755)
+        return str(d / name)
+
+    def fresh(self):
+        for d in (self.store, self.disk, self.opt, self.sysroot, self.tmp / 'run'):
+            shutil.rmtree(d, ignore_errors=True)
+        for n in ('wg', 'openvpn', 'mihomo'):
+            (self.stubs / n).unlink(missing_ok=True)
+        for n in ('extra.log', 'pkg.log'):
+            (self.tmp / n).unlink(missing_ok=True)
+        self.conf.write_text('ENABLE=0\nKILL_SWITCH=0\n')
+        self.pkg('apt-get')
+
+    def openwrt(self):
+        (self.sysroot / 'etc').mkdir(parents=True, exist_ok=True)
+        (self.sysroot / 'etc/openwrt_release').write_text("DISTRIB_ID='OpenWrt'\n")
+
+    def vpn(self, shell, *args, **extra):
+        env = dict(MU300_VPN_CONF=self.conf, MU300_VPN_RUN=self.tmp / 'run', MU300_VPN_LIB=LIB,
+                   MU300_LAN_CONF=self.tmp / 'no', MU300_BIN=BIN, MU300_OPT=self.opt, MU300_DISK=self.disk,
+                   MU300_VPN_SVC=self.stubs / 'svc', MU300_EXTRA_CMD=self.stubs / 'extra',
+                   MU300_WG_SYSMOD=self.tmp / 'no-module', MU300_SYSROOT=self.sysroot,
+                   PATH=f'{self.stubs}{os.pathsep}{self.tools}')
+        env.update(extra)
+        return self.script(shell, BIN / 'mu300-vpn', *args, **env)
+
+    def extra_log(self):
+        return (self.tmp / 'extra.log').read_text().splitlines() if (self.tmp / 'extra.log').exists() else []
+
+    def test_every_engine_missing_says_how(self):
+        for shell in self.each_shell():
+            self.fresh()
+            r = self.vpn(shell, 'engines')
+            self.assertEqual(r.stdout.splitlines(), [
+                'xray\tmissing\tmu300-extra install vpn',
+                'hev-socks5-tunnel\tmissing\tmu300-extra install vpn',
+                'sing-box\tmissing\tmu300-extra install vpn',
+                'mihomo\tmissing\tmu300-extra install vpn-mihomo',
+                'wireguard\tmissing\tmu300-vpn engines install wireguard (apt-get install -y wireguard-tools)',
+                'openvpn\tmissing\tmu300-vpn engines install openvpn (apt-get install -y openvpn)'], r.stderr)
+            # no active profile: the status is the vpn extra's engines for the default type
+            self.assertEqual(r.returncode, 1)
+            self.assertIn('mu300-extra install vpn', r.stderr)
+            # the package command is this system's: apk on OpenWrt (where openvpn is openvpn-openssl), pacman
+            # without apt-get, and none at all is said
+            self.openwrt(); self.pkg('apk', 'apt-get')
+            lines = self.vpn(shell, 'engines').stdout.splitlines()
+            self.assertEqual(lines[4:], [
+                'wireguard\tmissing\tmu300-vpn engines install wireguard (apk add wireguard-tools)',
+                'openvpn\tmissing\tmu300-vpn engines install openvpn (apk add openvpn-openssl)'])
+            shutil.rmtree(self.sysroot); self.pkg('pacman')
+            lines = self.vpn(shell, 'engines').stdout.splitlines()
+            self.assertEqual(lines[4:], [
+                'wireguard\tmissing\tmu300-vpn engines install wireguard (pacman -S --noconfirm --needed wireguard-tools)',
+                'openvpn\tmissing\tmu300-vpn engines install openvpn (pacman -S --noconfirm --needed openvpn)'])
+            self.pkg()
+            lines = self.vpn(shell, 'engines').stdout.splitlines()
+            self.assertEqual(lines[4:], [
+                'wireguard\tmissing\tmu300-vpn engines install wireguard (no apk, apt-get or pacman here: wireguard-tools by hand)',
+                'openvpn\tmissing\tmu300-vpn engines install openvpn (no apk, apt-get or pacman here: openvpn by hand)'])
+
+    def test_every_engine_present_with_its_path(self):
+        for shell in self.each_shell():
+            self.fresh()
+            want = ['xray\tpresent\t' + self.engine('xray', 'vpn'),
+                    'hev-socks5-tunnel\tpresent\t' + self.engine('hev-socks5-tunnel', 'vpn'),
+                    'sing-box\tpresent\t' + self.engine('sing-box', 'vpn'),
+                    'mihomo\tpresent\t' + self.engine('mihomo', 'vpn-mihomo'),
+                    'wireguard\tpresent\t' + self.engine('wg', 'path'),
+                    'openvpn\tpresent\t' + self.engine('openvpn', 'path')]
+            r = self.vpn(shell, 'engines')
+            self.assertEqual(r.stdout.splitlines(), want, r.stderr)
+            self.assertEqual((r.returncode, r.stderr), (0, ''))
+            # an older image's own copy, and a package's on PATH, are found where the extra has none
+            shutil.rmtree(self.disk)
+            want = ['xray\tpresent\t' + self.engine('xray', 'opt'),
+                    'hev-socks5-tunnel\tpresent\t' + self.engine('hev-socks5-tunnel', 'path'),
+                    'sing-box\tpresent\t' + self.engine('sing-box', 'opt'),
+                    'mihomo\tpresent\t' + self.engine('mihomo', 'opt')]
+            r = self.vpn(shell, 'engines')
+            self.assertEqual(r.stdout.splitlines()[:4], want, r.stderr)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            # the settings naming other binaries: those are what is reported
+            r = self.vpn(shell, 'engines', MIHOMO=self.tmp / 'none', OPENVPN=self.tmp / 'none')
+            self.assertIn('mihomo\tmissing\tmu300-extra install vpn-mihomo', r.stdout.splitlines())
+            self.assertIn('openvpn\tmissing\tmu300-vpn engines install openvpn (apt-get install -y openvpn)',
+                          r.stdout.splitlines())
+
+    def test_wireguard_needs_the_kernel_too(self):
+        for shell in self.each_shell():
+            self.fresh()
+            wg = self.engine('wg', 'path')
+            self.kernel(False)
+            r = self.vpn(shell, 'engines')
+            self.assertIn('wireguard\tmissing\tmu300-vpn engines install wireguard (apt-get install -y wireguard-tools)',
+                          r.stdout.splitlines())
+            # the module directory alone says the kernel has it
+            (self.tmp / 'no-module').mkdir()
+            r = self.vpn(shell, 'engines')
+            (self.tmp / 'no-module').rmdir()
+            self.assertIn(f'wireguard\tpresent\t{wg}', r.stdout.splitlines())
+            self.kernel(True)
+            r = self.vpn(shell, 'engines')
+            self.assertIn(f'wireguard\tpresent\t{wg}', r.stdout.splitlines())
+
+    def test_exit_status_follows_the_active_profile(self):
+        for shell in self.each_shell():
+            self.fresh()
+            r = self.vpn(shell, 'profile', 'import', self.src, 'Wg')
+            self.assertEqual((r.returncode, r.stdout.strip()), (0, 'wg'), r.stderr)
+            self.assertEqual(self.vpn(shell, 'profile', 'use', 'wg').returncode, 0)
+            # the vpn extra's engines do not help a wireguard profile
+            for n in ('xray', 'hev-socks5-tunnel', 'sing-box'):
+                self.engine(n, 'vpn')
+            r = self.vpn(shell, 'engines')
+            self.assertEqual(r.returncode, 1, r.stdout)
+            self.assertEqual(len(r.stdout.splitlines()), 6)
+            self.assertIn('wireguard engine is not installed: run mu300-vpn engines install wireguard', r.stderr)
+            self.engine('wg', 'path')
+            self.kernel(False)
+            self.assertEqual(self.vpn(shell, 'engines').returncode, 1)
+            self.kernel(True)
+            r = self.vpn(shell, 'engines')
+            self.assertEqual((r.returncode, r.stderr), (0, ''), r.stdout)
+            # the lines are the same whatever the active profile; the loaded driver leaves no trace in them
+            state = [l.split('\t')[1] for l in r.stdout.splitlines()]
+            self.assertEqual(state, ['present', 'present', 'present', 'missing', 'present', 'missing'])
+            # no engines at all, no profile: as before profiles existed
+            self.fresh()
+            r = self.vpn(shell, 'engines')
+            self.assertEqual(r.returncode, 1)
+            for n in ('xray', 'hev-socks5-tunnel'):
+                self.engine(n, 'vpn')
+            self.assertEqual(self.vpn(shell, 'engines').returncode, 0)
+
+    def test_install_runs_the_extra_or_the_package_manager(self):
+        for shell in self.each_shell():
+            self.fresh()
+            for eng, extra in (('xray', 'vpn'), ('hev-socks5-tunnel', 'vpn'), ('sing-box', 'vpn'),
+                               ('mihomo', 'vpn-mihomo')):
+                (self.tmp / 'extra.log').unlink(missing_ok=True)
+                r = self.vpn(shell, 'engines', 'install', eng)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertEqual(self.extra_log(), [f'extra install {extra}'])
+            self.assertEqual(self.pkglog(), [])
+            # OpenWrt: apk, and openvpn's package carries the TLS library
+            self.openwrt(); self.pkg('apk', 'apt-get', 'pacman')
+            r = self.vpn(shell, 'engines', 'install', 'openvpn')
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(self.pkglog(), ['apk add openvpn-openssl'])
+            self.pkg('apk')
+            self.assertEqual(self.vpn(shell, 'engines', 'install', 'wireguard').returncode, 0)
+            self.assertEqual(self.pkglog(), ['apk add wireguard-tools'])
+            # Ubuntu: apt-get, its lists refreshed first
+            shutil.rmtree(self.sysroot); self.pkg('apt-get', 'pacman')
+            self.assertEqual(self.vpn(shell, 'engines', 'install', 'openvpn').returncode, 0)
+            self.assertEqual(self.pkglog(), ['apt-get update', 'apt-get install -y openvpn'])
+            # Arch: pacman
+            self.pkg('pacman')
+            self.assertEqual(self.vpn(shell, 'engines', 'install', 'wireguard').returncode, 0)
+            self.assertEqual(self.pkglog(), ['pacman -S --noconfirm --needed wireguard-tools'])
+            # a package manager that fails: so does the command
+            self.pkg('pacman')
+            r = self.vpn(shell, 'engines', 'install', 'openvpn', PKG_FAIL='3')
+            self.assertEqual(r.returncode, 3)
+            self.assertEqual(self.pkglog(), ['pacman -S --noconfirm --needed openvpn'])
+            # none: a message that names the package
+            self.pkg()
+            r = self.vpn(shell, 'engines', 'install', 'openvpn')
+            self.assertEqual(r.returncode, 1)
+            self.assertIn('openvpn', r.stderr)
+            self.assertEqual(r.stdout, '')
+            self.assertEqual(self.extra_log(), ['extra install vpn-mihomo'])
+
+    def test_install_takes_only_a_known_engine(self):
+        for shell in self.each_shell():
+            self.fresh()
+            for args in (('install', 'foo'), ('install',), ('install', 'openvpn', 'now'), ('list',),
+                         ('install', '../x'), ('install', 'vpn')):
+                r = self.vpn(shell, 'engines', *args)
+                self.assertEqual(r.returncode, 2, args)
+                self.assertIn('usage: mu300-vpn engines [install ', r.stderr)
+                self.assertEqual(r.stdout, '', args)
+            self.assertEqual(self.extra_log(), [])
+            self.assertEqual(self.pkglog(), [])

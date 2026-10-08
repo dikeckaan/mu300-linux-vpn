@@ -21,7 +21,8 @@
 #                       that prints a profile's credentials; add, import and edit read the link or the config
 #                       from stdin when it is given as -, which keeps it out of the process list)
 #   mu300-vpn settings [get [KEY] | set KEY VALUE]
-#   mu300-vpn engines   which engine programs it uses (the vpn extra: mu300-extra install vpn)
+#   mu300-vpn engines [install ENGINE]   every engine, one TSV line each: present and its path, or missing and
+#                       how to get it (the vpn or vpn-mihomo extra, or this system's package); install gets one
 set -e
 CONF=${MU300_VPN_CONF:-/etc/mu300/vpn.conf}
 RUN=${MU300_VPN_RUN:-/run/mu300-vpn}   # (MU300_VPN_RUN, MU300_LAN_CONF, MU300_BIN, MU300_LIB: for tests/)
@@ -473,6 +474,71 @@ ensure_engines() {
     fi
     engines_missing
     return 1
+}
+
+# ---- every engine: where it is, and how to get it (mu300-vpn engines) ------------------------------------------
+# WireGuard and OpenVPN are this system's packages: apk on OpenWrt (the release file under SYSROOT, which tests
+# point elsewhere), else apt-get (Ubuntu), else pacman (Arch). The package names differ only for openvpn, whose
+# OpenWrt package carries the TLS library.
+SYSROOT=${MU300_SYSROOT:-}
+pkg_name() { case $1 in openvpn) if [ -e "$SYSROOT/etc/openwrt_release" ]; then echo openvpn-openssl; else echo openvpn; fi ;;
+                        wireguard) echo wireguard-tools ;; esac; }
+# pkg_cmd PKG: the command that installs it here (stdout); none: a sentence instead, and 1
+pkg_cmd() {
+    if [ -e "$SYSROOT/etc/openwrt_release" ]; then echo "apk add $1"
+    elif command -v apt-get >/dev/null 2>&1; then echo "apt-get install -y $1"
+    elif command -v pacman >/dev/null 2>&1; then echo "pacman -S --noconfirm --needed $1"
+    else echo "no apk, apt-get or pacman here: $1 by hand"; return 1; fi
+}
+# pkg_install PKG: by this system's package manager (an apt-get refreshes its lists first); the manager's own
+# status, or 1 with a message naming the package where there is none
+pkg_install() {
+    _pm=$(pkg_cmd "$1") || { echo "cannot install $1: $_pm" >&2; return 1; }
+    case $_pm in
+        "apk "*) apk add "$1" ;;
+        "apt-get "*) apt-get update && apt-get install -y "$1" ;;
+        *) pacman -S --noconfirm --needed "$1" ;;
+    esac
+}
+# engine_line NAME PATH HOW: the TSV line of one engine (present iff PATH is executable)
+engine_line() {
+    if [ -x "$2" ]; then printf '%s\tpresent\t%s\n' "$1" "$2"; else printf '%s\tmissing\t%s\n' "$1" "$3"; fi
+}
+# engines_list: one line per engine, in a fixed order. The drivers of the package engines are loaded in subshells
+# for their paths (the OPENVPN and MIHOMO settings count) and, for wireguard, the kernel probe: whatever driver
+# the caller has loaded stays as it is. A driver that cannot be loaded (a damaged library) leaves its engine
+# missing.
+engines_list() {
+    engine_line xray "$XRAY" "mu300-extra install vpn"
+    engine_line hev-socks5-tunnel "$HEV" "mu300-extra install vpn"
+    engine_line sing-box "$BIN" "mu300-extra install vpn"
+    _mh=$( (load_driver mihomo >/dev/null 2>&1 && drv_engines) ) || _mh=
+    engine_line mihomo "$_mh" "mu300-extra install vpn-mihomo"
+    _how=$(pkg_cmd "$(pkg_name wireguard)") || true
+    _wg=$( (load_driver wireguard >/dev/null 2>&1 && drv_engines_ok && drv_engines) ) || _wg=
+    engine_line wireguard "$_wg" "mu300-vpn engines install wireguard ($_how)"
+    _how=$(pkg_cmd "$(pkg_name openvpn)") || true
+    _ov=$( (load_driver openvpn >/dev/null 2>&1 && drv_engines) ) || _ov=
+    engine_line openvpn "$_ov" "mu300-vpn engines install openvpn ($_how)"
+}
+engines_usage() { echo "usage: mu300-vpn engines [install xray|hev-socks5-tunnel|sing-box|mihomo|wireguard|openvpn]" >&2; exit 2; }
+# engines [install ENGINE]: the list, with the status of the active profile's engines (no profile: the vpn
+# extra's for ENGINE); install: the extra that carries it, or its package
+engines_cmd() {
+    if [ "${1:-}" = install ]; then
+        [ $# -eq 2 ] || engines_usage
+        case $2 in
+            xray|hev-socks5-tunnel|sing-box) "$EXTRA_CMD" install vpn || exit $? ;;
+            mihomo) "$EXTRA_CMD" install vpn-mihomo || exit $? ;;
+            openvpn|wireguard) pkg_install "$(pkg_name "$2")" || exit $? ;;
+            *) engines_usage ;;
+        esac
+        return 0
+    fi
+    [ $# -eq 0 ] || engines_usage
+    engines_list
+    if [ -n "$PTYPE" ]; then load_driver "$PTYPE" || exit 1; fi
+    drv_engines_ok || { engines_missing; exit 1; }
 }
 
 # ---- the download window --------------------------------------------------------------------------------------
@@ -1320,8 +1386,6 @@ case "${1:-status}" in
     status) vpn_status ;;
     profile) shift; profile_cmd "$@" ;;
     settings) shift; settings_cmd "$@" ;;
-    engines)
-        for e in "$XRAY" "$HEV" "$BIN"; do printf '%s %s\n' "$e" "$([ -x "$e" ] && echo ok || echo missing)"; done
-        engines_ok || { echo "$MISSING" >&2; exit 1; } ;;
-    *) echo "usage: $0 on|off|restart|status|profile ...|settings ...|engines|check [ID]|gen|run|guard" >&2; exit 2 ;;
+    engines) shift; engines_cmd "$@" ;;
+    *) echo "usage: $0 on|off|restart|status|profile ...|settings ...|engines [install ENGINE]|check [ID]|gen|run|guard" >&2; exit 2 ;;
 esac
