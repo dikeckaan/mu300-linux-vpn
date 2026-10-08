@@ -173,7 +173,11 @@ gen_xray() {
 #   to an address of the config's choosing. sockopt and sendThrough are removed wherever they sit: they bind to an
 #   interface or an address, or set a mark, and the mark is ours. Every outbound gets sockopt {"mark": 720}, and the
 #   dialerProxy its sockopt had, which only chains it through another of the config's outbounds. A WireGuard
-#   outbound gets noKernelTun, or it would make an interface and ip rules of its own.
+#   outbound gets noKernelTun, or it would make an interface and ip rules of its own. Xray dials again from inside
+#   an outbound (xhttp's downloadSettings is a stream configuration of its own, and a streamSettings can sit deeper
+#   still), and those dialers lose their sockopt like the rest, so each of them gets {"mark": 720} too: otherwise
+#   that connection would leave unmarked and be dropped by the kill switch, or worse, be routed by it. A network of
+#   domainsocket (or ds) and dsSettings dial a unix socket of the config's choosing, so they refuse the config.
 # - proxySettings.tag, dialerProxy and every routing rule's outboundTag name an outbound the config has. A dns.servers
 #   entry is a string, or an object reduced to the keys in XRAY_JSON_DNS_KEYS.
 # - No key from JSON_DENY anywhere in what is kept, and no key spelled differently from a name the checks read
@@ -187,7 +191,7 @@ XRAY_JSON_PROTOCOLS='vless vmess trojan shadowsocks socks http wireguard hysteri
 # refused protocols a refusal names; any other is "a protocol it does not know" (a value is never printed)
 XRAY_JSON_KNOWN='dokodemo-door loopback tun mtproto'
 XRAY_JSON_DNS_KEYS='address port domains expectIPs skipFallback clientIP queryStrategy tag timeoutMs'
-XRAY_JSON_NAMES='protocol tag settings streamSettings proxySettings dialerProxy vnext servers address outboundTag noKernelTun security tlsSettings realitySettings serverName rules'
+XRAY_JSON_NAMES='network downloadSettings protocol tag settings streamSettings proxySettings dialerProxy vnext servers address outboundTag noKernelTun security tlsSettings realitySettings serverName rules'
 XRAY_JSON_REBUILD='
 ($keep | split(" ")) as $keep | ($drop | split(" ")) as $drop | ($deny | split(" ") + ["reverse"]) as $deny
 | ($protos | split(" ")) as $protos | ($known | split(" ")) as $known | ($dnskeys | split(" ")) as $dnskeys
@@ -201,6 +205,7 @@ XRAY_JSON_REBUILD='
     if type != "object" then . else
       ((.streamSettings | objects | .sockopt | objects | .dialerProxy) // null) as $dp
       | mu_strip(["sockopt", "sendthrough"])
+      | mu_marks($mark)
       | if (.protocol | mu_type) == "wireguard" then .settings.noKernelTun = true else . end
       | .streamSettings.sockopt = ({"mark": $mark} + (if $dp != null then {"dialerProxy": $dp} else {} end))
     end) else . end
@@ -219,6 +224,8 @@ XRAY_JSON_REBUILD='
                   else "an outbound protocol it does not know" end end]
    + [$b | mu_keys_in($deny)[] | "key " + .]
    + [$b | mu_misspelled($names)[] | "a key spelled differently from " + .]
+   + (if [$b | .. | objects | .network | strings | mu_fold | select(. == "domainsocket" or . == "ds")] | length > 0
+      then ["network domainsocket"] else [] end)
    + [$outs[] | objects | (.proxySettings | objects | .tag), .streamSettings.sockopt.dialerProxy
       | select(. != null and (known_tag | not)) | "proxySettings or dialerProxy naming an outbound it does not have"]
    + [$b.routing | objects | .rules | arrays | .[] | objects | .outboundTag

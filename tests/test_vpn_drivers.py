@@ -1271,6 +1271,89 @@ class RawJson(ShellTest):
         self.xray.write_text(self.json.dumps(XRAY_RAW))
         self.sb.write_text(self.json.dumps(SING_BOX_RAW))
 
+    def test_key_log_and_key_files_are_refused(self):
+        # An engine run as root must not write a file of the config's choosing (the TLS key log) or read a key from a
+        # path of its choosing: panels put keys inline.
+        def xout(**stream):
+            o = dict(XRAY_RAW['outbounds'][0])
+            o['streamSettings'] = dict(o['streamSettings'], **stream)
+            return dict(XRAY_RAW, outbounds=[o, XRAY_RAW['outbounds'][1]])
+        def sout(**extra):
+            return dict(SING_BOX_RAW, outbounds=[dict(SING_BOX_RAW['outbounds'][0], **extra),
+                                                 SING_BOX_RAW['outbounds'][1]])
+        for shell in self.each_shell():
+            self.refused(shell, self.xray, xout(tlsSettings={"masterKeyLog": "/tmp/keys"}), 'masterkeylog')
+            self.refused(shell, self.xray, xout(security="reality", realitySettings={"MasterKeyLog": "/tmp/keys"}),
+                         'masterkeylog')
+            self.refused(shell, self.xray, xout(tlsSettings={"certificates": [{"keyFile": "/etc/k", "usage": "x"}]}),
+                         'keyfile')
+            self.refused(shell, self.xray, xout(tlsSettings={"certificates": [{"certificateFile": "/etc/c"}]}),
+                         'certificatefile')
+            self.refused(shell, self.sb, sout(tls={"enabled": True, "client_key_path": "/etc/k"}), 'client_key_path')
+            self.refused(shell, self.sb, sout(tls={"enabled": True, "ech": {"private_key_path": "/etc/k"}}),
+                         'private_key_path')
+            r = self.refused(shell, self.xray, xout(tlsSettings={"masterKeyLog": "/tmp/SECRETPATH"}))
+            self.assertNotIn('SECRETPATH', r.stderr)
+        self.xray.write_text(self.json.dumps(XRAY_RAW))
+        self.sb.write_text(self.json.dumps(SING_BOX_RAW))
+
+    def test_a_unix_socket_dialer_is_refused(self):
+        def xout(**stream):
+            o = dict(XRAY_RAW['outbounds'][0])
+            o['streamSettings'] = dict(o['streamSettings'], **stream)
+            return dict(XRAY_RAW, outbounds=[o, XRAY_RAW['outbounds'][1]])
+        for shell in self.each_shell():
+            self.refused(shell, self.xray, xout(network="domainsocket"), 'domainsocket')
+            self.refused(shell, self.xray, xout(network="DomainSocket"), 'domainsocket')
+            self.refused(shell, self.xray, xout(network="ds"), 'domainsocket')
+            self.refused(shell, self.xray, xout(dsSettings={"path": "/run/x.sock"}), 'dssettings')
+            # a transport that is not a socket is still fine
+            self.fresh()
+            self.xray.write_text(self.json.dumps(xout(network="ws")))
+            self.assertEqual(self.cli(shell, 'profile', 'import', self.xray, 'Raw').returncode, 0)
+        self.xray.write_text(self.json.dumps(XRAY_RAW))
+
+    def test_every_nested_dialer_carries_the_mark(self):
+        out = dict(XRAY_RAW['outbounds'][0])
+        out['streamSettings'] = {"network": "xhttp", "security": "tls", "xhttpSettings": {"path": "/x", "extra": {
+            "downloadSettings": {"address": "srv.example", "port": 443, "network": "xhttp",
+                                 "sockopt": {"interface": "wlan0"}, "security": "tls",
+                                 "streamSettings": {"sockopt": {"mark": 1, "interface": "wlan0"}}}}}}
+        raw = dict(XRAY_RAW, outbounds=[out, XRAY_RAW['outbounds'][1]])
+        for shell in self.each_shell():
+            self.fresh()
+            self.xray.write_text(self.json.dumps(raw))
+            self.assertEqual(self.cli(shell, 'profile', 'import', self.xray, 'Raw').returncode, 0)
+            r = self.gen(shell, 'raw')
+            self.assertEqual(r.returncode, 0, r.stderr)
+            cfg = self.json.loads((self.tmp / 'run/xray.json').read_text())
+            ss = cfg['outbounds'][0]['streamSettings']
+            self.assertEqual(ss['sockopt'], {"mark": 720})
+            dl = ss['xhttpSettings']['extra']['downloadSettings']
+            self.assertEqual(dl['sockopt'], {"mark": 720})
+            self.assertEqual(dl['streamSettings']['sockopt'], {"mark": 720})
+            self.assertNotIn('wlan0', (self.tmp / 'run/xray.json').read_text())
+            # DownloadSettings (any other spelling) would be read by Xray, not by the mark: refused
+            bad = self.json.loads(self.json.dumps(raw))
+            x = bad['outbounds'][0]['streamSettings']['xhttpSettings']['extra']
+            x['DownloadSettings'] = x.pop('downloadSettings')
+            self.refused(shell, self.xray, bad, 'downloadSettings')
+        self.xray.write_text(self.json.dumps(XRAY_RAW))
+
+    def test_the_size_cap_comes_before_any_full_read(self):
+        # A file over 1 MiB is refused by the cap before the sniff or is_json reads it whole: the cap is the first
+        # thing either runs, so a function that reads the file would show up in a stub that fails when called.
+        big = self.tmp / 'big.json'
+        big.write_text('{"outbounds": [], "pad": "' + 'x' * (1 << 20) + '"}')
+        for shell in self.each_shell():
+            self.fresh()
+            r = self.cli(shell, 'profile', 'import', big)
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn('1 MiB', r.stderr)
+            r = self.lib(shell, f'. "{LIB}/uri.sh" 2>/dev/null; tr() {{ echo TR-RAN; }}; is_json "{big}" || echo no')
+            self.assertEqual(r.stdout.strip(), 'no', r.stderr)
+            self.assertNotIn('TR-RAN', r.stdout)
+
     def test_tags_must_be_the_configs_own(self):
         sb_out = SING_BOX_RAW['outbounds']
         xr_out = XRAY_RAW['outbounds']

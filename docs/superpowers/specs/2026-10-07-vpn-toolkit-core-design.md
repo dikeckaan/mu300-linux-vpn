@@ -256,7 +256,7 @@ Per system, at every start of `mu300-vpn` (any command), idempotent, and only wh
   a config is held to an allowlist of what it may contain, never a denylist, because each engine release adds
   features (some of which listen) faster than a denylist would follow.
 * **Parsed once, strictly; the engine reads only what we built.** `json_strict` refuses, before anything else reads
-  the file: more than 1 MiB (checked before jq sees it); anything that is not exactly one JSON object (comments,
+  the file: more than 1 MiB (checked before jq sees it, and before import sniffing reads it); anything that is not exactly one JSON object (comments,
   trailing commas, a second document, a top level that is not an object); `nan`/`infinity`, which jq accepts; the
   same key twice in one object (jq keeps the last silently: its `--stream` event count of the file is then larger
   than that of what it kept); and two keys of one object that are equal under Go's case folding (`"type"` and
@@ -278,8 +278,15 @@ Per system, at every start of `mu300-vpn` (any command), idempotent, and only wh
   closed.
 * **Refused at any depth** of what is kept (folded): `listen`, `listen_port`, `external_controller`,
   `executable_path`, `data_directory`, `torrc`, `extra_args`, `redirect` (Xray's freedom), `override_address`,
-  `override_port` (sing-box's direct and route options), and for Xray `reverse`. Also refused: a key spelled
+  `override_port` (sing-box's direct and route options), and for Xray `reverse`. Also refused: `masterKeyLog`
+  (Xray's `tlsSettings` and `realitySettings`: the engine would write the TLS session keys to a file, as root);
+  `private_key_path` and `client_key_path` (sing-box) and `keyFile` and `certificateFile` (Xray's `certificates`),
+  because they read a key from a path of the config's choosing and panels put keys inline; and Xray's unix-socket
+  transport (`dsSettings`, and a `network` of `domainsocket` or `ds`). Also refused: a key spelled
   differently from a field name the checks read (a lone `"Protocol"` is the protocol to Xray, but not to the checks).
+  The case-folding and misspelling checks look at every object, data maps included (HTTP `headers`, Xray's
+  `dns.hosts`), so a config whose header names differ only in case, or that has a `"Network"` key where `network`
+  is read, is refused for it; a panel that emits such a map has to change it.
   `path` is not refused: a transport's path (ws, httpupgrade, xhttp) is a URL path, a local rule set's path is a
   file sing-box reads, and no type the allowlists accept writes a file (`cache_file` goes with `experimental`).
 * **What a raw config may do:** pick its outbounds and the servers they reach, route between them with its own
@@ -287,8 +294,10 @@ Per system, at every start of `mu300-vpn` (any command), idempotent, and only wh
   server whose detour is one) sends traffic out of the tunnel onto the uplink with the engine's mark, past the kill
   switch. Split tunnelling is the config's own choice, and the kill switch does not override it; a user who wants
   everything through the tunnel imports a config that routes everything through the tunnel. A config can also name
-  files the engine reads (sing-box local rule sets, certificate paths), which parse or fail; it can name no file
-  the engine writes. Every reference between its parts must name something it has: a route rule's outbound, a
+  files the engine reads, which parse or fail: `certificate_path`, an ECH `config_path`, a `hosts` server's `path`,
+  a local rule set's `path` (sing-box), and `ext:` geo files (Xray). That is a documented exposure, not a refusal:
+  none of them is a key, and the engine does not show what it read. Key files are not on this list: they are
+  refused (above). It can name no file the engine writes. Every reference between its parts must name something it has: a route rule's outbound, a
   detour, a dialer proxy to an unknown tag refuses the config.
 * **xray raw JSON.**
   * Top level: kept as the config has them: `outbounds`, `routing`, `dns`, `fakedns`, `observatory`,
@@ -304,7 +313,9 @@ Per system, at every start of `mu300-vpn` (any command), idempotent, and only wh
   * Stripped anywhere in an outbound: `sockopt` and `sendThrough` (they bind to an interface or address, or set a
     mark). The rebuild writes `streamSettings.sockopt = {"mark":720}`, plus the `dialerProxy` the config had, which
     only chains through another of its outbounds. A `wireguard` outbound gets `settings.noKernelTun = true`, so it
-    makes no interface or ip rules of its own. Server names in `vnext`/`servers` are resolved by the core.
+    makes no interface or ip rules of its own. Xray also dials from inside an outbound (xhttp's
+    `downloadSettings` is a stream configuration of its own, and a `streamSettings` can sit deeper): each of those
+    gets `sockopt = {"mark":720}` too, or that connection would leave unmarked. Server names in `vnext`/`servers` are resolved by the core.
   * `proxySettings.tag`, `dialerProxy` and every routing rule's `outboundTag` must name an outbound of the config.
   * `dns.servers`: a string, or an object reduced to `address`, `port`, `domains`, `expectIPs`, `skipFallback`,
     `clientIP`, `queryStrategy`, `tag`, `timeoutMs`.

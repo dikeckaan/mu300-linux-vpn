@@ -186,7 +186,9 @@ link_import() {
 }
 # is_json FILE: the file's first character that is not white space is "{" (a JSON config rather than a link or
 # some other kind of file)
-is_json() { [ -f "$1" ] && [ -r "$1" ] && [ "$(tr -d ' \t\r\n' < "$1" | cut -c1)" = '{' ]; }
+# The size is checked first: the sniff reads the whole file, and nothing may read a file before the cap has said
+# it is small enough.
+is_json() { [ -f "$1" ] && [ -r "$1" ] && json_size_ok "$1" && [ "$(tr -d ' \t\r\n' < "$1" | cut -c1)" = '{' ]; }
 
 # ---- raw JSON configs: hostile input --------------------------------------------------------------------------
 # A raw Xray or sing-box config comes from a user, a panel or a subscription, and the engine runs it as root. It is
@@ -213,13 +215,21 @@ def mu_keys_in($l): [.. | objects | keys_unsorted[] | mu_fold | select(mu_in($l)
 def mu_misspelled($l): [.. | objects | keys_unsorted[] | . as $k | mu_fold as $f
                         | $l[] | select(mu_fold == $f and . != $k)] | unique;
 def mu_type: if type == "string" then mu_fold else "" end;
+def mu_marks($m): if type == "object"
+                  then with_entries(.value |= mu_marks($m))
+                       | if (.streamSettings | type) == "object" then .streamSettings.sockopt = {"mark": $m} else . end
+                       | if (.downloadSettings | type) == "object" then .downloadSettings.sockopt = {"mark": $m} else . end
+                  elif type == "array" then map(mu_marks($m)) else . end;
 '
 # Keys no raw config may have anywhere in what is kept of it, compared folded. listen, listen_port and
 # external_controller open ports; executable_path, data_directory, torrc and extra_args start programs or name
 # directories the engine writes; redirect (Xray's freedom) and override_address/override_port (sing-box's direct and
-# route options) send a connection somewhere other than where the config's own routing says. A refusal names the
-# key from this list, never the value.
-JSON_DENY='listen listen_port external_controller executable_path data_directory torrc extra_args redirect override_address override_port'
+# route options) send a connection somewhere other than where the config's own routing says. masterkeylog (Xray's
+# tlsSettings and realitySettings) makes the engine write the TLS session keys to a file, as root. private_key_path
+# and client_key_path (sing-box), keyfile and certificatefile (Xray's certificates) read a key from a path of the
+# config's choosing: panels put keys inline, so a path is refused. dssettings is Xray's unix-socket transport. A
+# refusal names the key from this list, never the value.
+JSON_DENY='listen listen_port external_controller executable_path data_directory torrc extra_args redirect override_address override_port masterkeylog private_key_path client_key_path keyfile certificatefile dssettings'
 
 # json_size_ok FILE: at most 1 MiB, checked before jq reads the file at all
 json_size_ok() {
