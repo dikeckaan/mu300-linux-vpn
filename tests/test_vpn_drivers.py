@@ -2642,3 +2642,653 @@ keepalive 10 60
             self.assertIn('cannot resolve the VPN server nx.example', r.stderr)
             self.assertEqual(self.ev.read_text().splitlines(), ['nft -f', 'getent nx.example', 'nft -f'])
             self.assertFalse((self.run_dir / 'openvpn.conf').exists())
+
+
+# a Clash/mihomo YAML as subscriptions give them: ports, a LAN listener, a controller with a secret, its own tun and
+# dns, then the proxies and rules; only the last two survive the driver's reduction
+MH_CONF = '''port: 7890
+allow-lan: true
+external-controller: 0.0.0.0:9090
+secret: s
+tun:
+  enable: true
+  auto-route: true
+dns:
+  enhanced-mode: fake-ip
+proxies:
+  - {name: a, type: ss, server: ss.example, port: 8388, cipher: aes-256-gcm, password: hunter2}
+rules:
+  - MATCH,a
+'''
+MH_OURS = ('routing-mark', 'allow-lan', 'bind-address', 'tun', 'dns')
+
+
+class Mihomo(ShellTest):
+    """The mihomo driver: the YAML is reduced to the top-level keys the spec allows (awk, no YAML parser), ours
+    (routing-mark, allow-lan, bind-address, tun, dns, the controller) are appended, interface-name and routing-mark
+    go from every proxy and group, mihomo checks and runs only the file we wrote, and no secret is printed."""
+
+    def setUp(self):
+        super().setUp()
+        self.conf = self.tmp / 'vpn.conf'
+        self.conf.write_text('ENABLE=0\nKILL_SWITCH=0\n')
+        self.store = self.tmp / 'vpn'
+        self.run_dir = self.tmp / 'run'
+        self.home = self.store / 'cache/mihomo'
+        self.ev = self.tmp / 'events'
+        # "link show mh-mu300" finds the tunnel once the stub mihomo has been started (not with -t)
+        self.stub('ip', 'echo "$*" >> "$STUBLOG/ip.log"\n'
+                        'case "$*" in\n'
+                        '  "link show mh-mu300") [ -e "$STUBLOG/mh-up" ]; exit ;;\n'
+                        '  "link show"*) exit 1 ;;\n'
+                        'esac; exit 0')
+        self.stub('svc', 'exit 0')
+        self.stub('nft', 'case "$1" in -f) cat >/dev/null; echo "nft -f" >> "$STUBLOG/events" ;; esac; exit 0')
+        self.mihomo_stub()
+        self.src = self.tmp / 'sub.yaml'
+        self.src.write_text(MH_CONF)
+
+    def mihomo_stub(self, body=None):
+        # -t records its arguments and passes; a run records them too, makes the tunnel appear and stays
+        self.stub('mihomo', body or (
+            'case " $* " in *" -t "*) printf "%s\\n" "$@" > "$STUBLOG/mihomo.t.args"; exit 0 ;; esac\n'
+            'printf "%s\\n" "$@" > "$STUBLOG/mihomo.args"\n'
+            'env | grep "^SAFE_PATHS=\\|^SKIP_SAFE_PATH_CHECK=" > "$STUBLOG/mihomo.env"\n'
+            ': > "$STUBLOG/mh-up"\n'
+            'exec sleep 60'))
+
+    def env(self, **extra):
+        base = dict(MU300_VPN_CONF=self.conf, MU300_VPN_RUN=self.run_dir, MU300_VPN_LIB=LIB,
+                    MU300_LAN_CONF=self.tmp / 'no', MU300_BIN=BIN, MU300_OPT=self.tmp / 'opt',
+                    MU300_DISK=self.tmp / 'disk', MU300_VPN_SVC=self.stubs / 'svc',
+                    SAFE_PATHS='/tmp', SKIP_SAFE_PATH_CHECK='1')
+        base.update(extra)
+        return super().env(**base)
+
+    def lib(self, shell, code, stdin=None):
+        return self.sh(shell, f'. "{BIN}/mu300-vpn"; {code}', stdin=stdin, MU300_LIB=1)
+
+    def cli(self, shell, *args, stdin=None):
+        return self.script(shell, BIN / 'mu300-vpn', *args, stdin=stdin)
+
+    def fresh(self):
+        shutil.rmtree(self.store, ignore_errors=True)
+        shutil.rmtree(self.run_dir, ignore_errors=True)
+        for p in ('events', 'ip.log', 'mihomo.args', 'mihomo.t.args', 'mihomo.env', 'mh-up'):
+            (self.tmp / p).unlink(missing_ok=True)
+
+    def setup_profile(self, shell, text=MH_CONF):
+        self.fresh()
+        if isinstance(text, bytes):
+            self.src.write_bytes(text)
+        else:
+            self.src.write_text(text)
+        r = self.cli(shell, 'profile', 'import', self.src, 'Sub')
+        self.assertEqual((r.returncode, r.stdout.strip()), (0, 'sub'), r.stderr)
+
+    def run_lib(self, shell, code, pre='', stdin=None):
+        return self.lib(shell, f'{pre}profile_load sub; load_driver "$PTYPE"; {code}', stdin=stdin)
+
+    def no_secrets(self, r, name=None):
+        for secret in ('hunter2', 'ss.example', 'aes-256-gcm', '0.0.0.0:9090', 'secret: s', 'eth0'):
+            self.assertNotIn(secret, r.stdout + r.stderr, name)
+
+    def refused(self, shell, text, msg=None, name=None):
+        """imports TEXT, which must be refused (with MSG in the message), leaving no profile and no secret said"""
+        self.fresh()
+        if isinstance(text, bytes):
+            self.src.write_bytes(text)
+        else:
+            self.src.write_text(text)
+        r = self.cli(shell, 'profile', 'add', 'mihomo', 'X', self.src)
+        self.assertNotEqual(r.returncode, 0, name or text)
+        if msg:
+            self.assertIn(msg, r.stderr, name or text)
+        self.no_secrets(r, name or text)
+        profiles = self.store / 'profiles'
+        self.assertEqual(list(profiles.iterdir()) if profiles.exists() else [], [], name or text)
+        return r
+
+    def gen(self, shell, pre=''):
+        r = self.run_lib(shell, 'drv_gen', pre)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.no_secrets(r)
+        return (self.run_dir / 'mihomo.yaml').read_text()
+
+    @staticmethod
+    def top_keys(text):
+        """the column-0 keys of a generated file, in order"""
+        return [l.split(':')[0] for l in text.splitlines() if l and l[0] not in ' \t#']
+
+    @staticmethod
+    def block(text, key):
+        """the lines of the top-level KEY block (the key line and what is indented under it)"""
+        out, inside = [], False
+        for l in text.splitlines():
+            if l.startswith(key + ':'):
+                inside = True
+            elif l and l[0] not in ' \t#':
+                inside = False
+            if inside:
+                out.append(l)
+        return out
+
+    def test_import_sniffs_and_stores_0600(self):
+        for shell in self.each_shell():
+            self.setup_profile(shell)
+            pdir = self.store / 'profiles/sub'
+            self.assertIn("TYPE='mihomo'", (pdir / 'meta').read_text())
+            self.assertEqual(stat.S_IMODE((pdir / 'config.yaml').stat().st_mode), 0o600)
+            self.assertEqual((pdir / 'config.yaml').read_text(), MH_CONF)
+            self.assertEqual(self.cli(shell, 'profile', 'export', 'sub').stdout, MH_CONF)
+            r = self.cli(shell, 'profile', 'list')
+            self.assertIn('\tsub\tmihomo\tSub', r.stdout)
+            r = self.cli(shell, 'check', 'sub')
+            self.assertEqual((r.returncode, r.stdout.strip()), (0, 'profile sub: OK'), r.stderr)
+            self.no_secrets(r)
+            # the check names the top-level keys it does not use, nothing else of the file
+            for k in ('port', 'allow-lan', 'external-controller', 'secret', 'tun', 'dns'):
+                self.assertIn(f' {k}', r.stderr)
+            # nothing for the profile is left in its directory by the check, and the check ran without mihomo
+            self.assertEqual(sorted(p.name for p in pdir.iterdir()), ['config.yaml', 'meta'])
+            self.assertFalse((self.tmp / 'mihomo.t.args').exists())
+            # from stdin, and with the type given
+            self.fresh()
+            r = self.cli(shell, 'profile', 'import', '-', 'Low', stdin=MH_CONF)
+            self.assertEqual((r.returncode, r.stdout.strip()), (0, 'low'), r.stderr)
+            self.fresh()
+            r = self.cli(shell, 'profile', 'add', 'mihomo', 'Two', self.src)
+            self.assertEqual((r.returncode, r.stdout.strip()), (0, 'two'), r.stderr)
+            # a file with proxy-providers and no proxies is a mihomo config too
+            self.fresh()
+            self.src.write_text('proxy-providers:\n  p:\n    type: http\n    url: https://sub.example/x\n    path: ./p.yaml\n'
+                                'proxy-groups:\n  - {name: g, type: select, use: [p]}\nrules:\n  - MATCH,g\n')
+            r = self.cli(shell, 'profile', 'import', self.src, 'Prov')
+            self.assertEqual((r.returncode, r.stdout.strip()), (0, 'prov'), r.stderr)
+            # not a mihomo config: JSON, a file with neither, a WireGuard file given the type
+            self.refused(shell, '{"proxies": [], "rules": []}', 'not a mihomo config')
+            self.refused(shell, 'mode: rule\nrules:\n  - MATCH,DIRECT\n', 'no proxies or proxy-providers')
+            self.refused(shell, '[Interface]\nPrivateKey = x\n', None)
+
+    def test_gen_reduces_the_config(self):
+        for shell in self.each_shell():
+            self.setup_profile(shell)
+            gen = self.gen(shell)
+            self.assertEqual(stat.S_IMODE((self.run_dir / 'mihomo.yaml').stat().st_mode), 0o600)
+            # the kept blocks as they were, then ours; nothing else at the top level
+            self.assertEqual(self.top_keys(gen), ['proxies', 'rules'] + list(MH_OURS))
+            self.assertEqual(self.block(gen, 'proxies'),
+                             ['proxies:', '  - {name: a, type: ss, server: ss.example, port: 8388, cipher: aes-256-gcm, password: hunter2}'])
+            self.assertEqual(self.block(gen, 'rules'), ['rules:', '  - MATCH,a'])
+            for gone in ('port: 7890', 'external-controller', 'secret', 'allow-lan: true', 'auto-route: true',
+                         'fake-ip', '0.0.0.0'):
+                self.assertNotIn(gone, gen)
+            lines = gen.splitlines()
+            self.assertEqual(lines.count('tun:'), 1)
+            self.assertEqual(lines.count('dns:'), 1)
+            self.assertIn('routing-mark: 720', lines)
+            self.assertIn('allow-lan: false', lines)
+            self.assertIn("bind-address: '127.0.0.1'", lines)
+            self.assertEqual(self.block(gen, 'tun'),
+                             ['tun:', '  enable: true', '  device: mh-mu300', '  stack: gvisor', '  auto-route: false',
+                              '  auto-redirect: false', '  auto-detect-interface: false', '  dns-hijack: []',
+                              '  mtu: 1400', '  inet4-address: [198.18.8.1/30]'])
+            self.assertEqual(self.block(gen, 'dns'),
+                             ['dns:', '  enable: true', '  ipv6: false', '  respect-rules: true',
+                              "  default-nameserver: ['1.1.1.1']", "  proxy-server-nameserver: ['1.1.1.1']",
+                              "  nameserver: ['1.1.1.1']"])
+            # mihomo checked the written file, from its home under the store, and nothing else
+            t = (self.tmp / 'mihomo.t.args').read_text().splitlines()
+            self.assertEqual(t, ['-t', '-d', str(self.home), '-f', str(self.run_dir / 'mihomo.yaml')])
+            self.assertEqual(stat.S_IMODE(self.home.stat().st_mode), 0o700)
+            self.assertFalse((self.tmp / 'mihomo.args').exists())
+            # no server address to keep off the tunnel: mihomo marks its own sockets
+            self.assertEqual((self.run_dir / 'server-ip').read_text(), '')
+            # the settings go in: the resolvers, and the controller only when set
+            r = self.cli(shell, 'settings', 'set', 'REMOTE_DNS', '9.9.9.9')
+            self.assertEqual(r.returncode, 0, r.stderr)
+            r = self.cli(shell, 'settings', 'set', 'BOOTSTRAP_DNS', '8.8.8.8')
+            self.assertEqual(r.returncode, 0, r.stderr)
+            gen = self.gen(shell)
+            self.assertIn("  nameserver: ['9.9.9.9']", gen.splitlines())
+            self.assertIn("  default-nameserver: ['8.8.8.8']", gen.splitlines())
+            self.assertIn("  proxy-server-nameserver: ['8.8.8.8']", gen.splitlines())
+            self.assertNotIn('external-controller', gen)
+            r = self.cli(shell, 'settings', 'set', 'MIHOMO_CONTROLLER', '127.0.0.1:9090')
+            self.assertEqual(r.returncode, 0, r.stderr)
+            gen = self.gen(shell)
+            self.assertIn("external-controller: '127.0.0.1:9090'", gen.splitlines())
+            self.assertEqual(self.top_keys(gen), ['proxies', 'rules'] + list(MH_OURS) + ['external-controller'])
+            self.assertEqual(gen.count('external-controller'), 1)
+            # a controller that is not loopback (a legacy vpn.conf could say anything) is not written
+            r = self.run_lib(shell, 'drv_gen', 'MIHOMO_CONTROLLER=0.0.0.0:9090; ')
+            self.assertNotEqual(r.returncode, 0)
+            self.assertNotIn('0.0.0.0', r.stdout + r.stderr)
+            self.assertFalse((self.run_dir / 'mihomo.yaml').exists())
+            # a mihomo that rejects the file fails the gen, without repeating what mihomo said
+            self.mihomo_stub('echo "yaml: cannot unmarshal !!str hunter2" >&2; exit 1')
+            r = self.run_lib(shell, 'drv_gen')
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn('mihomo -t', r.stderr)
+            self.no_secrets(r)
+            self.mihomo_stub()
+
+    def test_stack_option(self):
+        for shell in self.each_shell():
+            self.setup_profile(shell)
+            meta = self.store / 'profiles/sub/meta'
+            for v in ('system', 'mixed', 'gvisor'):
+                r = self.cli(shell, 'profile', 'set', 'sub', 'MIHOMO_STACK', v)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertIn(f"MIHOMO_STACK='{v}'", meta.read_text())
+                self.assertIn(f'  stack: {v}', self.gen(shell).splitlines())
+            r = self.cli(shell, 'profile', 'set', 'sub', 'MIHOMO_STACK', 'x')
+            self.assertEqual(r.returncode, 2)
+            self.assertIn("MIHOMO_STACK='gvisor'", meta.read_text())
+            r = self.cli(shell, 'profile', 'set', 'sub', 'MIHOMO_STACK', '')
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertNotIn('MIHOMO_STACK', meta.read_text())
+            self.assertIn('  stack: gvisor', self.gen(shell).splitlines())
+            # a value written into meta by hand that is not a stack: the default
+            meta.write_text(meta.read_text() + "MIHOMO_STACK='bogus'\n")
+            self.assertIn('  stack: gvisor', self.gen(shell).splitlines())
+            # the keys of the other types are not this type's
+            for k in ('TLS_PIN_SHA256', 'OVPN_USER', 'UPSTREAM_HTTP_PROXY'):
+                self.assertEqual(self.cli(shell, 'profile', 'set', 'sub', k, 'x').returncode, 2, k)
+
+    def test_interface_name_and_routing_mark_go_from_proxies_and_groups(self):
+        text = '''proxies:
+  - {name: a, type: ss, server: ss.example, port: 8388, cipher: aes-256-gcm, password: hunter2, interface-name: eth0, routing-mark: 1}
+  - {name: b, type: ss, interface-name: 'eth0', server: ss.example, port: 1, cipher: c, password: "hu,nter2", routing-mark: 2}
+  - {interface-name: eth0, name: c, type: socks5, server: s, port: 1, routing-mark: 3}
+  - {name: d, type: http, server: s, port: 1, headers: {X: [eth0, 1]}, Interface-Name: eth0}
+  - {name: e, type: vmess, server: s, port: 1, uuid: u, ws-opts: {path: /x, headers: {Host: h}}, routing-mark: {a: 1}}
+  - name: f
+    type: ss
+    interface-name: eth0
+    server: ss.example
+    port: 8388
+    routing-mark: 5
+    cipher: aes-256-gcm
+    password: hunter2
+  - interface-name: eth0
+    name: g
+    type: socks5
+    server: s
+    port: 1
+  - routing-mark: |
+      1
+      2
+    name: h
+    type: socks5
+    server: s
+    port: 1
+proxy-groups:
+  - name: sel
+    type: select
+    interface-name: wan
+    proxies: [a, b]
+  - {name: auto, type: url-test, interface-name: wan, routing-mark: 7, proxies: [a], url: 'http://x', interval: 300}
+rules:
+  - MATCH,sel
+'''
+        for shell in self.each_shell():
+            self.setup_profile(shell, text)
+            gen = self.gen(shell)
+            self.assertNotIn('interface-name', gen.lower())
+            self.assertNotIn('routing-mark: 1', gen)
+            self.assertNotIn('routing-mark: 2', gen)
+            self.assertNotIn('routing-mark: 3', gen)
+            self.assertNotIn('routing-mark: 5', gen)
+            self.assertNotIn('routing-mark: 7,', gen)
+            self.assertNotIn('routing-mark: {', gen)
+            self.assertNotIn('wan', gen)
+            self.assertEqual(gen.count('routing-mark'), 1)
+            self.assertEqual(self.block(gen, 'proxies'), [
+                'proxies:',
+                '  - {name: a, type: ss, server: ss.example, port: 8388, cipher: aes-256-gcm, password: hunter2}',
+                '  - {name: b, type: ss, server: ss.example, port: 1, cipher: c, password: "hu,nter2"}',
+                '  - {name: c, type: socks5, server: s, port: 1}',
+                '  - {name: d, type: http, server: s, port: 1, headers: {X: [eth0, 1]}}',
+                '  - {name: e, type: vmess, server: s, port: 1, uuid: u, ws-opts: {path: /x, headers: {Host: h}}}',
+                '  - name: f', '    type: ss', '    server: ss.example', '    port: 8388', '    cipher: aes-256-gcm',
+                '    password: hunter2',
+                '  -', '    name: g', '    type: socks5', '    server: s', '    port: 1',
+                '  -', '    name: h', '    type: socks5', '    server: s', '    port: 1'])
+            self.assertEqual(self.block(gen, 'proxy-groups'), [
+                'proxy-groups:',
+                '  - name: sel', '    type: select', '    proxies: [a, b]',
+                "  - {name: auto, type: url-test, proxies: [a], url: 'http://x', interval: 300}"])
+            # a spelling of either key that awk cannot take out is refused, naming the key
+            for bad, key in (('"interface-name": eth0', 'interface-name'), ("'routing-mark': 1", 'routing-mark'),
+                             ('x: &k interface-name\n    *k : eth0', 'interface-name'),
+                             ('server: s # interface-name', 'interface-name'),
+                             ('x: "Interface-Name"', 'interface-name'), ('x: ROUTING-MARK', 'routing-mark')):
+                r = self.refused(shell, f'proxies:\n  - name: a\n    type: socks5\n    {bad}\n    server: s\n    port: 1\n'
+                                        '    password: hunter2\nrules:\n  - MATCH,a\n', 'refused', bad)
+                self.assertIn(key, r.stderr, bad)
+            # the keys in another case go the same way, and a comment line that mentions them is only a comment
+            self.setup_profile(shell, '# interface-name: eth0 and routing-mark: 1 are set by mu300\n'
+                                      'proxies:\n  - name: a\n    type: socks5\n    INTERFACE-NAME: eth0\n    server: s\n'
+                                      '    Routing-Mark: 1\n    port: 1\n  - {name: b, type: socks5, server: s, port: 1, Interface-Name: eth0}\n'
+                                      'rules:\n  - MATCH,a\n')
+            gen = self.gen(shell)
+            self.assertEqual(self.block(gen, 'proxies'),
+                             ['proxies:', '  - name: a', '    type: socks5', '    server: s', '    port: 1',
+                              '  - {name: b, type: socks5, server: s, port: 1}'])
+            self.assertNotIn('eth0', gen)
+
+    def test_listening_and_control_blocks_go(self):
+        text = '''mixed-port: 7890
+socks-port: 7891
+redir-port: 7892
+tproxy-port: 7893
+allow-lan: true
+bind-address: '*'
+lan-allowed-ips: [0.0.0.0/0]
+authentication: ["user:hunter2"]
+mode: rule
+log-level: info
+ipv6: true
+external-controller: 0.0.0.0:9090
+external-controller-tls: 0.0.0.0:9443
+external-controller-unix: /tmp/x.sock
+external-ui: /tmp/ui
+external-ui-url: https://x.example/ui.zip
+secret: hunter2
+listeners:
+  - name: ss-in
+    type: shadowsocks
+    port: 8388
+    listen: 0.0.0.0
+    cipher: aes-256-gcm
+    password: hunter2
+tunnels:
+  - tcp/udp,127.0.0.1:6553,114.114.114.114:53,proxy
+ntp:
+  enable: true
+  write-to-system: true
+  server: time.apple.com
+ebpf:
+  auto-redir: [eth0]
+iptables:
+  enable: true
+interface-name: eth0
+routing-mark: 6666
+tun:
+  enable: true
+  stack: system
+  auto-route: true
+  auto-redirect: true
+  dns-hijack: [any:53]
+dns:
+  enable: true
+  listen: 0.0.0.0:53
+  enhanced-mode: fake-ip
+  nameserver: [https://dns.example/dns-query]
+hosts:
+  'router.example': 192.168.78.1
+geodata-mode: true
+geodata-loader: memconservative
+geox-url:
+  geoip: https://x.example/geoip.dat
+profile:
+  store-selected: true
+sniffer:
+  enable: true
+  sniff:
+    HTTP:
+      ports: [80]
+proxies:
+  - {name: a, type: ss, server: ss.example, port: 8388, cipher: aes-256-gcm, password: hunter2}
+proxy-groups:
+  - {name: g, type: select, proxies: [a]}
+rule-providers:
+  ads:
+    type: http
+    behavior: domain
+    url: https://x.example/ads.yaml
+    path: ./ads.yaml
+    interval: 86400
+sub-rules:
+  sub:
+    - MATCH,a
+rules:
+  - RULE-SET,ads,REJECT
+  - SUB-RULE,(DOMAIN,x.example),sub
+  - MATCH,g
+'''
+        for shell in self.each_shell():
+            self.setup_profile(shell, text)
+            gen = self.gen(shell)
+            self.assertEqual(self.top_keys(gen),
+                             ['mode', 'log-level', 'ipv6', 'hosts', 'geodata-mode', 'geodata-loader', 'geox-url',
+                              'profile', 'sniffer', 'proxies', 'proxy-groups', 'rule-providers', 'sub-rules', 'rules']
+                             + list(MH_OURS))
+            for gone in ('mixed-port', 'socks-port', 'redir-port', 'tproxy-port', 'lan-allowed-ips', 'authentication',
+                         'external-controller', 'external-ui', 'secret', 'listeners', 'ss-in', 'tunnels', '6553',
+                         'ntp', 'write-to-system', 'ebpf', 'iptables', 'eth0', '6666', 'stack: system',
+                         'auto-route: true', 'auto-redirect: true', 'any:53', '0.0.0.0', 'fake-ip', 'dns.example',
+                         "bind-address: '*'", 'allow-lan: true'):
+                self.assertNotIn(gone, gen, gone)
+            self.assertEqual(self.block(gen, 'sniffer'), ['sniffer:', '  enable: true', '  sniff:', '    HTTP:', '      ports: [80]'])
+            self.assertEqual(self.block(gen, 'hosts'), ['hosts:', "  'router.example': 192.168.78.1"])
+            self.assertEqual(self.block(gen, 'sub-rules'), ['sub-rules:', '  sub:', '    - MATCH,a'])
+            self.assertIn('  - SUB-RULE,(DOMAIN,x.example),sub', self.block(gen, 'rules'))
+            self.assertEqual(self.block(gen, 'geox-url'), ['geox-url:', '  geoip: https://x.example/geoip.dat'])
+            # the check tells which top-level keys were not used, by name only
+            r = self.cli(shell, 'check', 'sub')
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn('not used', r.stderr)
+            for k in ('listeners', 'ntp', 'secret', 'interface-name', 'routing-mark', 'mixed-port'):
+                self.assertIn(f' {k}', r.stderr)
+            self.no_secrets(r)
+            self.assertNotIn('time.apple.com', r.stderr)
+
+    def test_refusals_name_the_rule_and_nothing_of_the_file(self):
+        base = ('proxies:\n  - {name: a, type: ss, server: ss.example, port: 8388, cipher: aes-256-gcm, password: hunter2}\n'
+                'rules:\n  - MATCH,a\n')
+        for shell in self.each_shell():
+            for name, text, msg in (
+                    ('second document', base + '---\nproxies: []\ntun:\n  enable: true\n', 'second YAML document'),
+                    ('second document with content', base + '--- # x\n', 'second YAML document'),
+                    ('document end', base + '...\n', 'document end'),
+                    ('directive', '%YAML 1.2\n---\n' + base, 'directive'),
+                    ('tab at column 0', base.replace('  - MATCH,a', '\t- MATCH,a'), 'TAB'),
+                    ('tab at column 0 of a key', base + '\ttun:\n  enable: true\n', 'TAB'),
+                    ('a long line', base + 'rule-providers:\n  x: ' + 'a' * 4100 + '\n', '4096'),
+                    ('a NUL', base.encode() + b'rules:\n  - MATCH,\x00a\n', 'control character'),
+                    ('an escape', base.encode() + b'rules:\n  - MATCH,\x1ba\n', 'control character'),
+                    ('a form feed', base.encode() + b'rules:\n  - MATCH,a\x0c\n', 'control character'),
+                    ('explicit key', base + 'proxy-groups:\n  - ? "interface-\\\n      name"\n    : eth0\n', 'explicit key'),
+                    ('explicit flow key', base + 'proxy-groups:\n  - {? x: 1}\n', 'explicit key'),
+                    ('hex escape', base.replace('ss.example', '"interface\\x2dname"'), 'escape'),
+                    ('unicode escape', base.replace('ss.example', '"interface\\u002dname"'), 'escape'),
+                    ('a list at the top', base + '- tun:\n    enable: true\n', 'top-level line'),
+                    ('a quoted top-level key', base + '"tun":\n  enable: true\n', 'top-level line'),
+                    ('a flow collection at column 0', 'proxies: [\n{name: a, type: ss, server: s, port: 1, password: hunter2}\n]\n', 'top-level line'),
+                    ('a merge key', base + '<<: {tun: {enable: true}}\n', 'top-level line'),
+                    ('an anchor at column 0', base + '&x tun:\n  enable: true\n', 'top-level line'),
+                    ('a kept key twice', base + 'rules:\n  - MATCH,a\n', 'twice'),
+                    ('no proxies', 'rules:\n  - MATCH,DIRECT\n', 'no proxies'),
+                    ('empty', '', 'no proxies'),
+                    ('a JSON file', '{"proxies": []}', 'not a mihomo config')):
+                with self.subTest(what=name):
+                    r = self.refused(shell, text, msg, name)
+                    self.assertNotIn('MATCH', r.stderr)
+            # too large: refused before anything reads it
+            big = base + '# ' + 'x' * (1 << 20) + '\n'
+            r = self.refused(shell, big, '1 MiB', 'too large')
+            # a first line that is the document start, a BOM and CRLF line ends are taken, and a blank before the
+            # colon is the same key to YAML and to the driver (here: tun, dropped)
+            for name, text in (('document start', '---\n' + base), ('BOM', '\ufeff# a subscription\n' + base),
+                               ('CRLF', base.replace('\n', '\r\n')),
+                               ('a blank before the colon', base + 'tun :\n  enable: true\n')):
+                with self.subTest(what=name):
+                    self.setup_profile(shell, text)
+                    gen = self.gen(shell)
+                    self.assertEqual(self.block(gen, 'rules'), ['rules:', '  - MATCH,a'])
+                    self.assertEqual(self.top_keys(gen), ['proxies', 'rules'] + list(MH_OURS))
+                    self.assertNotIn('\r', gen)
+                    self.assertNotIn('\ufeff', gen)
+                    self.assertNotIn('---', gen)
+                    self.assertEqual(gen.count('enable: true'), 2)
+
+    def test_anchors_of_dropped_keys_are_kept_inert(self):
+        # subscription templates (and mihomo's own example) put the defaults of providers and groups under keys of
+        # their own and merge them with <<: *name; dropping those keys would leave the aliases dangling
+        text = '''p: &p {type: http, interval: 3600, health-check: {enable: true, url: "https://g.example/204?a=1&b=2", interval: 300}}
+pg: &pg
+  type: select
+  proxies: [auto, a]
+  use: [sub]
+tun: &t
+  enable: true
+  stack: system
+secret: "x&y"
+proxy-providers:
+  sub:
+    <<: *p
+    url: "https://sub.example/link?token=abc&x=1"
+    path: ./sub.yaml
+proxies:
+  - {name: a, type: ss, server: ss.example, port: 8388, cipher: aes-256-gcm, password: hunter2}
+proxy-groups:
+  - {name: Proxy, <<: *pg}
+  - name: auto
+    type: url-test
+    <<: *p
+    proxies: [a]
+rules:
+  - MATCH,Proxy
+'''
+        for shell in self.each_shell():
+            self.setup_profile(shell, text)
+            gen = self.gen(shell)
+            # (x&y is not an anchor: secret goes with the other dropped keys)
+            self.assertEqual(self.top_keys(gen),
+                             ['mu300-anchor-1', 'mu300-anchor-2', 'mu300-anchor-3',
+                              'proxy-providers', 'proxies', 'proxy-groups', 'rules'] + list(MH_OURS))
+            lines = gen.splitlines()
+            self.assertIn('mu300-anchor-1: &p {type: http, interval: 3600, health-check: {enable: true, url: "https://g.example/204?a=1&b=2", interval: 300}}', lines)
+            self.assertEqual(self.block(gen, 'mu300-anchor-2'), ['mu300-anchor-2: &pg', '  type: select', '  proxies: [auto, a]', '  use: [sub]'])
+            self.assertEqual(self.block(gen, 'mu300-anchor-3'), ['mu300-anchor-3: &t', '  enable: true', '  stack: system'])
+            self.assertNotIn('x&y', gen)
+            self.assertIn('    <<: *p', lines)
+            self.assertIn('  - {name: Proxy, <<: *pg}', lines)
+            self.assertNotRegex(gen, r'(?m)^(p|pg|tun: &t|secret):')
+            self.assertEqual(lines.count('tun:'), 1)
+            r = self.cli(shell, 'check', 'sub')
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn('kept for the anchors', r.stderr)
+            self.assertIn(' p pg tun\n', r.stderr)
+            self.assertIn(' secret', r.stderr)
+            # what an anchored block holds goes through the same removals and the same text check
+            self.setup_profile(shell, text.replace('pg: &pg\n', 'pg: &pg\n  routing-mark: 9\n'))
+            gen = self.gen(shell)
+            self.assertNotIn('routing-mark: 9', gen)
+            self.assertEqual(self.block(gen, 'mu300-anchor-2'), ['mu300-anchor-2: &pg', '  type: select', '  proxies: [auto, a]', '  use: [sub]'])
+            r = self.refused(shell, text.replace('p: &p {type: http,', 'p: &p {type: http, "interface-name": eth0,'), 'interface-name')
+            # a dropped block without an anchor is still gone, "&" in a URL or a password is not an anchor
+            self.setup_profile(shell, MH_CONF + 'x:\n  url: "https://a.example/?a=1&b=2"\n  password: "p&q"\n')
+            self.assertEqual(self.top_keys(self.gen(shell)), ['proxies', 'rules'] + list(MH_OURS))
+
+    def test_written_file_guard_fails_closed(self):
+        # the guard behind the rebuild, on files that are not what the driver writes
+        good = ('proxies:\n  - {name: a, type: ss}\nrules:\n  - MATCH,a\nrouting-mark: 720\nallow-lan: false\n'
+                "bind-address: '127.0.0.1'\ntun:\n  enable: true\ndns:\n  enable: true\n")
+        for shell in self.each_shell():
+            self.setup_profile(shell)
+            f = self.tmp / 'w.yaml'
+            for name, text, ctl, ok in (
+                    ('as written', good, '', True),
+                    ('with the controller', good + "external-controller: '127.0.0.1:9090'\n", '127.0.0.1:9090', True),
+                    ('a controller that was not asked for', good + "external-controller: '127.0.0.1:9090'\n", '', False),
+                    ('no controller although asked', good, '127.0.0.1:9090', False),
+                    ('two tun', good + 'tun:\n  enable: true\n', '', False),
+                    ('two dns', good + 'dns:\n  enable: true\n', '', False),
+                    ('no tun', good.replace('tun:\n  enable: true\n', ''), '', False),
+                    ('a stray secret', good + 'secret: x\n', '', False),
+                    ('a stray listener', good + 'listeners:\n  - x\n', '', False),
+                    ('an anchor holder of ours', good + 'mu300-anchor-12: &p {type: http}\n', '', True),
+                    ('an anchor holder spelled otherwise', good + 'mu300-anchor-x: &p {type: http}\n', '', False),
+                    ('allow-lan true', good.replace('allow-lan: false', 'allow-lan: true'), '', False),
+                    ('another mark', good.replace('routing-mark: 720', 'routing-mark: 721'), '', False),
+                    ('no mark', good.replace('routing-mark: 720\n', ''), '', False),
+                    ('a quoted key', good + '"x": 1\n', '', False),
+                    ('a list', good + '- x\n', '', False)):
+                f.write_text(text)
+                r = self.run_lib(shell, f'mihomo_written_ok "{ctl}" "{f}" && echo OK')
+                self.assertEqual('OK' in r.stdout, ok, (name, r.stderr))
+
+    def test_engine_and_extra(self):
+        for shell in self.each_shell():
+            self.setup_profile(shell)
+            r = self.run_lib(shell, 'echo "pkg=[$DRV_PKG] extra=[$DRV_EXTRA] tun=$TUN routes=$DRV_ROUTES fg=$DRV_FOREGROUND keys=[$DRV_KEYS]"; '
+                                    'drv_engines; drv_engines_ok && echo OK')
+            self.assertIn('pkg=[] extra=[vpn-mihomo] tun=mh-mu300 routes=core fg=0 keys=[MIHOMO_STACK]', r.stdout)
+            self.assertIn(str(self.stubs / 'mihomo'), r.stdout)
+            self.assertIn('OK', r.stdout)
+            # the extra's copy comes first, the MIHOMO setting before it
+            d = self.tmp / 'disk/extra/vpn-mihomo/bin'
+            d.mkdir(parents=True, exist_ok=True)
+            shutil.copy(self.stubs / 'mihomo', d / 'mihomo')
+            r = self.run_lib(shell, 'drv_engines; drv_engines_ok && echo OK')
+            self.assertEqual(r.stdout.splitlines(), [str(d / 'mihomo'), 'OK'])
+            r = self.run_lib(shell, 'drv_engines; drv_engines_ok || echo MISSING', f'_mihomo={self.tmp}/none; ')
+            self.assertEqual(r.stdout.splitlines(), [f'{self.tmp}/none', 'MISSING'])
+            shutil.rmtree(self.tmp / 'disk')
+            # without any: the message names the extra
+            (self.stubs / 'mihomo').unlink()
+            self.assertEqual(self.cli(shell, 'profile', 'use', 'sub').returncode, 0)
+            r = self.cli(shell, 'status')
+            self.assertIn('mu300-extra install vpn-mihomo', r.stdout + r.stderr)
+            r = self.cli(shell, 'on')
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn('engines install mihomo', r.stderr)
+            self.mihomo_stub()
+
+    def test_start_alive_stop(self):
+        for shell in self.each_shell():
+            self.setup_profile(shell)
+            self.assertEqual(self.run_lib(shell, 'drv_gen').returncode, 0)
+            (self.tmp / 'ip.log').unlink()
+            r = self.run_lib(shell, 'drv_start && echo "STARTED pids=[$DRV_PIDS]"; drv_alive && echo ALIVE; '
+                                    'p=$DRV_PIDS; drv_stop; echo "stop=$?"; kill -0 $p 2>/dev/null && echo SURVIVED; '
+                                    'drv_alive || echo "gone=$DRV_GONE"')
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn('tunnel up on mh-mu300', r.stdout)
+            self.assertRegex(r.stdout, r'STARTED pids=\[[0-9]+\]')
+            for want in ('ALIVE', 'stop=0', 'gone=mihomo'):
+                self.assertIn(want, r.stdout)
+            self.assertNotIn('SURVIVED', r.stdout)
+            self.no_secrets(r)
+            # mihomo ran the written file from its home, without the path escapes in its environment
+            self.assertEqual((self.tmp / 'mihomo.args').read_text().splitlines(),
+                             ['-d', str(self.home), '-f', str(self.run_dir / 'mihomo.yaml')])
+            self.assertEqual((self.tmp / 'mihomo.env').read_text(), '')
+            ip = [l for l in (self.tmp / 'ip.log').read_text().splitlines() if l.startswith('link')]
+            self.assertIn('link set mh-mu300 up', ip)
+            # the runtime copy (it holds the credentials) goes with the stop
+            self.assertFalse((self.run_dir / 'mihomo.yaml').exists())
+            # one that exits at once, and one that ignores TERM
+            self.assertEqual(self.run_lib(shell, 'drv_gen').returncode, 0)
+            (self.tmp / 'mh-up').unlink()
+            self.mihomo_stub('echo "FATAL hunter2" >&2; exit 1')
+            r = self.run_lib(shell, 'drv_start && echo STARTED; echo "pids=[$DRV_PIDS]"')
+            self.assertNotIn('STARTED', r.stdout)
+            self.assertIn('mihomo exited during start', r.stderr)
+            self.assertIn('pids=[]', r.stdout)
+            self.mihomo_stub('trap "" TERM\n: > "$STUBLOG/mh-up"\nwhile :; do sleep 1; done')
+            r = self.run_lib(shell, 'drv_start; p=$DRV_PIDS; drv_stop; kill -0 $p 2>/dev/null && echo SURVIVED; echo done')
+            self.assertIn('done', r.stdout)
+            self.assertNotIn('SURVIVED', r.stdout)
+            self.mihomo_stub()
+
+    def test_status_says_no_secret(self):
+        for shell in self.each_shell():
+            self.setup_profile(shell, 'mode: global\n' + MH_CONF)
+            self.assertEqual(self.run_lib(shell, 'drv_gen').returncode, 0)
+            r = self.run_lib(shell, 'drv_status')
+            self.assertEqual(r.stdout.splitlines(), ['mode: global', 'proxies: 1'])
+            self.no_secrets(r)

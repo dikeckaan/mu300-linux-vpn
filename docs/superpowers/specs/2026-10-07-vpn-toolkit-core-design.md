@@ -380,14 +380,39 @@ Per system, at every start of `mu300-vpn` (any command), idempotent, and only wh
   `mode`, `log-level`, `ipv6`, `geodata-mode`, `geodata-loader`, `geox-url`, `profile`, `sniffer`. Written by the
   driver, whatever the file had: `tun` (ours), `dns` (ours), `routing-mark: 720`, `allow-lan: false`,
   `bind-address: '127.0.0.1'`, and `external-controller` only as MIHOMO_CONTROLLER, which must be a 127.0.0.1
-  address (no `external-controller-tls`/`-unix`/`-pipe`, no `external-ui*`, and a `secret` only with the
-  controller). `port`, `socks-port`, `mixed-port`, `redir-port` and `tproxy-port` are removed (the TUN is the only
+  address (no `external-controller-tls`/`-unix`/`-pipe`, no `external-ui*`; the file's `secret` is removed with the
+  rest - the controller listens on loopback only, where every user of this device is root). `port`, `socks-port`,
+  `mixed-port`, `redir-port` and `tproxy-port` are removed (the TUN is the only
   inbound; were one ever written, `allow-lan: false` and the bind address keep it on loopback). Everything else is
   removed with the unlisted keys - among them `listeners`, `tunnels`, `ss-config`, `vmess-config`, `tuic-server`
   (all listen), `ebpf`, `iptables`, `interface-name`, `ntp` (`write-to-system` would set the clock), `secret`,
   `external-*`. `interface-name` and `routing-mark` are stripped from every proxy and group as well (the mark is
-  ours, the uplink the kernel's choice). mihomo runs with its home directory under `$RUN` and without `SAFE_PATHS`,
-  so a provider's `path` or the geodata it downloads stays inside it.
+  ours, the uplink the kernel's choice). mihomo runs with its home directory `$VPN_DIR/cache/mihomo` (0700; the
+  geodata it downloads survives a reboot) and without `SAFE_PATHS` or `SKIP_SAFE_PATH_CHECK` in its environment, so
+  a provider's `path` or the geodata it downloads stays inside it.
+  * How the reduction reads the file (awk, no YAML parser, so the rules are about lines): a top-level entry is a
+    line at column 0 of the form `KEY:` with KEY of `[A-Za-z0-9_-]`, and its block runs to the next such line (blank
+    and `#` lines belong to the block they follow); a kept block is copied as it is, a dropped one goes, and the
+    check names the dropped keys (they match that pattern, so nothing else of the file is repeated). A dropped block
+    that defines an anchor (`&name`) is kept inert under a name of the driver's, `mu300-anchor-N`, which mihomo
+    does not read (subscription templates and mihomo's own example put the defaults of providers and groups under
+    keys of their own and merge them with `<<: *name`; without the anchor the file would not parse); it goes through
+    the same removals and the same text check as a kept block, so nothing it anchors can bring the two keys in. Inside a kept
+    block a line `^[ \t-]*interface-name:` or `routing-mark:` (any case) goes with the lines indented deeper than
+    the key (a `-` before it stays, so the item keeps its place), and in a flow mapping or sequence the `KEY: value`
+    segment goes with one comma (a quoted value, or a value up to the next `,` or closing bracket, brackets nested).
+    After that the text `interface-name` or `routing-mark` anywhere outside a `#` line (a quoted key, an anchor,
+    a trailing comment, any form awk did not undo) refuses the file naming the key. Refused as well, naming the
+    rule: a second YAML document (`---` after the first line, `...`), a `%` directive, a TAB at the start of a line,
+    a line over 4096 bytes, a file over 1 MiB, a control byte other than TAB, LF and CR, an explicit key (`? `,
+    the one way a key can span lines), a hex escape (`\x`, `\u`, `\U`: the one way a key can be spelled without its
+    text), a column-0 line that is not `KEY:` (a quoted key, a list item, a merge key, an anchor, a flow collection
+    continued at column 0: YAML would read it as top-level content that the line rules cannot see), a kept key
+    given twice (mihomo's YAML reader refuses it anyway), and a file without `proxies` and `proxy-providers`. A
+    first line `---`, a BOM and CRLF line ends are taken. The written file is checked again before `mihomo -t`
+    (every column-0 key one of the kept list, ours or `mu300-anchor-N`, `tun` and `dns` exactly once, `routing-mark: 720`,
+    `allow-lan: false`, `bind-address` once, `external-controller` exactly when MIHOMO_CONTROLLER is set), and
+    `mihomo -t`'s own output is not shown (its YAML errors quote values); the message gives the command to run.
 * The kill switch is unchanged: only marked traffic, NTP and the Wi-Fi client's DHCP leave on an uplink; forwarded
   traffic to an uplink is dropped. Every new driver marks its own sockets, so none of them needs an exception.
 
