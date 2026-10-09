@@ -180,7 +180,12 @@ enabled when the VPN is on in that system (`mu300-vpn enabled`), and `vpn.conf.e
 What an older image had there itself is moved aside to `NAME.builtin`, never deleted. For the running system it also
 reloads systemd and starts a wanted VPN that is not running. `hooks/unlink SYSROOT` undoes exactly that and puts the
 `*.builtin` back. Both can run any number of times. `mu300-extra` runs them after an install and a removal, and
-`hooks/link ""` at every boot.
+`hooks/link ""` at every boot, as `MU300_DISK=DISK MU300_EXTRA_DIR=DISK/extra/vpn sh hooks/link SYSROOT`; the
+links point at `MU300_EXTRA_DIR` (default `/mnt/mu300-disk/extra/vpn`).
+
+What mu300-extra accepts as the module: plain files and directories only, names of `[A-Za-z0-9._+-]` that do not
+start with a dot, at most four levels deep; `VERSION` one line of `[A-Za-z0-9._-]`; `requires` the line
+`mu300-linux vYYYY.MM.DD`; `bin/mu300-vpn` and both hooks present (`tests/test_module.py` checks the built ones).
 
 ## For developers
 

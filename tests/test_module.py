@@ -107,6 +107,29 @@ class Tarballs(unittest.TestCase):
         for name in ('mu300-linux-vpn.tar.gz', 'mu300-linux-vpn-mihomo.tar.gz', 'SHA256SUMS'):
             self.assertEqual((self.tmp / 'again' / name).read_bytes(), (self.out / name).read_bytes(), name)
 
+    def test_what_mu300_extra_accepts(self):
+        """mu300-extra's checks (mu300-linux's spec, As implemented): plain files and directories only, names of
+        [A-Za-z0-9._+-] not starting with a dot, at most four levels deep; VERSION one line of [A-Za-z0-9._-]{1,40};
+        requires exactly 'mu300-linux v2026.10.16'; bin/mu300-vpn and the hooks there (vpn-mihomo: a program)."""
+        import re
+        for name in ('mu300-linux-vpn.tar.gz', 'mu300-linux-vpn-mihomo.tar.gz'):
+            m, data = self.members(name)
+            for n, ti in m.items():
+                with self.subTest(tarball=name, entry=n):
+                    self.assertTrue(ti.isreg() or ti.isdir())
+                    self.assertFalse(ti.islnk() or ti.issym())
+                    parts = n[2:].rstrip('/').split('/') if n.startswith('./') else n.split('/')
+                    self.assertLessEqual(len(parts), 4)
+                    for c in parts:
+                        self.assertRegex(c, r'^[A-Za-z0-9_+-][A-Za-z0-9._+-]*$')
+            self.assertRegex(data['./VERSION'].decode(), r'^[A-Za-z0-9._-]{1,40}\n$')
+            self.assertEqual(data['./requires'], b'mu300-linux v2026.10.16\n')
+        m, data = self.members('mu300-linux-vpn.tar.gz')
+        for rel in ('bin/mu300-vpn', 'hooks/link', 'hooks/unlink'):
+            self.assertTrue(m['./' + rel].isreg() and m['./' + rel].mode & 0o111, rel)
+        m, _ = self.members('mu300-linux-vpn-mihomo.tar.gz')
+        self.assertTrue(m['./bin/mihomo'].isreg() and m['./bin/mihomo'].mode & 0o111)
+
     def test_tag_is_checked(self):
         r = build(self.tmp / 'bad', tag='1.0')
         self.assertNotEqual(r.returncode, 0)
@@ -147,6 +170,7 @@ class Hooks(ShellTest):
         with tarfile.open(self.build / 'mu300-linux-vpn.tar.gz') as t:
             t.extractall(self.extra, **({'filter': 'tar'} if hasattr(tarfile, 'tar_filter') else {}))
         self.extra = Path(os.path.realpath(self.extra))
+        self.disk = self.extra.parents[1]
         for name in ('systemctl', 'nft', 'ip'):
             self.stub(name, f'echo "{name} $*" >> "$STUBLOG/calls"; '
                             f'[ "$1" = is-active ] && [ -e "$STUBLOG/active" ] && exit 0; [ "$1" != is-active ]')
@@ -179,7 +203,8 @@ class Hooks(ShellTest):
         return root
 
     def hook(self, shell, name, root, live='0', **env):
-        return self.script(shell, self.extra / 'hooks' / name, root, MU300_VPN_LIVE=live, **env)
+        return self.script(shell, self.extra / 'hooks' / name, root, MU300_VPN_LIVE=live, MU300_DISK=self.disk,
+                           MU300_EXTRA_DIR=self.extra, **env)
 
     def assertLinked(self, root, kind, wanted):
         self.assertEqual(os.readlink(root / 'opt/mu300/bin/mu300-vpn'), str(self.extra / 'bin/mu300-vpn'))
@@ -307,7 +332,8 @@ class Hooks(ShellTest):
                     self.assertEqual(calls, want)
             # another system's root: no service calls
             (self.tmp / 'calls').unlink(missing_ok=True)
-            r = self.script(shell, self.extra / 'hooks/link', self.system('ubuntu', 'ENABLE=1\n'))
+            r = self.script(shell, self.extra / 'hooks/link', self.system('ubuntu', 'ENABLE=1\n'),
+                            MU300_EXTRA_DIR=self.extra)
             self.assertEqual(r.returncode, 0, r.stderr)
             self.assertFalse((self.tmp / 'calls').exists())
 
@@ -352,6 +378,18 @@ class Hooks(ShellTest):
             r = subprocess.run(shell + ['-c', '. "$0"; echo "$LIB"', str(alone / 'mu300-vpn')], capture_output=True,
                                text=True, env=self.env(**env), timeout=60)
             self.assertEqual(r.stdout.strip(), '/opt/mu300/lib/vpn')
+
+    def test_links_go_to_the_extra_dir_mu300_extra_names(self):
+        """mu300-extra runs the hooks with MU300_DISK and MU300_EXTRA_DIR; without them the links go to the
+        device's own $DISK/extra/vpn, whichever directory the hook runs from."""
+        for shell in self.each_shell():
+            for env, want in (({'MU300_DISK': '/d', 'MU300_EXTRA_DIR': '/d/extra/vpn'}, '/d/extra/vpn'),
+                              ({'MU300_DISK': '/d'}, '/d/extra/vpn'), ({}, '/mnt/mu300-disk/extra/vpn')):
+                root = self.system('ubuntu', 'ENABLE=0\n')
+                r = self.script(shell, self.extra / 'hooks/link', root, MU300_VPN_LIVE='0', **env)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertEqual(os.readlink(root / 'opt/mu300/bin/mu300-vpn'), want + '/bin/mu300-vpn')
+                self.assertEqual(os.readlink(root / 'opt/mu300/lib/vpn'), want + '/lib/vpn')
 
     def test_not_the_module(self):
         for shell in self.each_shell():

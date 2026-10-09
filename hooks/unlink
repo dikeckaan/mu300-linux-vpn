@@ -4,7 +4,8 @@
 # (NAME.builtin, an older image's own mu300-vpn) is put back. When nothing comes back, the service's enable link
 # goes too, and on the running system (SYSROOT "") the VPN is turned off first with this module's own mu300-vpn
 # off - the service stopped and the kill switch taken down - since nothing would be left that could take it down
-# later. Running it again changes nothing. (MU300_VPN_LIVE=1|0 as in hooks/link: tests/.)
+# later. Running it again changes nothing. Run as hooks/link is (MU300_DISK, MU300_EXTRA_DIR); MU300_VPN_LIVE=1|0
+# as there (tests/).
 set -eu
 R=${1?usage: hooks/unlink SYSROOT   (SYSROOT "" = the running system)}
 R=${R%/}

@@ -12,13 +12,16 @@
 # NAME.builtin, never deleted; hooks/unlink puts it back. Running it again changes nothing. A service link that is
 # there already stays, also when the VPN is not wanted (mu300-vpn off removes it; the service does nothing with
 # ENABLE=0 anyway). For the running system it also reloads systemd, and starts the service when the VPN is wanted
-# and it is not running. (MU300_VPN_EXTRA: the extra's path as the systems see it, default this hook's directory's
-# parent; MU300_VPN_LIVE=1|0: those service calls or not, by default for SYSROOT "" only - tests/.)
+# and it is not running. mu300-extra and mu300-update run it as MU300_DISK=DISK MU300_EXTRA_DIR=DISK/extra/vpn
+# sh hooks/link SYSROOT: the links point at MU300_EXTRA_DIR (default $MU300_DISK/extra/vpn, MU300_DISK default
+# /mnt/mu300-disk), the path every system sees the extra at; the files copied come from this hook's own module.
+# (MU300_VPN_LIVE=1|0: those service calls or not, by default for SYSROOT "" only - tests/.)
 set -eu
 R=${1?usage: hooks/link SYSROOT   (SYSROOT "" = the running system)}
 R=${R%/}
 HERE=$(cd "$(dirname "$0")/.." && pwd)
-EXTRA=${MU300_VPN_EXTRA:-$HERE}
+DISK=${MU300_DISK:-/mnt/mu300-disk}
+EXTRA=${MU300_EXTRA_DIR:-$DISK/extra/vpn}
 LIVE=${MU300_VPN_LIVE:-}; [ -n "$LIVE" ] || { [ -n "$R" ] && LIVE=0 || LIVE=1; }
 
 [ -x "$HERE/bin/mu300-vpn" ] && [ -r "$HERE/lib/vpn/uri.sh" ] || { echo "hooks/link: $HERE is not the vpn module" >&2; exit 1; }
