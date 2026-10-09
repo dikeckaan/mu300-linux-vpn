@@ -180,14 +180,14 @@ class Store(ShellTest):
         good = [('KILL_SWITCH', '0'), ('KILL_SWITCH', '1'), ('TAILSCALE', '0'), ('IPV6', '1'),
                 ('REMOTE_DNS', '1.1.1.1'), ('REMOTE_DNS', '2606:4700::1111'), ('BOOTSTRAP_DNS', '8.8.4.4'),
                 ('LAN_CIDRS', '10.0.0.0/8,fd00::/8'), ('LAN_CIDRS', ''), ('LAN_CIDRS', '192.168.1.0/24'),
-                ('MIHOMO_CONTROLLER', '127.0.0.1:9090'), ('MIHOMO_CONTROLLER', '[::1]:9090'),
-                ('MIHOMO_CONTROLLER', ''), ('XRAY', '/x/xray'), ('HEV', '/x/hev'), ('SING_BOX', '/x/sb'),
+                ('XRAY', '/x/xray'), ('HEV', '/x/hev'), ('SING_BOX', '/x/sb'),
                 ('MIHOMO', '/x/m'), ('OPENVPN', '/usr/sbin/openvpn'), ('XRAY', '')]
+        # (MIHOMO_CONTROLLER is no setting: mihomo gets no control API of any kind, see Mihomo.test_nothing_listens)
         bad = [('KILL_SWITCH', 'yes'), ('KILL_SWITCH', ''), ('IPV6', '2'), ('REMOTE_DNS', 'a;b'),
                ('REMOTE_DNS', '1.1.1.256'), ('REMOTE_DNS', '1.1.1'), ('REMOTE_DNS', ''), ('LAN_CIDRS', '10.0.0.0'),
                ('LAN_CIDRS', '10.0.0.0/33'), ('LAN_CIDRS', '10.0.0.0/8,'), ('LAN_CIDRS', 'fd00::/129'),
-               ('MIHOMO_CONTROLLER', '0.0.0.0:9090'), ('MIHOMO_CONTROLLER', '127.0.0.1:99999'),
-               ('MIHOMO_CONTROLLER', '127.0.0.1'), ('XRAY', 'relative/xray'), ('UNKNOWN', 'x')]
+               ('MIHOMO_CONTROLLER', '127.0.0.1:9090'), ('MIHOMO_CONTROLLER', ''),
+               ('XRAY', 'relative/xray'), ('UNKNOWN', 'x')]
         for shell in self.each_shell():
             self.reset()
             code = '; '.join(f"setting_valid {k} '{v}' && echo 1 || echo 0" for k, v in good + bad)
@@ -792,7 +792,8 @@ class Cli(ShellTest):
             got = dict(l.split('=', 1) for l in r.stdout.splitlines())
             self.assertEqual((got['REMOTE_DNS'], got['KILL_SWITCH'], got['LAN_CIDRS'], got['XRAY']),
                              ('9.9.9.9', '1', '', ''))
-            self.assertEqual(len(got), 12)
+            self.assertEqual(len(got), 11)
+            self.assertNotIn('MIHOMO_CONTROLLER', got)
             # empty: back to the default
             r = self.vpn(shell, 'settings', 'set', 'REMOTE_DNS', '')
             self.assertEqual(r.returncode, 0, r.stderr)
@@ -2698,12 +2699,16 @@ rules:
   - MATCH,a
 '''
 MH_OURS = ('routing-mark', 'allow-lan', 'bind-address', 'tun', 'dns')
+# the smallest file the driver takes: one proxy and one rule
+MH_BASE = ('proxies:\n  - {name: a, type: ss, server: ss.example, port: 8388, cipher: aes-256-gcm, password: hunter2}\n'
+           'rules:\n  - MATCH,a\n')
 
 
 class Mihomo(ShellTest):
     """The mihomo driver: the YAML is reduced to the top-level keys the spec allows (awk, no YAML parser), ours
-    (routing-mark, allow-lan, bind-address, tun, dns, the controller) are appended, interface-name and routing-mark
-    go from every proxy and group, mihomo checks and runs only the file we wrote, and no secret is printed."""
+    (routing-mark, allow-lan, bind-address, tun, dns) are appended, nothing of the file listens (no port, no
+    controller or API of any kind), interface-name and routing-mark go from every proxy and group, mihomo checks and
+    runs only the file we wrote, and no secret is printed."""
 
     def setUp(self):
         super().setUp()
@@ -2881,7 +2886,7 @@ class Mihomo(ShellTest):
             self.assertFalse((self.tmp / 'mihomo.args').exists())
             # no server address to keep off the tunnel: mihomo marks its own sockets
             self.assertEqual((self.run_dir / 'server-ip').read_text(), '')
-            # the settings go in: the resolvers, and the controller only when set
+            # the settings go in: the resolvers
             r = self.cli(shell, 'settings', 'set', 'REMOTE_DNS', '9.9.9.9')
             self.assertEqual(r.returncode, 0, r.stderr)
             r = self.cli(shell, 'settings', 'set', 'BOOTSTRAP_DNS', '8.8.8.8')
@@ -2891,17 +2896,12 @@ class Mihomo(ShellTest):
             self.assertIn("  default-nameserver: ['8.8.8.8']", gen.splitlines())
             self.assertIn("  proxy-server-nameserver: ['8.8.8.8']", gen.splitlines())
             self.assertNotIn('external-controller', gen)
-            r = self.cli(shell, 'settings', 'set', 'MIHOMO_CONTROLLER', '127.0.0.1:9090')
-            self.assertEqual(r.returncode, 0, r.stderr)
-            gen = self.gen(shell)
-            self.assertIn("external-controller: '127.0.0.1:9090'", gen.splitlines())
-            self.assertEqual(self.top_keys(gen), ['proxies', 'rules'] + list(MH_OURS) + ['external-controller'])
-            self.assertEqual(gen.count('external-controller'), 1)
-            # a controller that is not loopback (a legacy vpn.conf could say anything) is not written
-            r = self.run_lib(shell, 'drv_gen', 'MIHOMO_CONTROLLER=0.0.0.0:9090; ')
-            self.assertNotEqual(r.returncode, 0)
-            self.assertNotIn('0.0.0.0', r.stdout + r.stderr)
-            self.assertFalse((self.run_dir / 'mihomo.yaml').exists())
+            # a controller is written for nobody: not for a setting of an older store, not for a legacy vpn.conf
+            (self.store / 'settings').write_text("MIHOMO_CONTROLLER='127.0.0.1:9090'\n")
+            gen = self.gen(shell, 'MIHOMO_CONTROLLER=127.0.0.1:9090; ')
+            self.assertNotIn('external-controller', gen)
+            self.assertNotIn('9090', gen)
+            self.assertEqual(self.top_keys(gen), ['proxies', 'rules'] + list(MH_OURS))
             # a mihomo that rejects the file fails the gen, without repeating what mihomo said
             self.mihomo_stub('echo "yaml: cannot unmarshal !!str hunter2" >&2; exit 1')
             r = self.run_lib(shell, 'drv_gen')
@@ -3158,7 +3158,12 @@ rules:
                     ('a quoted top-level key', base + '"tun":\n  enable: true\n', 'top-level line'),
                     ('a flow collection at column 0', 'proxies: [\n{name: a, type: ss, server: s, port: 1, password: hunter2}\n]\n', 'top-level line'),
                     ('a merge key', base + '<<: {tun: {enable: true}}\n', 'top-level line'),
+                    ('a merge key of an anchor', base + 'x: &x {tun: {enable: true}}\n<<: *x\n', 'top-level line'),
+                    ('an alias at column 0', base + 'x: &x {tun: {enable: true}}\n*x\n', 'top-level line'),
                     ('an anchor at column 0', base + '&x tun:\n  enable: true\n', 'top-level line'),
+                    ('a merge tag', base + 'x: &x {udp: true}\nproxy-groups:\n  - !!merge <<: *x\n', 'tag'),
+                    ('a name reserved for the driver', base + 'mu300-anchor-1: {}\n', 'reserved'),
+                    ('a reserved name in another case', base + 'MU300-Anchor-1: &p {}\n', 'reserved'),
                     ('a kept key twice', base + 'rules:\n  - MATCH,a\n', 'twice'),
                     ('no proxies', 'rules:\n  - MATCH,DIRECT\n', 'no proxies'),
                     ('empty', '', 'no proxies'),
@@ -3288,34 +3293,38 @@ rules:
         for shell in self.each_shell():
             self.setup_profile(shell)
             f = self.tmp / 'w.yaml'
-            for name, text, ctl, ok in (
-                    ('as written', good, '', True),
-                    ('with the controller', good + "external-controller: '127.0.0.1:9090'\n", '127.0.0.1:9090', True),
-                    ('a controller that was not asked for', good + "external-controller: '127.0.0.1:9090'\n", '', False),
-                    ('no controller although asked', good, '127.0.0.1:9090', False),
-                    ('two tun', good + 'tun:\n  enable: true\n', '', False),
-                    ('two dns', good + 'dns:\n  enable: true\n', '', False),
-                    ('no tun', good.replace('tun:\n  enable: true\n', ''), '', False),
-                    ('a stray secret', good + 'secret: x\n', '', False),
-                    ('a stray listener', good + 'listeners:\n  - x\n', '', False),
-                    ('an anchor holder of ours', good + 'mu300-anchor-12: &p {type: http}\n', '', True),
-                    ('an anchor holder spelled otherwise', good + 'mu300-anchor-x: &p {type: http}\n', '', False),
-                    ('allow-lan true', good.replace('allow-lan: false', 'allow-lan: true'), '', False),
-                    ('another mark', good.replace('routing-mark: 720', 'routing-mark: 721'), '', False),
-                    ('no mark', good.replace('routing-mark: 720\n', ''), '', False),
-                    ('a quoted key', good + '"x": 1\n', '', False),
-                    ('a list', good + '- x\n', '', False),
+            for name, text, ok in (
+                    ('as written', good, True),
+                    ('a controller', good + "external-controller: '127.0.0.1:9090'\n", False),
+                    ('a unix controller', good + "external-controller-unix: /run/x.sock\n", False),
+                    ('a tls controller', good + "external-controller-tls: '127.0.0.1:9443'\n", False),
+                    ('a pipe controller', good + "external-controller-pipe: x\n", False),
+                    ('an external ui', good + "external-ui: /x\n", False),
+                    ('a key of ours in another case', good + "External-Controller: '127.0.0.1:9090'\n", False),
+                    ('two tun', good + 'tun:\n  enable: true\n', False),
+                    ('two dns', good + 'dns:\n  enable: true\n', False),
+                    ('no tun', good.replace('tun:\n  enable: true\n', ''), False),
+                    ('a stray secret', good + 'secret: x\n', False),
+                    ('a stray listener', good + 'listeners:\n  - x\n', False),
+                    ('a stray port', good + 'mixed-port: 7890\n', False),
+                    ('an anchor holder of ours', good + 'mu300-anchor-12: &p {type: http}\n', True),
+                    ('an anchor holder spelled otherwise', good + 'mu300-anchor-x: &p {type: http}\n', False),
+                    ('allow-lan true', good.replace('allow-lan: false', 'allow-lan: true'), False),
+                    ('another mark', good.replace('routing-mark: 720', 'routing-mark: 721'), False),
+                    ('no mark', good.replace('routing-mark: 720\n', ''), False),
+                    ('a quoted key', good + '"x": 1\n', False),
+                    ('a list', good + '- x\n', False),
                     # the guard's line model is yaml.v3's: a line break hidden in a line is several lines to mihomo
-                    ('a lone CR in a line', good.encode().replace(b'type: ss}\n', b'type: ss}\rlisteners: []\n'), '', False),
-                    ('a NEL in a line', good.encode().replace(b'type: ss}\n', b'type: ss}\xc2\x85listeners: []\n'), '', False),
-                    ('an LS in a line', good.encode().replace(b'type: ss}\n', b'type: ss}\xe2\x80\xa8listeners: []\n'), '', False),
-                    ('a PS in a line', good.encode().replace(b'type: ss}\n', b'type: ss}\xe2\x80\xa9listeners: []\n'), '', False),
-                    ('a CR at the end of a line', good.encode().replace(b'type: ss}\n', b'type: ss}\r\n'), '', False)):
+                    ('a lone CR in a line', good.encode().replace(b'type: ss}\n', b'type: ss}\rlisteners: []\n'), False),
+                    ('a NEL in a line', good.encode().replace(b'type: ss}\n', b'type: ss}\xc2\x85listeners: []\n'), False),
+                    ('an LS in a line', good.encode().replace(b'type: ss}\n', b'type: ss}\xe2\x80\xa8listeners: []\n'), False),
+                    ('a PS in a line', good.encode().replace(b'type: ss}\n', b'type: ss}\xe2\x80\xa9listeners: []\n'), False),
+                    ('a CR at the end of a line', good.encode().replace(b'type: ss}\n', b'type: ss}\r\n'), False)):
                 if isinstance(text, bytes):
                     f.write_bytes(text)
                 else:
                     f.write_text(text)
-                r = self.run_lib(shell, f'mihomo_written_ok "{ctl}" "{f}" && echo OK')
+                r = self.run_lib(shell, f'mihomo_written_ok "{f}" && echo OK')
                 self.assertEqual('OK' in r.stdout, ok, (name, r.stderr))
 
     def test_engine_and_extra(self):
@@ -3388,6 +3397,129 @@ rules:
             self.assertEqual(self.run_lib(shell, 'drv_gen').returncode, 0)
             r = self.run_lib(shell, 'drv_status')
             self.assertEqual(r.stdout.splitlines(), ['mode: global', 'proxies: 1'])
+            self.no_secrets(r)
+
+    # ---- the gates the JSON drivers have, one for one (RawJson) ----
+    def test_nothing_listens(self):
+        # RawJson.test_listener_guard's sibling: every port, listener, control API and UI a Clash file can carry is
+        # gone from the written file, in any spelling; the driver writes no controller for anybody (there is no
+        # MIHOMO_CONTROLLER setting, and a value of an older store or a legacy vpn.conf is not read), and the guard
+        # behind the rebuild refuses a file that has one
+        text = ('mixed-port: 7890\nport: 7891\nsocks-port: 7892\nredir-port: 7893\ntproxy-port: 7894\n'
+                'allow-lan: true\nbind-address: "*"\nlan-allowed-ips: [0.0.0.0/0]\nlan-disallowed-ips: []\n'
+                'authentication: ["u:ctl-secret"]\nskip-auth-prefixes: [127.0.0.1/8]\n'
+                "external-controller: '127.0.0.1:9090'\nexternal-controller-tls: 0.0.0.0:9443\n"
+                'external-controller-unix: /run/mihomo.sock\nexternal-controller-pipe: x\n'
+                'external-controller-cors: {allow-origins: ["*"]}\nexternal-ui: /tmp/ui\nexternal-ui-name: x\n'
+                'external-ui-url: https://x.example/ui.zip\nexternal-doh-server: /dns-query\nsecret: ctl-secret\n'
+                'External-Controller-Unix: /run/x.sock\nEXTERNAL-UI: /tmp/ui\n'
+                'tls: {certificate: /etc/ssl/x.pem, private-key: /etc/ssl/x.key}\n'
+                'listeners:\n  - {name: l, type: socks, port: 9999, listen: 0.0.0.0}\n'
+                'tunnels: [tcp/udp,127.0.0.1:6553,8.8.8.8:53,proxy]\n'
+                'ss-config: ss://x@0.0.0.0:1\nvmess-config: x\ntuic-server: {enable: true, listen: 0.0.0.0:443}\n'
+                'dns:\n  enable: true\n  listen: 0.0.0.0:53\n'
+                'tun:\n  enable: true\n  auto-route: true\n  auto-detect-interface: true\n  auto-redirect: true\n'
+                + MH_BASE)
+        for shell in self.each_shell():
+            self.setup_profile(shell, text)
+            (self.store / 'settings').write_text("MIHOMO_CONTROLLER='127.0.0.1:9090'\n")
+            gen = self.gen(shell, 'MIHOMO_CONTROLLER=127.0.0.1:9090; ')
+            self.assertEqual(self.top_keys(gen), ['proxies', 'rules'] + list(MH_OURS))
+            for gone in ('\nport:', '-port:', 'listen', 'external', 'External', 'EXTERNAL', 'secret', 'ctl-secret', 'authentication',
+                         'skip-auth', 'lan-allowed', 'lan-disallowed', '/etc/ssl', 'certificate', 'private-key',
+                         'tunnels', 'ss-config', 'vmess-config', 'tuic-server', '0.0.0.0', '9090', '9443', '.sock',
+                         'auto-route: true', 'auto-detect-interface: true', 'auto-redirect: true', 'dns-query', '/tmp/ui'):
+                self.assertNotIn(gone, gen, gone)
+            self.assertIn('  auto-route: false', self.block(gen, 'tun'))
+            self.assertIn('  auto-detect-interface: false', self.block(gen, 'tun'))
+            self.assertNotIn('listen', '\n'.join(self.block(gen, 'dns')))
+            r = self.cli(shell, 'check', 'sub')
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.no_secrets(r)
+            self.assertNotIn('ctl-secret', r.stdout + r.stderr)
+            # nothing can ask for a controller
+            r = self.cli(shell, 'settings', 'set', 'MIHOMO_CONTROLLER', '127.0.0.1:9090')
+            self.assertNotEqual(r.returncode, 0)
+            r = self.cli(shell, 'settings', 'get')
+            self.assertNotIn('MIHOMO_CONTROLLER', r.stdout + r.stderr)
+            r = self.run_lib(shell, 'mihomo_ours gvisor; echo "ours=[$MIHOMO_OURS]"', 'MIHOMO_CONTROLLER=127.0.0.1:9090; ')
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertNotIn('external', r.stdout)
+            self.assertNotIn('9090', r.stdout)
+            self.assertIn('ours=[routing-mark allow-lan bind-address tun dns]', r.stdout)
+
+    def test_keys_spelled_differently_are_refused(self):
+        # RawJson.test_keys_are_the_shapes_named_exactly's sibling: a top-level key that is one of the kept names
+        # or ours in another spelling (another case, _ for -) is refused, naming the name it collides with and
+        # nothing of the file. (mihomo's reader is case-sensitive and would not read it; the file is refused rather
+        # than reduced to something its author did not mean, as the JSON drivers do.)
+        for shell in self.each_shell():
+            for extra, name in (('Proxies: []\n', 'proxies'), ('proxy_groups: []\n', 'proxy-groups'),
+                                ('RULES: []\n', 'rules'), ('Rule_Providers: {}\n', 'rule-providers'),
+                                ('Tun:\n  enable: true\n', 'tun'), ('DNS: {listen: 0.0.0.0:53}\n', 'dns'),
+                                ('Routing_Mark: 1\n', 'routing-mark'), ('Allow-LAN: true\n', 'allow-lan'),
+                                ('Bind_Address: "*"\n', 'bind-address'), ('Mode: global\n', 'mode')):
+                with self.subTest(what=extra):
+                    r = self.refused(shell, MH_BASE + extra, 'spelled differently from ' + name, extra)
+                    self.assertNotIn(extra.split(':')[0], r.stderr)
+                    self.assertNotIn('0.0.0.0', r.stderr)
+            # the exact spelling next to the other one is refused the same way, not taken as "twice"
+            r = self.refused(shell, MH_BASE + 'Rules: []\n', 'spelled differently from rules')
+            self.assertNotIn('twice', r.stderr)
+
+    def test_the_size_cap_comes_before_any_read(self):
+        # RawJson.test_the_size_cap_comes_before_any_full_read's sibling: the cap is the first thing the reader
+        # and the import run, before the control-character count and before awk sees a line
+        big = self.tmp / 'big.yaml'
+        big.write_text(MH_BASE + '# ' + 'x' * (1 << 20) + '\n')
+        for shell in self.each_shell():
+            self.setup_profile(shell)
+            r = self.run_lib(shell, 'awk() { echo AWK-RAN; }; '
+                                    f'mihomo_read check "{big}" || echo no; mihomo_read gen "{big}" || echo no; '
+                                    f'drv_import "{big}" || echo no')
+            self.assertEqual(r.stdout.splitlines(), ['the mihomo config is larger than 1 MiB', 'no', 'no', 'no'], r.stderr)
+            self.assertIn('1 MiB', r.stderr)
+            self.assertNotIn('AWK-RAN', r.stdout + r.stderr)
+            self.assertEqual((self.store / 'profiles/sub/config.yaml').read_text(), MH_CONF)
+        text = (LIB / 'mihomo.sh').read_text()
+        for fn in ('mihomo_read() {', 'drv_import() {'):
+            body = text[text.index(fn):text.index('\n}\n', text.index(fn))]
+            for reader in (' awk ', ' tr ', ' cat ', ' is_json ', ' mihomo_read '):
+                if reader in body:
+                    self.assertLess(body.index('json_size_ok'), body.index(reader), (fn, reader))
+
+    def test_an_alias_cannot_bring_a_key_in(self):
+        # the JSON drivers strip the dial fields at every depth; here what an alias or a merge key can bring into
+        # a kept block comes from an anchored block that went through the same removals and the same text check,
+        # and the top-level keys stay the lines the reader saw (a merge key, an alias or an anchor at column 0 is
+        # no KEY: line, see test_refusals_name_the_rule_and_nothing_of_the_file)
+        text = ('x: &x\n  Interface-Name: eth0\n  routing-mark: 9\n  udp: true\n'
+                't: &t {enable: true, auto-route: true, auto-detect-interface: true, interface-name: eth0}\n'
+                'd: &d {enable: true, listen: 0.0.0.0:53, ROUTING-MARK: 9}\n'
+                + MH_BASE + 'proxy-groups:\n  - name: g\n    type: select\n    <<: *x\n    proxies: [a]\n'
+                'profile: *t\nsniffer: *d\n')
+        for shell in self.each_shell():
+            self.setup_profile(shell, text)
+            gen = self.gen(shell)
+            lines = gen.splitlines()
+            self.assertEqual(self.top_keys(gen), ['mu300-anchor-1', 'mu300-anchor-2', 'mu300-anchor-3',
+                                                  'proxies', 'rules', 'proxy-groups', 'profile', 'sniffer'] + list(MH_OURS))
+            self.assertEqual(self.block(gen, 'mu300-anchor-1'), ['mu300-anchor-1: &x', '  udp: true'])
+            self.assertIn('mu300-anchor-2: &t {enable: true, auto-route: true, auto-detect-interface: true}', lines)
+            self.assertIn('mu300-anchor-3: &d {enable: true, listen: 0.0.0.0:53}', lines)
+            self.assertIn('    <<: *x', lines)
+            self.assertIn('profile: *t', lines)
+            for gone in ('eth0', 'routing-mark: 9', 'ROUTING-MARK', 'Interface-Name', 'interface-name'):
+                self.assertNotIn(gone, gen, gone)
+            self.assertEqual(lines.count('tun:'), 1)
+            self.assertEqual(lines.count('dns:'), 1)
+            self.assertIn('  auto-route: false', self.block(gen, 'tun'))
+            self.assertEqual(gen.count('routing-mark'), 1)
+            self.assertIn('routing-mark: 720', lines)
+            # the written file passes its own guard, and the check says which blocks were kept for their anchors
+            r = self.cli(shell, 'check', 'sub')
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn(' x t d\n', r.stderr)
             self.no_secrets(r)
 
 

@@ -70,7 +70,6 @@ Everything under `/etc/mu300`, which updates keep. Each system (Ubuntu, OpenWrt,
 | REMOTE_DNS | IPv4/IPv6 address | 1.1.1.1 | DNS for the device and clients, through the tunnel |
 | BOOTSTRAP_DNS | IPv4/IPv6 address | 1.1.1.1 | for server names, outside the tunnel (sing-box, mihomo) |
 | LAN_CIDRS | comma list of CIDRs | empty | the device's own LAN is always added (as today) |
-| MIHOMO_CONTROLLER | empty or `127.0.0.1:PORT` / `[::1]:PORT` | empty | mihomo's external-controller; off by default |
 | XRAY HEV SING_BOX MIHOMO OPENVPN | absolute path | empty | another engine binary (as XRAY= in vpn.conf today) |
 
 `settings set` validates and refuses (exit 2) a value outside these; on read an invalid value counts as the default.
@@ -143,8 +142,8 @@ The kill switch lets only marked traffic out on an uplink, and rule 9000 keeps i
   top-level key and its indented block; every other block is removed) and ours appended: TUN `mh-mu300`, stack from
   the profile's `MIHOMO_STACK` (default gvisor), `auto-route: false`, `auto-detect-interface: false`, no DNS hijack;
   `dns` with `proxy-server-nameserver`/`default-nameserver` = BOOTSTRAP_DNS, `nameserver` = REMOTE_DNS,
-  `respect-rules: true`; `allow-lan: false`; `bind-address: '127.0.0.1'`; `external-controller` only when
-  MIHOMO_CONTROLLER is set. Checked with `mihomo -t`.
+  `respect-rules: true`; `allow-lan: false`; `bind-address: '127.0.0.1'`; no `external-controller` of any kind (the
+  TUN is the only thing that listens). Checked with `mihomo -t`.
 * **wireguard**: `wg set wg-mu300 fwmark 0x2d0`. `wg.conf`'s wg-quick keys (Address, DNS, MTU, Table, Pre/PostUp/Down,
   SaveConfig) are stripped for `wg setconf`, and so are ListenPort (a config opens no port on the device) and
   FwMark (the mark is ours, set by `wg set` after setconf); the Endpoint name is resolved, Address goes on with `ip addr`, MTU
@@ -403,9 +402,10 @@ Per system, at every start of `mu300-vpn` (any command), idempotent, and only wh
   not refused. Kept: `proxies`, `proxy-groups`, `proxy-providers`, `rules`, `rule-providers`, `sub-rules`, `hosts`,
   `mode`, `log-level`, `ipv6`, `geodata-mode`, `geodata-loader`, `geox-url`, `profile`, `sniffer`. Written by the
   driver, whatever the file had: `tun` (ours), `dns` (ours), `routing-mark: 720`, `allow-lan: false`,
-  `bind-address: '127.0.0.1'`, and `external-controller` only as MIHOMO_CONTROLLER, which must be a 127.0.0.1
-  address (no `external-controller-tls`/`-unix`/`-pipe`, no `external-ui*`; the file's `secret` is removed with the
-  rest - the controller listens on loopback only, where every user of this device is root). `port`, `socks-port`,
+  `bind-address: '127.0.0.1'`. No controller or API of any kind is written: `external-controller`,
+  `external-controller-tls`/`-unix`/`-pipe`/`-cors`, `external-ui*`, `external-doh-server`, `tls` and `secret` are
+  removed with the rest (there is no setting that asks for one; an unauthenticated control API could reconfigure
+  mihomo, and a secret of the file's would be the file author's). `port`, `socks-port`,
   `mixed-port`, `redir-port` and `tproxy-port` are removed (the TUN is the only
   inbound; were one ever written, `allow-lan: false` and the bind address keep it on loopback). Everything else is
   removed with the unlisted keys - among them `listeners`, `tunnels`, `ss-config`, `vmess-config`, `tuic-server`
@@ -436,10 +436,13 @@ Per system, at every start of `mu300-vpn` (any command), idempotent, and only wh
     middle of a value belongs to the value), a hex escape (`\x`, `\u`, `\U`: the one way a key can be spelled
     without its text on one line), a column-0 line that is not `KEY:` (a quoted key, a list item, a merge key, an anchor, a flow collection
     continued at column 0: YAML would read it as top-level content that the line rules cannot see), a kept key
-    given twice (mihomo's YAML reader refuses it anyway), and a file without `proxies` and `proxy-providers`. A
+    given twice (mihomo's YAML reader refuses it anyway), a top-level key that is a kept name or one of ours in
+    another spelling (case, `_` for `-`: refused by the name it collides with, as the JSON drivers refuse a
+    misspelled shape key), a key of the driver's own reserved names (`mu300-anchor-N`), and a file without
+    `proxies` and `proxy-providers`. The size cap comes before anything reads the file, as in the JSON drivers. A
     first line `---`, a BOM and CRLF line ends are taken. The written file is checked again before `mihomo -t`
     (no line break but LF, the guard's line model being yaml.v3's; every column-0 key one of the kept list, ours or `mu300-anchor-N`, `tun` and `dns` exactly once, `routing-mark: 720`,
-    `allow-lan: false`, `bind-address` once, `external-controller` exactly when MIHOMO_CONTROLLER is set), and
+    `allow-lan: false`, `bind-address` once, no `external-*` key), and
     `mihomo -t`'s own output is not shown (its YAML errors quote values); the message gives the command to run.
 * The kill switch is unchanged: only marked traffic, NTP and the Wi-Fi client's DHCP leave on an uplink; forwarded
   traffic to an uplink is dropped. Every new driver marks its own sockets, so none of them needs an exception.
@@ -450,7 +453,7 @@ Per system, at every start of `mu300-vpn` (any command), idempotent, and only wh
 * `tests/test_vpn_drivers.py` (every shell): the driver contract per type with stub engines recording their
   arguments (`xray`, `hev-socks5-tunnel`, `sing-box`, `mihomo`, `wg`, `openvpn`, `ip`, `nft`); the URI parsers
   (vless, vmess base64 JSON, trojan, ss SIP002 and legacy base64, wg .conf); raw JSON/YAML forcing (marks, inbounds,
-  TUN, controller); migration (first, idempotent, an edited vpn.conf, not writable); profile CRUD, ID validation,
+  TUN, no controller); migration (first, idempotent, an edited vpn.conf, not writable); profile CRUD, ID validation,
   `use` keeping the kill switch (no `delete table` between two runs); settings validation; `engines` output;
   reserved types; nothing secret in stdout/stderr of `list`/`show`/`status`/`run`.
 * `tests/test_static.py`: the vpn-mihomo extra in make-release's build and audit lists and mu300-update's EXTRAS;

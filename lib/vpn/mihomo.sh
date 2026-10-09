@@ -9,8 +9,9 @@
 # profile's file: the driver reads it once, line by line (awk; there is no YAML parser on the device, and the rules
 # below are about lines, see mihomo_read), keeps the top-level blocks of an allowlist, removes the rest (Clash files
 # carry many harmless keys, so an unknown key is dropped, not refused), takes interface-name and routing-mark out of
-# every proxy and group, appends what is ours last (the mark, allow-lan, bind-address, tun, dns, the controller),
-# checks the written file once more (mihomo_written_ok), and only then lets mihomo check (-t) and run it. The
+# every proxy and group, appends what is ours last (the mark, allow-lan, bind-address, tun, dns; no controller or
+# API of any kind: the TUN is the only thing that listens, and nothing can ask for more), checks the written file
+# once more (mihomo_written_ok), and only then lets mihomo check (-t) and run it. The
 # profile keeps the file as imported (profile export gives it back). A refusal names a key of our own lists or a
 # rule, never a value or a line of the file, and mihomo's own messages are not repeated (its YAML errors quote values).
 DRV_EXTRA=vpn-mihomo
@@ -26,8 +27,10 @@ unset SAFE_PATHS SKIP_SAFE_PATH_CHECK
 
 # the top-level keys of the file that survive, as the spec's Security section lists them; every other one is removed
 MIHOMO_KEYS='proxies proxy-groups proxy-providers rules rule-providers sub-rules hosts mode log-level ipv6 geodata-mode geodata-loader geox-url profile sniffer'
-# the top-level keys this driver writes (external-controller only when MIHOMO_CONTROLLER is set)
-MIHOMO_OURS='routing-mark allow-lan bind-address tun dns external-controller'
+# the top-level keys this driver writes, and the only ones besides the kept list that the written file may have:
+# external-controller (and -tls, -unix, -pipe, -cors), external-ui*, external-doh-server, secret and tls are not
+# among them, so no control API of the file's or of a setting's ever reaches mihomo
+MIHOMO_OURS='routing-mark allow-lan bind-address tun dns'
 
 # The binary: the MIHOMO setting when there is one, else the extra's (or /opt/mu300/bin, or PATH).
 mihomo_bin() { if [ -n "${_mihomo:-}" ]; then printf '%s\n' "$_mihomo"; else engine_path mihomo vpn-mihomo; fi; }
@@ -61,9 +64,12 @@ mihomo_home() {
 # line ending in a backslash and a quoted scalar not closed on its line (the other ways a key can span lines), a
 # hex escape (\x, \u, \U: the one way a key can be spelled without its text on one line), a column-0 line that is
 # not "KEY:" (a quoted key, a list item, a merge key, an anchor, a flow collection continued at column 0), a kept
-# key given twice (mihomo's reader refuses it anyway) and a file with neither proxies nor proxy-providers. A first
-# line "---", a BOM and CRLF line ends are taken. The size and the control bytes are checked in the shell, before
-# awk sees the file.
+# key given twice (mihomo's reader refuses it anyway), a top-level key that is a kept name or one of ours in another
+# spelling (another case, _ for -: mihomo's reader would not read it, and the JSON drivers refuse a misspelled
+# shape key the same way; the refusal names the name it collides with, not the file's key), a key of the driver's
+# own reserved names (mu300-anchor-N) and a file with neither proxies nor proxy-providers. A first line "---", a
+# BOM and CRLF line ends are taken. The size cap comes first (before the control-byte count, which is the shell's,
+# and before awk sees a line), as in the JSON drivers.
 mihomo_read() {
     json_size_ok "$2" || { [ "$1" != check ] || echo "the mihomo config is larger than 1 MiB"; return 1; }
     # what is left after removing TAB, LF, CR, printable ASCII and the bytes from 0x80 is a control character or NUL
@@ -72,7 +78,7 @@ mihomo_read() {
         [ "$1" != check ] || echo "the mihomo config has a control character (NUL, escape, form feed ...), which it may not contain"
         return 1
     fi
-    LC_ALL=C awk -v mode="$1" -v keep="$MIHOMO_KEYS" '
+    LC_ALL=C awk -v mode="$1" -v keep="$MIHOMO_KEYS" -v ours="$MIHOMO_OURS" '
     function bad(m) { if (mode == "check") print "the mihomo config " m; err = 1 }
     function atline(m) { bad("(line " NR ") " m) }
     function emit(s) { out[++no] = s }
@@ -193,8 +199,12 @@ mihomo_read() {
         dropto = -1
         for (i = 2; i <= npend; i++) body(pend[i])
     }
+    # fold(k): a key as a case-insensitive reader with - for _ would see it; foldk maps the folds of the kept names
+    # and ours back to the name, so a key spelled otherwise is caught by the name it collides with
+    function fold(k) { k = tolower(k); gsub(/_/, "-", k); return k }
     BEGIN {
-        n = split(keep, a, " "); for (i = 1; i <= n; i++) keepk[a[i]] = 1
+        n = split(keep, a, " "); for (i = 1; i <= n; i++) { keepk[a[i]] = 1; foldk[fold(a[i])] = a[i] }
+        n = split(ours, a, " "); for (i = 1; i <= n; i++) foldk[fold(a[i])] = a[i]
         dk[1] = "interface-name"; dk[2] = "routing-mark"
         dropto = -1; keeping = 0; dropping = 0; ngone = 0; nanch = 0
     }
@@ -234,6 +244,11 @@ mihomo_read() {
             keeping = 0; next
         }
         k = $0; sub(/[ \t]*:.*/, "", k)
+        f = fold(k)
+        if (f ~ /^mu300-anchor-[0-9]+$/) { atline("has the top-level key mu300-anchor-N, a name reserved for this driver"); keeping = 0; next }
+        if ((f in foldk) && k != foldk[f]) {
+            atline("has a top-level key spelled differently from " foldk[f] " (another case, or _ for -)"); keeping = 0; next
+        }
         if (k in keepk) {
             if (k in seen) bad("has the top-level key " k " twice")
             seen[k] = 1; keeping = 1
@@ -259,16 +274,16 @@ mihomo_read() {
         }
         if (err) exit 1
         if (mode == "gen") { for (i = 1; i <= no; i++) print out[i]; exit 0 }
-        if (gonelist != "") print "note: top-level keys of the file that are not used (this driver writes its own tun, dns, ports and controller):" gonelist (ngone > 40 ? " ..." : "")
+        if (gonelist != "") print "note: top-level keys of the file that are not used (this driver writes its own tun and dns; nothing listens but the TUN):" gonelist (ngone > 40 ? " ..." : "")
         if (anchored != "") print "note: kept for the anchors (&name) they define, under names mihomo does not read:" anchored
     }' "$2"
 }
 
-# mihomo_ours STACK CONTROLLER: the top-level keys this driver writes, after the file's own (the last wins in no
-# reader; they are the only ones, see mihomo_written_ok). The TUN is the only inbound (no port of any kind, and
-# allow-lan off with the bind address on loopback should one ever be written); auto-route and auto-detect-interface
-# are off (the core routes, the kernel picks the uplink); DNS: the server names through BOOTSTRAP_DNS over mihomo's
-# own marked sockets, everything else through REMOTE_DNS behind the rules.
+# mihomo_ours STACK: the top-level keys this driver writes, after the file's own (the last wins in no reader; they
+# are the only ones, see mihomo_written_ok). The TUN is the only inbound (no port of any kind, no controller or
+# API, and allow-lan off with the bind address on loopback should one ever be written); auto-route and
+# auto-detect-interface are off (the core routes, the kernel picks the uplink); DNS: the server names through
+# BOOTSTRAP_DNS over mihomo's own marked sockets, everything else through REMOTE_DNS behind the rules.
 mihomo_ours() {
     cat <<EOF
 routing-mark: $((MARK))
@@ -292,16 +307,15 @@ dns:
   proxy-server-nameserver: ['$BOOTSTRAP_DNS']
   nameserver: ['$REMOTE_DNS']
 EOF
-    [ -z "$2" ] || printf "external-controller: '%s'\n" "$2"
 }
 
-# mihomo_written_ok CONTROLLER FILE: the guard behind the rebuild, on the file mihomo gets: no line break but LF
-# (yaml.v3's line is the guard's line), every column-0 line a "KEY:" line whose key is one of the kept list, ours
-# or an anchor holder of ours (mu300-anchor-N, see flush_dropped), tun and dns exactly once, routing-mark 720 and allow-lan
-# false (once each), bind-address once, external-controller exactly when CONTROLLER is set. A later change to the
-# reduction that let something through fails closed here instead of reaching mihomo.
+# mihomo_written_ok FILE: the guard behind the rebuild, on the file mihomo gets: no line break but LF (yaml.v3's
+# line is the guard's line), every column-0 line a "KEY:" line whose key is one of the kept list, ours or an anchor
+# holder of ours (mu300-anchor-N, see flush_dropped) - so no external-*, secret, tls, port or listener in any
+# spelling - tun and dns exactly once, routing-mark 720 and allow-lan false (once each), bind-address once. A later
+# change to the reduction that let something through fails closed here instead of reaching mihomo.
 mihomo_written_ok() {
-    LC_ALL=C awk -v keep="$MIHOMO_KEYS" -v ours="$MIHOMO_OURS" -v ctl="$1" -v mark="$((MARK))" '
+    LC_ALL=C awk -v keep="$MIHOMO_KEYS" -v ours="$MIHOMO_OURS" -v mark="$((MARK))" '
     BEGIN { n = split(keep " " ours, a, " "); for (i = 1; i <= n; i++) ok[a[i]] = 1 }
     # the line model is that of yaml.v3: a CR, NEL, LS or PS anywhere is a line end to mihomo, so a line holding one
     # fails the file (the reduction writes none: a CRLF end is stripped, a break inside a line refused)
@@ -316,30 +330,24 @@ mihomo_written_ok() {
       if (k == "bind-address" && $0 != "bind-address: \047127.0.0.1\047") bad = 1
       if (bad) exit }
     END { if (bad) exit 1
-          if (c["tun"] != 1 || c["dns"] != 1 || c["routing-mark"] != 1 || c["allow-lan"] != 1 || c["bind-address"] != 1) exit 1
-          if (c["external-controller"] + 0 != (ctl != "" ? 1 : 0)) exit 1 }' "$2"
+          if (c["tun"] != 1 || c["dns"] != 1 || c["routing-mark"] != 1 || c["allow-lan"] != 1 || c["bind-address"] != 1) exit 1 }' "$1"
 }
 
 # mihomo_rebuild SRC OUT: SRC reduced (mihomo_read) with ours appended, into OUT (0600), or a refusal on stderr and
-# no OUT. The stack is the profile's MIHOMO_STACK (gvisor unless it says system or mixed), the controller the
-# MIHOMO_CONTROLLER setting - checked once more here, as are the two resolvers: where the store is not used they come
-# from vpn.conf, which nothing validated.
+# no OUT. The stack is the profile's MIHOMO_STACK (gvisor unless it says system or mixed); the two resolvers are
+# checked once more here: where the store is not used they come from vpn.conf, which nothing validated.
 mihomo_rebuild() {
     _src=$1; _out=$2
     rm -f "$_out"
     mihomo_read check "$_src" >&2 || return 1
     _stack=; kv_var _stack "$PDIR/meta" MIHOMO_STACK
     case $_stack in gvisor|system|mixed) ;; *) _stack=gvisor ;; esac
-    _ctl=${MIHOMO_CONTROLLER:-}
-    if [ -n "$_ctl" ] && ! setting_valid MIHOMO_CONTROLLER "$_ctl"; then
-        echo "MIHOMO_CONTROLLER is not a loopback address (127.0.0.1:PORT or [::1]:PORT): not written" >&2; return 1
-    fi
     { ip4_ok "$REMOTE_DNS" || ip6_ok "$REMOTE_DNS"; } && { ip4_ok "$BOOTSTRAP_DNS" || ip6_ok "$BOOTSTRAP_DNS"; } ||
         { echo "REMOTE_DNS and BOOTSTRAP_DNS must be IP addresses" >&2; return 1; }
-    if ! ( umask 077; { mihomo_read gen "$_src" && mihomo_ours "$_stack" "$_ctl"; } > "$_out.r" ); then
+    if ! ( umask 077; { mihomo_read gen "$_src" && mihomo_ours "$_stack"; } > "$_out.r" ); then
         rm -f "$_out.r"; echo "cannot write $_out" >&2; return 1
     fi
-    if ! mihomo_written_ok "$_ctl" "$_out.r"; then
+    if ! mihomo_written_ok "$_out.r"; then
         rm -f "$_out.r"; echo "the rebuilt mihomo config is not what this driver writes: refused" >&2; return 1
     fi
     mv "$_out.r" "$_out" && chmod 600 "$_out" && return 0

@@ -128,10 +128,6 @@ setting_valid() {
             case $2 in ,*|*,|*,,*|*[!0-9A-Fa-f.:/,]*) return 1 ;; esac
             _o=$IFS; IFS=,; set -- $2; IFS=$_o
             for _c; do cidr_ok "$_c" || return 1; done ;;
-        # mihomo's external controller can reconfigure it: never anywhere but loopback
-        MIHOMO_CONTROLLER)
-            case $2 in '') return 0 ;; 127.0.0.1:*) port_ok "${2#127.0.0.1:}" ;; '[::1]:'*) port_ok "${2#\[::1\]:}" ;;
-                *) return 1 ;; esac ;;
         XRAY|HEV|SING_BOX|MIHOMO|OPENVPN) case $2 in ''|/*) return 0 ;; esac; return 1 ;;
         *) return 1 ;;
     esac
@@ -149,7 +145,6 @@ setting() { setting_var _sv "$1"; printf '%s\n' "$_sv"; }
 settings_load() {
     setting_var KILL_SWITCH KILL_SWITCH; setting_var TAILSCALE TAILSCALE; setting_var IPV6 IPV6
     setting_var REMOTE_DNS REMOTE_DNS; setting_var BOOTSTRAP_DNS BOOTSTRAP_DNS; setting_var LAN_CIDRS LAN_CIDRS
-    setting_var MIHOMO_CONTROLLER MIHOMO_CONTROLLER
     setting_var _xray XRAY; setting_var _hev HEV; setting_var _sb SING_BOX; setting_var _mihomo MIHOMO
     setting_var _openvpn OPENVPN
 }
@@ -1262,7 +1257,7 @@ profile_cmd() {
     esac
 }
 
-SETTING_KEYS='KILL_SWITCH TAILSCALE IPV6 REMOTE_DNS BOOTSTRAP_DNS LAN_CIDRS MIHOMO_CONTROLLER XRAY HEV SING_BOX MIHOMO OPENVPN'
+SETTING_KEYS='KILL_SWITCH TAILSCALE IPV6 REMOTE_DNS BOOTSTRAP_DNS LAN_CIDRS XRAY HEV SING_BOX MIHOMO OPENVPN'
 # setting_show KEY: the value in force - from the store, or as vpn.conf gave it where the store is not used
 setting_show() {
     if [ -n "$STORE" ]; then setting "$1"; return; fi
