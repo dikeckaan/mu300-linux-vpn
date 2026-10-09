@@ -32,6 +32,19 @@ class Vpn(ShellTest):
                        MU300_VPN_RUN=self.tmp / 'run-vpn', MU300_LAN_CONF=self.tmp / 'no-lan.conf',
                        MU300_BIN=BIN, MU300_SYSROOT=self.root, MU300_VPN_LIB=LIB)
 
+    def test_enabled_prints_enable_and_touches_no_network(self):
+        """mu300-power asks `mu300-vpn enabled` before it starts a VPN it stopped; no exit-IP lookup, no nft."""
+        for name in ('wget', 'curl', 'nft'):
+            self.stub(name, f'echo "{name} $*" >> "$STUBLOG/net"')
+        for shell in self.each_shell():
+            for conf, want in (('ENABLE=1\n', '1'), ('ENABLE=0\n', '0'), ('', '0')):
+                self.conf.write_text(conf)
+                (self.root / 'run/mu300/device').write_text('f50\n')
+                r = self.sh(shell, f'"{BIN}/mu300-vpn" enabled', MU300_VPN_CONF=self.conf, MU300_VPN_RUN=self.tmp / 'run-vpn',
+                            MU300_LAN_CONF=self.tmp / 'no-lan.conf', MU300_BIN=BIN, MU300_SYSROOT=self.root)
+                self.assertEqual((r.returncode, r.stdout.strip()), (0, want), r.stderr)
+            self.assertFalse((self.tmp / 'net').exists())
+
     def test_own_lan_always_local(self):
         cases = [
             # (vpn.conf, device, br-lan address, LAN_CIDRS wanted)
@@ -805,6 +818,35 @@ class Tailscale(ShellTest):
             r = self.lib(shell, 'tailscale_up', self.conf_text('sing-box'))
             for net in ('10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16'):
                 self.assertIn(f'pref 5199 {self.TS} to {net} lookup main', self.shown())
+
+
+
+class ServiceUnits(unittest.TestCase):
+    """2026-10-07: xray ran out of its 1024 descriptors ("accept4: too many open files") while the modem was off and
+    needed a restart. Both service definitions raise the limit; mu300-power stops the service while the modem is
+    off (test_power.Incident)."""
+
+    def test_both_service_definitions_raise_the_descriptor_limit(self):
+        top = BIN.parents[4]
+        unit = (top / 'rootfs/overlay/etc/systemd/system/mu300-vpn.service').read_text()
+        self.assertRegex(unit, r'(?m)^\[Service\][^[]*^LimitNOFILE=65536$')
+        init = (top / 'openwrt/overlay/etc/init.d/mu300-vpn').read_text()
+        self.assertRegex(init, r'(?s)procd_open_instance.*procd_set_param limits nofile="65536 65536".*procd_close_instance')
+
+    def test_a_service_stop_leaves_the_kill_switch(self):
+        """What mu300-power relies on when it stops the VPN for a modem that is off: the stop never takes the kill
+        switch down (only ENABLE=0 and mu300-vpn off do), so nothing leaves outside the tunnel meanwhile."""
+        text = (BIN / 'mu300-vpn').read_text()
+        run = text[text.index('\n    run)'):text.index('\n    guard)')]
+        # the two removals a run may do: ENABLE=0, and KILL_SWITCH=0 (one left from before the setting changed)
+        self.assertNotIn('killswitch_off', run.replace('else killswitch_off; fi', '')
+                         .replace('[ "$ENABLE" = 1 ] || { echo "VPN disabled (ENABLE=0 in $CONF)"; killswitch_off', ''))
+        # the core's tunnel runner and the engine drivers never touch it: only `off` does (and `run` as above)
+        self.assertNotIn('killswitch_off', text[text.index('\nrun_tunnel() {'):text.index('\nkillswitch_off() {')])
+        lib = BIN.parent / 'lib/vpn'
+        for drv in sorted(lib.glob('*.sh')) + [lib / 'openvpn-up']:
+            self.assertNotIn('killswitch_off', drv.read_text(), drv.name)
+            self.assertNotIn('mu300_vpn', drv.read_text(), drv.name)
 
 
 if __name__ == '__main__':

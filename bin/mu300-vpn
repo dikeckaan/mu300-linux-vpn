@@ -17,6 +17,8 @@
 #                       so a crash never leaks), and any routing an engine left behind
 #   mu300-vpn restart   the service restarted
 #   mu300-vpn status    profile, kill switch, engine, tunnel, exit IP
+#   mu300-vpn enabled   ENABLE from vpn.conf (0 or 1), nothing else and no network (mu300-power asks it before it
+#                       starts again a VPN it stopped while the modem was off)
 #   mu300-vpn profile list|show|add|import|edit|set|remove|use|export   the profiles (export: the one command
 #                       that prints a profile's credentials; add, import and edit read the link or the config
 #                       from stdin when it is given as -, which keeps it out of the process list)
@@ -1386,8 +1388,9 @@ case "${1:-status}" in
         [ "$ENABLE" = 1 ] || { echo "the VPN is off: mu300-vpn on" >&2; exit 1; }
         svc restart ;;
     status) vpn_status ;;
+    enabled) echo "$ENABLE" ;;
     profile) shift; profile_cmd "$@" ;;
     settings) shift; settings_cmd "$@" ;;
     engines) shift; engines_cmd "$@" ;;
-    *) echo "usage: $0 on|off|restart|status|profile ...|settings ...|engines [install ENGINE]|check [ID]|gen|run|guard" >&2; exit 2 ;;
+    *) echo "usage: $0 on|off|restart|status|enabled|profile ...|settings ...|engines [install ENGINE]|check [ID]|gen|run|guard" >&2; exit 2 ;;
 esac
