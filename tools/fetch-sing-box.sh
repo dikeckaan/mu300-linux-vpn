@@ -1,6 +1,6 @@
 #!/bin/sh
 # Download the pinned sing-box release (static musl arm64) used by mu300-vpn and verify it.
-#   tools/fetch-sing-box.sh [OUT]   (default: ./sing-box, picked up by the rootfs builds)
+#   tools/fetch-sing-box.sh [OUT]   (default: ./sing-box, for tools/make-module.sh)
 set -eu
 VER=1.14.1
 SHA256=d94fc9704372ca2fa2854e54c20b406e4b8779b5ccdd0c557da90ea9344e9631

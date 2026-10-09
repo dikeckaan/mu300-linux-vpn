@@ -2,7 +2,7 @@
 # Download the pinned Xray-core and hev-socks5-tunnel releases (static arm64) used by mu300-vpn's xray engine and
 # verify them. Xray speaks VLESS (it is the reference implementation); hev-socks5-tunnel turns a kernel TUN
 # device into connections on Xray's local SOCKS port.
-#   tools/fetch-xray.sh [OUTDIR]   (default: .; writes OUTDIR/xray and OUTDIR/hev-socks5-tunnel)
+#   tools/fetch-xray.sh [OUTDIR]   (default: .; writes OUTDIR/xray and OUTDIR/hev-socks5-tunnel, for tools/make-module.sh)
 set -eu
 XRAY_VER=26.3.27
 XRAY_SHA256=4d30283ae614e3057f730f67cd088a42be6fdf91f8639d82cb69e48cde80413c

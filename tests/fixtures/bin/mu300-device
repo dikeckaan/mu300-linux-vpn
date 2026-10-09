@@ -1,0 +1,12 @@
+#!/bin/sh
+# Which device this is: f50 or u30air. boot/init writes it to /run/mu300/device; a boot image from before that
+# (an older release's or a mainline kernel) does not, so then the device tree tells, the way init decides:
+# only the U30 Air's has the charger policy service. (MU300_SYSROOT is for tests/: a fake / to read from.)
+R=${MU300_SYSROOT:-}
+if [ -s "$R/run/mu300/device" ]; then
+    cat "$R/run/mu300/device"
+elif [ -d "$R/proc/device-tree/charger_policy_service" ]; then
+    echo u30air
+else
+    echo f50
+fi

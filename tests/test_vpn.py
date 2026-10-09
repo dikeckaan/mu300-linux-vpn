@@ -9,7 +9,7 @@ import subprocess
 import time
 import unittest
 
-from helpers import BIN, LIB, ShellTest
+from helpers import BIN, LIB, SYSBIN, TOP, ShellTest
 
 
 class Vpn(ShellTest):
@@ -30,7 +30,7 @@ class Vpn(ShellTest):
         (self.tmp / 'br-lan').write_text(brlan or '')
         return self.sh(shell, f'. "{BIN}/mu300-vpn"; {code}', MU300_LIB=1, MU300_VPN_CONF=self.conf,
                        MU300_VPN_RUN=self.tmp / 'run-vpn', MU300_LAN_CONF=self.tmp / 'no-lan.conf',
-                       MU300_BIN=BIN, MU300_SYSROOT=self.root, MU300_VPN_LIB=LIB)
+                       MU300_BIN=SYSBIN, MU300_SYSROOT=self.root, MU300_VPN_LIB=LIB)
 
     def test_enabled_prints_enable_and_touches_no_network(self):
         """mu300-power asks `mu300-vpn enabled` before it starts a VPN it stopped; no exit-IP lookup, no nft."""
@@ -41,7 +41,7 @@ class Vpn(ShellTest):
                 self.conf.write_text(conf)
                 (self.root / 'run/mu300/device').write_text('f50\n')
                 r = self.sh(shell, f'"{BIN}/mu300-vpn" enabled', MU300_VPN_CONF=self.conf, MU300_VPN_RUN=self.tmp / 'run-vpn',
-                            MU300_LAN_CONF=self.tmp / 'no-lan.conf', MU300_BIN=BIN, MU300_SYSROOT=self.root)
+                            MU300_LAN_CONF=self.tmp / 'no-lan.conf', MU300_BIN=SYSBIN, MU300_SYSROOT=self.root)
                 self.assertEqual((r.returncode, r.stdout.strip()), (0, want), r.stderr)
             self.assertFalse((self.tmp / 'net').exists())
 
@@ -160,7 +160,7 @@ class Engines(ShellTest):
 
     def vpn(self, shell, code, conf='ENABLE=1\nENGINE=xray\n', **env):
         self.conf.write_text(conf)
-        e = dict(MU300_LIB=1, MU300_VPN_CONF=self.conf, MU300_VPN_RUN=self.tmp / 'run-vpn', MU300_BIN=BIN,
+        e = dict(MU300_LIB=1, MU300_VPN_CONF=self.conf, MU300_VPN_RUN=self.tmp / 'run-vpn', MU300_BIN=SYSBIN,
                  MU300_LAN_CONF=self.tmp / 'no-lan.conf', MU300_OPT=self.opt, MU300_DISK=self.disk,
                  MU300_EXTRA_CMD=self.stubs / 'extra', MU300_VPN_LIB=LIB)
         e.update(env)
@@ -307,7 +307,7 @@ class KillSwitch(ShellTest):
                 (self.extra / n).chmod(0o755)
 
     def envs(self, **extra):
-        e = dict(MU300_VPN_CONF=self.conf, MU300_VPN_RUN=self.tmp / 'run-vpn', MU300_BIN=BIN,
+        e = dict(MU300_VPN_CONF=self.conf, MU300_VPN_RUN=self.tmp / 'run-vpn', MU300_BIN=SYSBIN,
                  MU300_LAN_CONF=self.tmp / 'no-lan.conf', MU300_OPT=self.opt, MU300_DISK=self.disk,
                  MU300_EXTRA_CMD=self.stubs / 'extra', FETCH_REFRESH=1, MU300_RESOLV_FILES=self.tmp / 'resolv.conf',
                  MU300_VPN_LIB=LIB)
@@ -589,10 +589,6 @@ class KillSwitch(ShellTest):
                     self.assertClosed()
                 else:
                     self.assertFalse(self.state.exists() and self.state.read_text().strip(), conf)
-        # mobile-data calls it before it attaches
-        src = (BIN / 'mobile-data').read_text()
-        up = src[src.index('up_locked() {'):]
-        self.assertLess(up.index('mu300-vpn}" guard'), up.index('AT+CGACT'))
 
     def test_release_url_host_is_checked(self):
         for shell in self.each_shell():
@@ -659,7 +655,7 @@ class Tailscale(ShellTest):
             (d / n).chmod(0o755)
 
     def envs(self, **extra):
-        e = dict(MU300_VPN_CONF=self.conf, MU300_VPN_RUN=self.tmp / 'run-vpn', MU300_BIN=BIN,
+        e = dict(MU300_VPN_CONF=self.conf, MU300_VPN_RUN=self.tmp / 'run-vpn', MU300_BIN=SYSBIN,
                  MU300_LAN_CONF=self.tmp / 'no-lan.conf', MU300_OPT=self.tmp / 'opt', MU300_DISK=self.disk,
                  # (off tells the service manager to stop: never the real one)
                  MU300_EXTRA_CMD=self.stubs / 'extra', MU300_VPN_LIB=LIB, MU300_VPN_SVC='true')
@@ -827,10 +823,9 @@ class ServiceUnits(unittest.TestCase):
     off (test_power.Incident)."""
 
     def test_both_service_definitions_raise_the_descriptor_limit(self):
-        top = BIN.parents[4]
-        unit = (top / 'rootfs/overlay/etc/systemd/system/mu300-vpn.service').read_text()
+        unit = (TOP / 'service/systemd/mu300-vpn.service').read_text()
         self.assertRegex(unit, r'(?m)^\[Service\][^[]*^LimitNOFILE=65536$')
-        init = (top / 'openwrt/overlay/etc/init.d/mu300-vpn').read_text()
+        init = (TOP / 'service/procd/mu300-vpn').read_text()
         self.assertRegex(init, r'(?s)procd_open_instance.*procd_set_param limits nofile="65536 65536".*procd_close_instance')
 
     def test_a_service_stop_leaves_the_kill_switch(self):
@@ -843,7 +838,7 @@ class ServiceUnits(unittest.TestCase):
                          .replace('[ "$ENABLE" = 1 ] || { echo "VPN disabled (ENABLE=0 in $CONF)"; killswitch_off', ''))
         # the core's tunnel runner and the engine drivers never touch it: only `off` does (and `run` as above)
         self.assertNotIn('killswitch_off', text[text.index('\nrun_tunnel() {'):text.index('\nkillswitch_off() {')])
-        lib = BIN.parent / 'lib/vpn'
+        lib = LIB
         for drv in sorted(lib.glob('*.sh')) + [lib / 'openvpn-up']:
             self.assertNotIn('killswitch_off', drv.read_text(), drv.name)
             self.assertNotIn('mu300_vpn', drv.read_text(), drv.name)

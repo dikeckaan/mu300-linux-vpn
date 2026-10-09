@@ -7,7 +7,7 @@ import re
 import shutil
 import stat
 
-from helpers import BIN, LIB, ShellTest
+from helpers import BIN, LIB, SYSBIN, ShellTest
 
 MARKER = ('# mu300-vpn: migrated to /etc/mu300/vpn (profile legacy); only ENABLE is read from this file now')
 ID = re.compile(r'^[a-z0-9-]{1,32}$')
@@ -28,7 +28,7 @@ class Store(ShellTest):
             path.write_text(conf)
         return self.sh(shell, f'. "{BIN}/mu300-vpn"; {code}', MU300_LIB=1, MU300_VPN_CONF=path,
                        MU300_VPN_RUN=self.tmp / 'run', MU300_VPN_LIB=LIB, MU300_LAN_CONF=self.tmp / 'no',
-                       MU300_BIN=BIN, MU300_OPT=self.tmp / 'opt', MU300_DISK=self.tmp / 'disk')
+                       MU300_BIN=SYSBIN, MU300_OPT=self.tmp / 'opt', MU300_DISK=self.tmp / 'disk')
 
     def reset(self):
         shutil.rmtree(self.store, ignore_errors=True)
@@ -269,7 +269,7 @@ class Contract(ShellTest):
 
     def vpn(self, shell, code, **env):
         e = dict(MU300_LIB=1, MU300_VPN_CONF=self.conf, MU300_VPN_RUN=self.tmp / 'run', MU300_VPN_LIB=LIB,
-                 MU300_LAN_CONF=self.tmp / 'no', MU300_BIN=BIN, MU300_OPT=self.tmp / 'opt',
+                 MU300_LAN_CONF=self.tmp / 'no', MU300_BIN=SYSBIN, MU300_OPT=self.tmp / 'opt',
                  MU300_DISK=self.tmp / 'disk')
         e.update(env)
         return self.sh(shell, f'. "{BIN}/mu300-vpn"; {code}', **e)
@@ -324,7 +324,7 @@ class Contract(ShellTest):
             for p in ('events', 'resolving', 'nft.state'):
                 (self.tmp / p).unlink(missing_ok=True)
             e = dict(MU300_LIB=1, MU300_VPN_CONF=self.conf, MU300_VPN_RUN=self.tmp / 'run', MU300_VPN_LIB=LIB,
-                     MU300_LAN_CONF=self.tmp / 'no', MU300_BIN=BIN, MU300_OPT=self.tmp / 'opt',
+                     MU300_LAN_CONF=self.tmp / 'no', MU300_BIN=SYSBIN, MU300_OPT=self.tmp / 'opt',
                      MU300_DISK=self.tmp / 'disk', MU300_RESOLV_FILES=self.tmp / 'resolv.conf')
             p = subprocess.Popen(shell + ['-c', f'. "{BIN}/mu300-vpn"; vpn_resolve srv.example; echo DONE'],
                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=self.env(**e))
@@ -443,7 +443,7 @@ class Contract(ShellTest):
             self.rules.unlink(missing_ok=True)
             self.conf.write_text(f"ENABLE=1\nENGINE=xray\nKILL_SWITCH=0\nVLESS_URI='{uri}'\n")
             r = self.script(shell, BIN / 'mu300-vpn', 'run', MU300_VPN_CONF=self.conf, MU300_VPN_RUN=self.tmp / 'run',
-                            MU300_VPN_LIB=LIB, MU300_LAN_CONF=self.tmp / 'no', MU300_BIN=BIN,
+                            MU300_VPN_LIB=LIB, MU300_LAN_CONF=self.tmp / 'no', MU300_BIN=SYSBIN,
                             MU300_OPT=self.tmp / 'opt', MU300_DISK=self.tmp / 'disk')
             self.assertNotEqual(r.returncode, 0)
             self.assertIn('cannot bring xtun up', r.stderr)
@@ -476,7 +476,7 @@ class Contract(ShellTest):
                 (self.tmp / p).unlink(missing_ok=True)
             self.conf.write_text(f"ENABLE=1\nENGINE=xray\nKILL_SWITCH=0\nVLESS_URI='{uri}'\n")
             r = self.script(shell, BIN / 'mu300-vpn', 'run', MU300_VPN_CONF=self.conf, MU300_VPN_RUN=self.tmp / 'run',
-                            MU300_VPN_LIB=LIB, MU300_LAN_CONF=self.tmp / 'no', MU300_BIN=BIN,
+                            MU300_VPN_LIB=LIB, MU300_LAN_CONF=self.tmp / 'no', MU300_BIN=SYSBIN,
                             MU300_OPT=self.tmp / 'opt', MU300_DISK=self.tmp / 'disk')
             self.assertEqual(r.returncode, 1, r.stderr)
             self.assertIn('tunnel up on xtun', r.stdout)
@@ -553,7 +553,7 @@ class Uris(ShellTest):
     def vpn(self, shell, code):
         return self.sh(shell, f'. "{BIN}/mu300-vpn"; {code}', MU300_LIB=1, MU300_VPN_CONF=self.conf,
                        MU300_VPN_RUN=self.tmp / 'run', MU300_VPN_LIB=LIB, MU300_LAN_CONF=self.tmp / 'no',
-                       MU300_BIN=BIN, MU300_OPT=self.tmp / 'opt', MU300_DISK=self.tmp / 'disk')
+                       MU300_BIN=SYSBIN, MU300_OPT=self.tmp / 'opt', MU300_DISK=self.tmp / 'disk')
 
     def test_parse_link(self):
         for shell in self.each_shell():
@@ -657,7 +657,7 @@ class Cli(ShellTest):
     def vpn(self, shell, *args):
         return self.script(shell, BIN / 'mu300-vpn', *args, MU300_VPN_CONF=self.conf,
                            MU300_VPN_RUN=self.tmp / 'run', MU300_VPN_LIB=LIB, MU300_LAN_CONF=self.tmp / 'no',
-                           MU300_BIN=BIN, MU300_OPT=self.tmp / 'opt', MU300_DISK=self.tmp / 'disk',
+                           MU300_BIN=SYSBIN, MU300_OPT=self.tmp / 'opt', MU300_DISK=self.tmp / 'disk',
                            MU300_VPN_SVC=self.stubs / 'svc', MU300_EXTRA_CMD=self.stubs / 'no-extra')
 
     def svc(self):
@@ -1043,7 +1043,7 @@ class RawJson(ShellTest):
 
     def env(self, **extra):
         base = dict(MU300_VPN_CONF=self.conf, MU300_VPN_RUN=self.tmp / 'run', MU300_VPN_LIB=LIB,
-                    MU300_LAN_CONF=self.tmp / 'no', MU300_BIN=BIN, MU300_OPT=self.tmp / 'opt',
+                    MU300_LAN_CONF=self.tmp / 'no', MU300_BIN=SYSBIN, MU300_OPT=self.tmp / 'opt',
                     MU300_DISK=self.tmp / 'disk', MU300_VPN_SVC=self.stubs / 'svc')
         base.update(extra)
         return super().env(**base)
@@ -1888,7 +1888,7 @@ class WireGuard(ShellTest):
 
     def env(self, **extra):
         base = dict(MU300_VPN_CONF=self.conf, MU300_VPN_RUN=self.tmp / 'run', MU300_VPN_LIB=LIB,
-                    MU300_LAN_CONF=self.tmp / 'no', MU300_BIN=BIN, MU300_OPT=self.tmp / 'opt',
+                    MU300_LAN_CONF=self.tmp / 'no', MU300_BIN=SYSBIN, MU300_OPT=self.tmp / 'opt',
                     MU300_DISK=self.tmp / 'disk', MU300_VPN_SVC=self.stubs / 'svc',
                     MU300_WG_SYSMOD=self.tmp / 'no-module')
         base.update(extra)
@@ -2200,7 +2200,7 @@ class OpenVpn(ShellTest):
 
     def env(self, **extra):
         base = dict(MU300_VPN_CONF=self.conf, MU300_VPN_RUN=self.run_dir, MU300_VPN_LIB=LIB,
-                    MU300_LAN_CONF=self.tmp / 'no', MU300_BIN=BIN, MU300_OPT=self.tmp / 'opt',
+                    MU300_LAN_CONF=self.tmp / 'no', MU300_BIN=SYSBIN, MU300_OPT=self.tmp / 'opt',
                     MU300_DISK=self.tmp / 'disk', MU300_VPN_SVC=self.stubs / 'svc',
                     MU300_OPENWRT_RELEASE=self.tmp / 'no-openwrt')
         base.update(extra)
@@ -2741,7 +2741,7 @@ class Mihomo(ShellTest):
 
     def env(self, **extra):
         base = dict(MU300_VPN_CONF=self.conf, MU300_VPN_RUN=self.run_dir, MU300_VPN_LIB=LIB,
-                    MU300_LAN_CONF=self.tmp / 'no', MU300_BIN=BIN, MU300_OPT=self.tmp / 'opt',
+                    MU300_LAN_CONF=self.tmp / 'no', MU300_BIN=SYSBIN, MU300_OPT=self.tmp / 'opt',
                     MU300_DISK=self.tmp / 'disk', MU300_VPN_SVC=self.stubs / 'svc',
                     SAFE_PATHS='/tmp', SKIP_SAFE_PATH_CHECK='1')
         base.update(extra)
@@ -3597,7 +3597,7 @@ class EnginesCmd(ShellTest):
 
     def vpn(self, shell, *args, **extra):
         env = dict(MU300_VPN_CONF=self.conf, MU300_VPN_RUN=self.tmp / 'run', MU300_VPN_LIB=LIB,
-                   MU300_LAN_CONF=self.tmp / 'no', MU300_BIN=BIN, MU300_OPT=self.opt, MU300_DISK=self.disk,
+                   MU300_LAN_CONF=self.tmp / 'no', MU300_BIN=SYSBIN, MU300_OPT=self.opt, MU300_DISK=self.disk,
                    MU300_VPN_SVC=self.stubs / 'svc', MU300_EXTRA_CMD=self.stubs / 'extra',
                    MU300_WG_SYSMOD=self.tmp / 'no-module', MU300_SYSROOT=self.sysroot,
                    PATH=f'{self.stubs}{os.pathsep}{self.tools}')

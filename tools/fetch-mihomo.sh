@@ -1,6 +1,6 @@
 #!/bin/sh
 # Download the pinned mihomo (Clash.Meta) release (linux arm64) that runs mu300-vpn's mihomo profiles and verify it.
-#   tools/fetch-mihomo.sh [OUTDIR]   (default: .; writes OUTDIR/mihomo, picked up by tools/make-extra.sh vpn-mihomo)
+#   tools/fetch-mihomo.sh [OUTDIR]   (default: .; writes OUTDIR/mihomo, for tools/make-module.sh)
 set -eu
 VER=1.19.32
 SHA256=9dd862e28b46ff7d775f169cceebc28deccaa0a9e804237d421cd2571e0caba0
