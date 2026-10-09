@@ -101,8 +101,8 @@ defines:
 |---|---|
 | `drv_engines` | prints the programs it needs, one path per line (resolved: extra, then /opt/mu300/bin, then PATH) |
 | `drv_engines_ok` | 0 when they are all executable (and, for wireguard, the kernel has it) |
-| `drv_check` | validates the profile (`$PDIR`), with the engine's own checker where there is one; errors to stderr |
-| `drv_gen` | the runtime config under `$RUN` from the profile + settings; writes `$RUN/server-ip` (addresses to keep off the tunnel, one per line) and optionally `$RUN/dns` |
+| `drv_check` | validates the profile's file (`$PDIR`) and the rebuild of it, with the driver's own parser; errors to stderr. The engine's own check (`xray run -test`, `sing-box check`, `mihomo -t`) runs at `drv_gen`, on the rebuilt file, because xray's needs the resolved addresses |
+| `drv_gen` | the runtime config under `$RUN` from the profile + settings (the check first, then the engine's own check on the file written); writes `$RUN/server-ip` (addresses to keep off the tunnel, one per line) and optionally `$RUN/dns` |
 | `drv_start` | brings up ONE tunnel interface, sets `TUN` and `DRV_PIDS`, prints `tunnel up on $TUN`; or, with `DRV_FOREGROUND=1`, execs the engine (sing-box) |
 | `drv_alive` | 0 while the engine and its interface are there |
 | `drv_stop` | stops what `drv_start` started, removes its interface |
@@ -146,7 +146,8 @@ The kill switch lets only marked traffic out on an uplink, and rule 9000 keeps i
   `respect-rules: true`; `allow-lan: false`; `bind-address: '127.0.0.1'`; `external-controller` only when
   MIHOMO_CONTROLLER is set. Checked with `mihomo -t`.
 * **wireguard**: `wg set wg-mu300 fwmark 0x2d0`. `wg.conf`'s wg-quick keys (Address, DNS, MTU, Table, Pre/PostUp/Down,
-  SaveConfig) are stripped for `wg setconf`, the Endpoint name is resolved, Address goes on with `ip addr`, MTU
+  SaveConfig) are stripped for `wg setconf`, and so are ListenPort (a config opens no port on the device) and
+  FwMark (the mark is ours, set by `wg set` after setconf); the Endpoint name is resolved, Address goes on with `ip addr`, MTU
   default 1420, DNS (first) to `$RUN/dns`. A peer without `0.0.0.0/0` in AllowedIPs gets a warning (traffic outside
   it is dropped by WireGuard - closed, not leaked). A kernel without WireGuard (the 5.4 vendor kernel) fails the check
   with that message.
@@ -178,15 +179,29 @@ The kill switch lets only marked traffic out on an uplink, and rule 9000 keeps i
     vocabulary; an unknown first word is never repeated) and never an argument. Also refused: a tap profile, no
     remote, neither `client` nor `tls-client`, no `<ca>`/`<pkcs12>`.
   * `remote` names are resolved to addresses; the written config is read back by the same parser for `server-ip`.
-  Run as `openvpn --config $RUN/openvpn.conf --dev tun-mu300 --dev-type tun --route-noexec --pull-filter ignore
-  redirect-gateway --pull-filter ignore "route " --pull-filter ignore route-ipv6 --pull-filter ignore setenv
-  --pull-filter ignore "dhcp-option DOMAIN" --pull-filter ignore block-outside-dns --mark 720 --script-security 2
-  --up /opt/mu300/lib/vpn/openvpn-up --setenv MU300_VPN_RUN $RUN --auth-nocache --verb 3 [--auth-user-pass
-  $RUN/ovpn.auth]`: our options after `--config`, so they win. Not `--route-nopull`, which would also drop the pushed
-  `dhcp-option DNS`. `ovpn.auth` is a 0600 copy of the profile's `auth.txt`, removed with the config when openvpn
+  Run as `openvpn --config $RUN/openvpn.conf --dev tun-mu300 --dev-type tun --route-noexec --pull-filter accept
+  ifconfig --pull-filter accept ifconfig-ipv6 --pull-filter accept topology --pull-filter accept "dhcp-option DNS"
+  --pull-filter accept ping --pull-filter accept ping-restart --pull-filter accept peer-id --pull-filter accept
+  cipher --pull-filter accept auth-token --pull-filter accept route-gateway --pull-filter accept protocol-flags
+  --pull-filter accept key-derivation --pull-filter accept tun-mtu --pull-filter ignore "" --mark 720
+  --script-security 2 --up /opt/mu300/lib/vpn/openvpn-up --setenv MU300_VPN_RUN $RUN --auth-nocache --verb 3
+  [--auth-user-pass $RUN/ovpn.auth]`: our options after `--config`, so they win. What the server pushes is held to
+  an accept list, not a denylist: a pull filter is a prefix match and the first that matches wins, so the accepts
+  come first and `ignore ""` (which matches everything) last. Accepted: the session's addresses and topology
+  (`ifconfig`, `ifconfig-ipv6`, `topology`, `route-gateway`), the resolver our up script reads (`dhcp-option DNS`,
+  which as a prefix also takes `DNS6`), the keepalive (`ping`, `ping-restart`; the prefix also takes `ping-exit`),
+  and what the data-channel negotiation the client announced decided (`peer-id`, `cipher`, `auth-token`,
+  `protocol-flags`, `key-derivation`, `tun-mtu`: IV_PROTO tls-ekm and dyn-tls-crypt, IV_MTU - a client that drops
+  them while the server applies them cannot decrypt the data channel or gets a wrong MTU). None of them runs
+  anything or names a file. Everything else is ignored by the catch-all: `route`, `route-ipv6`,
+  `redirect-gateway`, `setenv`, `compress`/`comp-lzo`, `dns`, `client-nat`, `block-outside-dns` and every other
+  `dhcp-option`. Not `--route-nopull`, which would also drop the pushed `dhcp-option DNS`. Not `--dns-updown
+  disable` either: OpenVPN 2.6 (the images' version) does not know the option and would refuse to start; on 2.7
+  the set `--up` script suppresses the built-in dns-updown by itself, and adding the option once the images carry
+  2.7 is a follow-up. `ovpn.auth` is a 0600 copy of the profile's `auth.txt`, removed with the config when openvpn
   stops or fails to start. `openvpn-up` is our own script and the only one: it writes the first pushed
-  `dhcp-option DNS` that is a proper IPv4 or IPv6 literal to `$RUN/dns`, and `$RUN/ovpn-up`. The driver waits for
-  that file.
+  `dhcp-option DNS` that is a proper IPv4 or IPv6 literal (or `dhcp-option DNS6` that is an IPv6 one) to
+  `$RUN/dns`, and `$RUN/ovpn-up`. The driver waits for that file.
 
 ### Names behind the kill switch: the resolve window
 
@@ -264,8 +279,9 @@ Per system, at every start of `mu300-vpn` (any command), idempotent, and only wh
   everywhere (`mu_fold`: ASCII lowercase, after mapping U+017F and U+212A, which Go folds onto `s` and `k`). Then a
   driver's jq program builds a NEW document from what its allowlist accepts and writes the core-controlled values
   last (inbounds, log, the mark / `default_mark`, `auto_detect_interface`, the bootstrap DNS), so they always win.
-  The engine's own check (`xray run -test`, `sing-box check`) runs on that file only, never on the profile's; the
-  profile keeps the file as imported (`profile export` gives it back) and it is rebuilt at every start. No jq regex
+  The engine's own check (`xray run -test`, `sing-box check`, `mihomo -t`) runs on that file only, never on the
+  profile's, and at `drv_gen` (xray's needs the resolved addresses; `drv_check` is the driver's own parser and the
+  rebuild); the profile keeps the file as imported (`profile export` gives it back) and it is rebuilt at every start. No jq regex
   is used (OpenWrt's jq may lack it), and jq's error output is never shown (it quotes the file).
 * **Refusals** name a key from our own lists, a type from our list of known refused types, or a top-level/route
   key reduced to printable characters (at most 40 characters, at most 8 reasons), never a value: an unknown type is
@@ -299,7 +315,12 @@ Per system, at every start of `mu300-vpn` (any command), idempotent, and only wh
   files the engine reads, which parse or fail: `certificate_path`, an ECH `config_path`, a `hosts` server's `path`,
   a local rule set's `path` (sing-box), and `ext:` geo files (Xray). That is a documented exposure, not a refusal:
   none of them is a key, and the engine does not show what it read. Key files are not on this list: they are
-  refused (above). It can name no file the engine writes. Every reference between its parts must name something it has: a route rule's outbound, a
+  refused (above). It can name no file the engine writes. mihomo reads files a proxy or a provider names the same
+  way: a proxy's `ca` (a certificate path), an `ssh` proxy's `private-key` given as a path, a provider's `path`.
+  They are confined to mihomo's home directory (`$VPN_DIR/cache/mihomo`) by mihomo's own safe-path check, since
+  `SAFE_PATHS` and `SKIP_SAFE_PATH_CHECK` are unset in its environment: a path elsewhere makes that proxy or
+  provider fail, and what was read is not shown. A documented exposure, not a refusal: none of them is a key the
+  driver removes. Every reference between its parts must name something it has: a route rule's outbound, a
   detour, a dialer proxy to an unknown tag refuses the config.
 * **xray raw JSON.**
   * Top level: kept as the config has them: `outbounds`, `routing`, `dns`, `fakedns`, `observatory`,
@@ -344,7 +365,10 @@ Per system, at every start of `mu300-vpn` (any command), idempotent, and only wh
     had, which only chains through another of its outbounds; xhttp's `downloadSettings` gets `sockopt =
     {"mark":720}` too, or that connection would leave unmarked. A `wireguard` outbound gets
     `settings.noKernelTun = true`, so it makes no interface or ip rules of its own. Server names in
-    `vnext`/`servers` are resolved by the core.
+    `vnext`/`servers` are resolved by the core. A `wireguard` outbound's `peers[].endpoint` and xhttp's
+    `downloadSettings.address` are not: Xray resolves those itself, through its own DNS, which under the kill
+    switch fails closed (the lookup is dropped, the outbound does not come up: a start-up failure, no leak). A
+    config with either names an address there, or runs with the kill switch off.
   * `proxySettings.tag`, `dialerProxy` and every routing rule's `outboundTag` must name an outbound of the config.
   * `dns.servers`: a string, or an object reduced to `address`, `port`, `domains`, `expectIPs`, `skipFallback`,
     `clientIP`, `queryStrategy`, `tag`, `timeoutMs`.
@@ -404,13 +428,17 @@ Per system, at every start of `mu300-vpn` (any command), idempotent, and only wh
     After that the text `interface-name` or `routing-mark` anywhere outside a `#` line (a quoted key, an anchor,
     a trailing comment, any form awk did not undo) refuses the file naming the key. Refused as well, naming the
     rule: a second YAML document (`---` after the first line, `...`), a `%` directive, a TAB at the start of a line,
-    a line over 4096 bytes, a file over 1 MiB, a control byte other than TAB, LF and CR, an explicit key (`? `,
-    the one way a key can span lines), a hex escape (`\x`, `\u`, `\U`: the one way a key can be spelled without its
-    text), a column-0 line that is not `KEY:` (a quoted key, a list item, a merge key, an anchor, a flow collection
+    a line over 4096 bytes, a file over 1 MiB, a control byte other than TAB, LF and CR, a line break inside a
+    line - a lone CR, NEL (U+0085), LS (U+2028) or PS (U+2029): yaml.v3 ends a line at each of them and awk does
+    not, so one kept line to the rules would be several top-level lines to mihomo - an explicit key (`? `, one way
+    a key can span lines), a tag (`!`: `!!binary` spells a key without its text), a line ending in a backslash
+    and a quoted scalar not closed on its line (the other ways a key can span lines; a `!` or a quote in the
+    middle of a value belongs to the value), a hex escape (`\x`, `\u`, `\U`: the one way a key can be spelled
+    without its text on one line), a column-0 line that is not `KEY:` (a quoted key, a list item, a merge key, an anchor, a flow collection
     continued at column 0: YAML would read it as top-level content that the line rules cannot see), a kept key
     given twice (mihomo's YAML reader refuses it anyway), and a file without `proxies` and `proxy-providers`. A
     first line `---`, a BOM and CRLF line ends are taken. The written file is checked again before `mihomo -t`
-    (every column-0 key one of the kept list, ours or `mu300-anchor-N`, `tun` and `dns` exactly once, `routing-mark: 720`,
+    (no line break but LF, the guard's line model being yaml.v3's; every column-0 key one of the kept list, ours or `mu300-anchor-N`, `tun` and `dns` exactly once, `routing-mark: 720`,
     `allow-lan: false`, `bind-address` once, `external-controller` exactly when MIHOMO_CONTROLLER is set), and
     `mihomo -t`'s own output is not shown (its YAML errors quote values); the message gives the command to run.
 * The kill switch is unchanged: only marked traffic, NTP and the Wi-Fi client's DHCP leave on an uplink; forwarded

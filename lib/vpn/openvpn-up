@@ -1,9 +1,9 @@
 #!/bin/sh
 # openvpn's --up script for mu300-vpn, and the only script it runs. openvpn gives it the device as $1 and the
-# options the server pushed as foreign_option_1 ... N in the environment; the first "dhcp-option DNS ADDRESS" is the
-# tunnel's resolver (the core points the device's lookups at it) and goes to $RUN/dns. $RUN/ovpn-up is what the
-# driver waits for. The environment holds the session's secrets: nothing here prints it, and a pushed value is only
-# ever used after it was checked to be an address.
+# options the server pushed as foreign_option_1 ... N in the environment; the first "dhcp-option DNS ADDRESS" (or
+# "DNS6 IPv6") is the tunnel's resolver (the core points the device's lookups at it) and goes to $RUN/dns.
+# $RUN/ovpn-up is what the driver waits for. The environment holds the session's secrets: nothing here prints it,
+# and a pushed value is only ever used after it was checked to be an address.
 umask 077
 RUN=${MU300_VPN_RUN:-}
 case $RUN in /*) [ -d "$RUN" ] || exit 1 ;; *) exit 1 ;; esac
@@ -62,9 +62,11 @@ i=1
 while [ "$i" -le 256 ]; do
     eval "set_=\${foreign_option_$i+x}; opt=\${foreign_option_$i:-}"
     [ -n "$set_" ] || break
-    # exactly three words: a pushed value with anything else in it (";", "$(...)") is not an address
+    # exactly three words: a pushed value with anything else in it (";", "$(...)") is not an address. DNS is an
+    # address of either family, DNS6 (the IPv6 resolver, pushed as such) an IPv6 one.
     set -f; set -- $opt; set +f
-    if [ $# -eq 3 ] && [ "$1" = dhcp-option ] && [ "$2" = DNS ] && is_addr "$3"; then
+    if [ $# -eq 3 ] && [ "$1" = dhcp-option ] &&
+       { { [ "$2" = DNS ] && is_addr "$3"; } || { [ "$2" = DNS6 ] && is_v6 "$3"; }; }; then
         printf '%s\n' "$3" > "$RUN/dns.$$" && mv "$RUN/dns.$$" "$RUN/dns" || exit 1
         break
     fi

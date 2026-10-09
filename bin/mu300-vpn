@@ -988,7 +988,9 @@ ensure_firewall_zone() {
 #
 # Only when nothing is running, so this never takes the rules away from a live tunnel.
 routing_cleanup() {
-    pgrep -f '[s]ing-box run|[x]ray run|[h]ev-socks5-tunnel|[m]ihomo|[o]penvpn --config /run/mu300-vpn' >/dev/null 2>&1 &&
+    # each engine as its driver starts it (mihomo: "mihomo -d HOME -f .../mihomo.yaml", see mihomo.sh drv_start),
+    # not its bare name, which "mu300-extra install vpn-mihomo" or a file name would match too
+    pgrep -f '[s]ing-box run|[x]ray run|[h]ev-socks5-tunnel|[m]ihomo -d .* -f .*/mihomo\.yaml|[o]penvpn --config /run/mu300-vpn' >/dev/null 2>&1 &&
         return 0
     # the tunnel the last run brought up, whichever driver it was ($RUN/iface), or the two engines' own names
     _if=$(cat "$RUN/iface" 2>/dev/null) || _if=

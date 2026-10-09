@@ -1830,6 +1830,8 @@ DNS = 10.7.0.1, example.org
 MTU = 1380
 PostUp = iptables -A FORWARD -i %i -j ACCEPT
 Table = off
+ListenPort = 51821
+FwMark = 0x1
 
 [Peer]
 PublicKey = {WG_PUB}
@@ -1943,7 +1945,9 @@ class WireGuard(ShellTest):
             self.no_keys(r)
             run = self.tmp / 'run'
             gen = (run / 'wg.conf').read_text()
-            for gone in ('Address', 'DNS', 'MTU', 'PostUp', 'Table', 'iptables', 'wg.example'):
+            # (a config opens no port, and the mark is ours, set by wg set)
+            for gone in ('Address', 'DNS', 'MTU', 'PostUp', 'Table', 'iptables', 'wg.example', 'ListenPort', '51821',
+                         'FwMark', '0x1'):
                 self.assertNotIn(gone, gen)
             self.assertIn('Endpoint = 203.0.113.7:51820', gen.splitlines())
             for kept in (f'PrivateKey = {WG_PRIV}', f'PublicKey = {WG_PUB}', f'PresharedKey = {WG_PSK}',
@@ -2354,6 +2358,21 @@ keepalive 10 60
             for block in (OVPN_CA, OVPN_KEY, OVPN_TLS):
                 self.assertIn((block + '\n').encode(), gen)
 
+    def test_a_bom_on_the_first_line_is_taken(self):
+        # a Windows export starts with a UTF-8 BOM; it is not part of the first directive, and not written
+        text = b'\xef\xbb\xbf' + OVPN_CONF.encode()
+        for shell in self.each_shell():
+            self.setup_profile(shell, text)
+            r = self.cli(shell, 'check', 'vpn')
+            self.assertEqual((r.returncode, r.stdout.strip()), (0, 'profile vpn: OK'), r.stderr)
+            r = self.run_lib(shell, 'drv_gen')
+            self.assertEqual(r.returncode, 0, r.stderr)
+            gen = (self.run_dir / 'openvpn.conf').read_bytes()
+            self.assertNotIn(b'\xef\xbb\xbf', gen)
+            self.assertEqual(gen.splitlines()[0], b'client')
+            # only on the first line: one later is a word openvpn would not know either
+            self.refused(shell, OVPN_CONF.encode().replace(b'nobind\n', b'\xef\xbb\xbfnobind\n'), 'line 13: has a directive this driver does not know')
+
     def test_certificate_text_outside_the_pem_is_left_out(self):
         ca = OVPN_CA.replace('<ca>\n', '<ca>\nCertificate:\n    Data:\n        Version: 3 (0x2)\n')
         for shell in self.each_shell():
@@ -2488,17 +2507,30 @@ keepalive 10 60
                 self.assertIn(want, r.stdout)
             args = (self.tmp / 'ovpn.args').read_text().splitlines()
             run = self.run_dir
-            # the config first, then every option of ours after it, so that ours win
+            # the config first, then every option of ours after it, so that ours win. The pushed options are held
+            # to an accept list (first match wins, so the accepts come first and the catch-all last): what the
+            # session needs and the data-channel negotiation decided, nothing that runs, names a file or routes.
             self.assertEqual(args, ['--config', f'{run}/openvpn.conf', '--dev', 'tun-mu300', '--dev-type', 'tun',
                                     '--route-noexec',
-                                    '--pull-filter', 'ignore', 'redirect-gateway', '--pull-filter', 'ignore', 'route ',
-                                    '--pull-filter', 'ignore', 'route-ipv6', '--pull-filter', 'ignore', 'setenv',
-                                    '--pull-filter', 'ignore', 'dhcp-option DOMAIN',
-                                    '--pull-filter', 'ignore', 'block-outside-dns',
+                                    '--pull-filter', 'accept', 'ifconfig', '--pull-filter', 'accept', 'ifconfig-ipv6',
+                                    '--pull-filter', 'accept', 'topology', '--pull-filter', 'accept', 'dhcp-option DNS',
+                                    '--pull-filter', 'accept', 'ping', '--pull-filter', 'accept', 'ping-restart',
+                                    '--pull-filter', 'accept', 'peer-id', '--pull-filter', 'accept', 'cipher',
+                                    '--pull-filter', 'accept', 'auth-token', '--pull-filter', 'accept', 'route-gateway',
+                                    '--pull-filter', 'accept', 'protocol-flags', '--pull-filter', 'accept', 'key-derivation',
+                                    '--pull-filter', 'accept', 'tun-mtu', '--pull-filter', 'ignore', '',
                                     '--mark', '720', '--script-security', '2', '--up', f'{LIB}/openvpn-up',
                                     '--setenv', 'MU300_VPN_RUN', str(run), '--auth-nocache', '--verb', '3'])
             # pushed DNS still reaches the up script: --route-nopull would drop it
             self.assertNotIn('--route-nopull', args)
+            # nothing pushed is accepted that the list does not name: no accept of a route, a script or a setenv,
+            # and the catch-all comes after every accept
+            for word in ('route', 'route-ipv6', 'redirect-gateway', 'setenv', 'dhcp-option DOMAIN', 'dhcp-option',
+                         'block-outside-dns', 'compress', 'comp-lzo', 'dns', 'client-nat', 'up', 'down'):
+                self.assertNotIn(word, args)
+            self.assertEqual(args.index('ignore'), max(i for i, a in enumerate(args) if a == 'accept') + 3)
+            # OpenVPN 2.6 does not know --dns-updown: it must not be given (2.7 is a follow-up)
+            self.assertNotIn('--dns-updown', args)
             # the first pushed resolver; the up script marked the session
             self.assertEqual((run / 'dns').read_text().strip(), '10.8.0.1')
             self.assertFalse((run / 'ovpn-up').exists())
@@ -2563,7 +2595,12 @@ keepalive 10 60
                               ('dhcp-option DNS abc:', None), ('dhcp-option DNS ::1.2.3', None),
                               ('dhcp-option DNS 10.8.0.1', '10.8.0.1'), ('dhcp-option DNS 2001:db8::53', '2001:db8::53'),
                               ('dhcp-option DNS ::ffff:192.0.2.1', '::ffff:192.0.2.1'),
-                              ('dhcp-option DNS 1:2:3:4:5:6:7:8', '1:2:3:4:5:6:7:8')):
+                              ('dhcp-option DNS 1:2:3:4:5:6:7:8', '1:2:3:4:5:6:7:8'),
+                              # DNS6 is the IPv6 resolver (OpenVPN pushes it for an IPv6 one); it takes no IPv4
+                              ('dhcp-option DNS6 2001:db8::53', '2001:db8::53'),
+                              ('dhcp-option DNS6 10.8.0.1', None), ('dhcp-option DNS6 example.org', None),
+                              ('dhcp-option DNS6 2001:db8::53;x', None), ('dhcp-option DNS7 2001:db8::53', None),
+                              ('dhcp-option dns 10.8.0.1', None)):
                 shutil.rmtree(self.run_dir); self.run_dir.mkdir()
                 r = self.script(shell, up, 'tun-mu300', foreign_option_1=opt, MU300_VPN_RUN=self.run_dir,
                                 SECRET_ENV='hunter2')
@@ -3102,6 +3139,19 @@ rules:
                     ('a form feed', base.encode() + b'rules:\n  - MATCH,a\x0c\n', 'control character'),
                     ('explicit key', base + 'proxy-groups:\n  - ? "interface-\\\n      name"\n    : eth0\n', 'explicit key'),
                     ('explicit flow key', base + 'proxy-groups:\n  - {? x: 1}\n', 'explicit key'),
+                    # yaml.v3 ends a line at a lone CR, NEL, LS and PS too: one line to awk, several to mihomo
+                    ('a lone CR', base.encode() + b'proxy-groups:\n  - name: x\rexternal-controller: 0.0.0.0:9090\n', 'line break'),
+                    ('a NEL', base.encode() + b'proxy-groups:\n  - name: x\xc2\x85external-controller: 0.0.0.0:9090\n', 'line break'),
+                    ('an LS', base.encode() + b'proxy-groups:\n  - name: x\xe2\x80\xa8external-controller: 0.0.0.0:9090\n', 'line break'),
+                    ('a PS', base.encode() + b'proxy-groups:\n  - name: x\xe2\x80\xa9listeners:\n', 'line break'),
+                    # a tag, a line continued by a backslash and a quoted scalar left open: the three ways a key could
+                    # be spelled over more than one line, or without its text
+                    ('a tag', base + 'proxy-groups:\n  - !!binary aW50ZXJmYWNlLW5hbWU=: eth0\n', 'tag'),
+                    ('a tag before a key', base + 'proxy-groups:\n  - name: x\n    !!str interface-name: eth0\n', 'tag'),
+                    ('a tag in a flow mapping', base + 'proxy-groups:\n  - {!!binary aW50ZXJmYWNlLW5hbWU=: eth0}\n', 'tag'),
+                    ('a backslash continuation', base + 'proxy-groups:\n  - "interface-\\\n    name": eth0\n', 'backslash'),
+                    ('an open double-quoted scalar', base + 'proxy-groups:\n  - "interface-\n    name": eth0\n', 'not closed'),
+                    ('an open single-quoted scalar', base + "proxy-groups:\n  - 'interface-\n    name': eth0\n", 'not closed'),
                     ('hex escape', base.replace('ss.example', '"interface\\x2dname"'), 'escape'),
                     ('unicode escape', base.replace('ss.example', '"interface\\u002dname"'), 'escape'),
                     ('a list at the top', base + '- tun:\n    enable: true\n', 'top-level line'),
@@ -3116,6 +3166,21 @@ rules:
                 with self.subTest(what=name):
                     r = self.refused(shell, text, msg, name)
                     self.assertNotIn('MATCH', r.stderr)
+                    for planted in ('external-controller', 'listeners', 'aW50', 'eth0'):
+                        self.assertNotIn(planted, r.stderr, name)
+            # a "!" or a quote in the middle of a quoted value is the value's, and stays
+            for name, text, kept in (
+                    ('a ! in a password', base.replace('password: hunter2', 'password: "hu!nter2"'), 'password: "hu!nter2"'),
+                    ('a quote in a password', base.replace('password: hunter2', 'password: "hu\\"nter2"'), 'password: "hu\\"nter2"'),
+                    ('a double quote in a single-quoted password', base.replace('password: hunter2', "password: 'hu\"nter2'"), "password: 'hu\"nter2'"),
+                    ('a single quote in a single-quoted password', base.replace('password: hunter2', "password: 'hu''nter2'"), "password: 'hu''nter2'"),
+                    ('a quote in a comment', base + '# it is "fine\n', 'MATCH,a'),
+                    ('a trailing comment with a quote', base.replace('  - MATCH,a', '  - MATCH,a # "x'), 'MATCH,a')):
+                with self.subTest(what=name):
+                    self.setup_profile(shell, text)
+                    gen = self.gen(shell)
+                    self.assertIn(kept, gen, name)
+                    self.assertEqual(self.top_keys(gen), ['proxies', 'rules'] + list(MH_OURS))
             # too large: refused before anything reads it
             big = base + '# ' + 'x' * (1 << 20) + '\n'
             r = self.refused(shell, big, '1 MiB', 'too large')
@@ -3133,6 +3198,29 @@ rules:
                     self.assertNotIn('\ufeff', gen)
                     self.assertNotIn('---', gen)
                     self.assertEqual(gen.count('enable: true'), 2)
+
+    def test_a_line_break_hidden_in_a_line_never_reaches_mihomo(self):
+        # the reviewer's probe: one kept "proxies" line to awk, five top-level lines to yaml.v3 (a controller on
+        # every address and a listener among them). Whatever the import said, the rebuild writes no file for it and
+        # mihomo is never started on it.
+        for sep in (b'\r', b'\xc2\x85', b'\xe2\x80\xa8', b'\xe2\x80\xa9'):
+            probe = (b'proxies:\n  - {name: a, type: ss, server: ss.example, port: 8388, cipher: aes-256-gcm, password: hunter2}\n'
+                     b'  - name: x' + sep + b'external-controller: 0.0.0.0:9090' + sep + b'listeners:' + sep
+                     + b'  - {name: l, type: socks, port: 9999, listen: 0.0.0.0}' + sep + b'secret: s\n'
+                     b'rules:\n  - MATCH,a\n')
+            for shell in self.each_shell():
+                with self.subTest(sep=sep, shell=shell):
+                    self.setup_profile(shell)
+                    (self.store / 'profiles/sub/config.yaml').write_bytes(probe)
+                    r = self.run_lib(shell, 'drv_gen')
+                    self.assertNotEqual(r.returncode, 0)
+                    self.assertIn('line break', r.stderr)
+                    self.no_secrets(r)
+                    self.assertFalse((self.run_dir / 'mihomo.yaml').exists())
+                    self.assertFalse((self.tmp / 'mihomo.t.args').exists())
+                    r = self.cli(shell, 'check', 'sub')
+                    self.assertNotEqual(r.returncode, 0)
+                    self.no_secrets(r)
 
     def test_anchors_of_dropped_keys_are_kept_inert(self):
         # subscription templates (and mihomo's own example) put the defaults of providers and groups under keys of
@@ -3216,8 +3304,17 @@ rules:
                     ('another mark', good.replace('routing-mark: 720', 'routing-mark: 721'), '', False),
                     ('no mark', good.replace('routing-mark: 720\n', ''), '', False),
                     ('a quoted key', good + '"x": 1\n', '', False),
-                    ('a list', good + '- x\n', '', False)):
-                f.write_text(text)
+                    ('a list', good + '- x\n', '', False),
+                    # the guard's line model is yaml.v3's: a line break hidden in a line is several lines to mihomo
+                    ('a lone CR in a line', good.encode().replace(b'type: ss}\n', b'type: ss}\rlisteners: []\n'), '', False),
+                    ('a NEL in a line', good.encode().replace(b'type: ss}\n', b'type: ss}\xc2\x85listeners: []\n'), '', False),
+                    ('an LS in a line', good.encode().replace(b'type: ss}\n', b'type: ss}\xe2\x80\xa8listeners: []\n'), '', False),
+                    ('a PS in a line', good.encode().replace(b'type: ss}\n', b'type: ss}\xe2\x80\xa9listeners: []\n'), '', False),
+                    ('a CR at the end of a line', good.encode().replace(b'type: ss}\n', b'type: ss}\r\n'), '', False)):
+                if isinstance(text, bytes):
+                    f.write_bytes(text)
+                else:
+                    f.write_text(text)
                 r = self.run_lib(shell, f'mihomo_written_ok "{ctl}" "{f}" && echo OK')
                 self.assertEqual('OK' in r.stdout, ok, (name, r.stderr))
 

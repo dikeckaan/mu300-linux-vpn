@@ -55,12 +55,15 @@ mihomo_home() {
 # After that, the text interface-name or routing-mark anywhere outside a "#" line - a quoted key, an anchor, a
 # trailing comment, a form these rules did not undo - refuses the file, naming the key. Refused as well, naming the
 # rule: a second document ("---" after the first line, "..."), a "%" directive, a TAB at the start of a line (YAML
-# does not indent with tabs; mihomo's reader refuses it too), a line over 4096 bytes, an explicit key ("? ", the one
-# way a key can span lines), a hex escape (\x, \u, \U: the one way a key can be spelled without its text), a
-# column-0 line that is not "KEY:" (a quoted key, a list item, a merge key, an anchor, a flow collection continued
-# at column 0), a kept key given twice (mihomo's reader refuses it anyway) and a file with neither proxies nor
-# proxy-providers. A first line "---", a BOM and CRLF line ends are taken. The size and the control bytes are
-# checked in the shell, before awk sees the file.
+# does not indent with tabs; mihomo's reader refuses it too), a line over 4096 bytes, a line break inside a line
+# (a lone CR, NEL, LS or PS: yaml.v3 ends a line there, awk does not, so one line here would be several to mihomo),
+# an explicit key ("? ", one way a key can span lines), a tag ("!": !!binary spells a key without its text), a
+# line ending in a backslash and a quoted scalar not closed on its line (the other ways a key can span lines), a
+# hex escape (\x, \u, \U: the one way a key can be spelled without its text on one line), a column-0 line that is
+# not "KEY:" (a quoted key, a list item, a merge key, an anchor, a flow collection continued at column 0), a kept
+# key given twice (mihomo's reader refuses it anyway) and a file with neither proxies nor proxy-providers. A first
+# line "---", a BOM and CRLF line ends are taken. The size and the control bytes are checked in the shell, before
+# awk sees the file.
 mihomo_read() {
     json_size_ok "$2" || { [ "$1" != check ] || echo "the mihomo config is larger than 1 MiB"; return 1; }
     # what is left after removing TAB, LF, CR, printable ASCII and the bytes from 0x80 is a control character or NUL
@@ -74,6 +77,23 @@ mihomo_read() {
     function atline(m) { bad("(line " NR ") " m) }
     function emit(s) { out[++no] = s }
     function indent(s,    i) { i = 0; while (substr(s, i + 1, 1) == " ") i++; return i }
+    # openq(l): whether L ends inside a quoted scalar. A quote opens one where a node can start (the line start,
+    # or after a blank, "[", "{" or ","); inside double quotes a backslash escapes the next character, inside
+    # single quotes a doubled quote is one; a blank "#" outside quotes starts a comment, which closes nothing.
+    # A quote elsewhere (a"b) is text, as YAML reads it.
+    function openq(l,    i, n, c, p, q) {
+        q = ""; n = length(l)
+        for (i = 1; i <= n; i++) {
+            c = substr(l, i, 1)
+            if (q == "\"") { if (c == "\\") i++; else if (c == "\"") q = "" }
+            else if (q == "\047") { if (c == "\047") { if (substr(l, i + 1, 1) == "\047") i++; else q = "" } }
+            else {
+                p = (i > 1) ? substr(l, i - 1, 1) : " "
+                if (p ~ /[[{, \t]/) { if (c == "\"" || c == "\047") q = c; else if (c == "#") break }
+            }
+        }
+        return q != ""
+    }
     # flowkey(lo): the position in LO (the line, lowercased) of the first "KEY:" of the two keys that sits in a
     # flow collection - after "{", "[" or "," and blanks, followed by a blank, ",", a closing bracket or the end -
     # with fk the key; 0 when there is none
@@ -180,6 +200,10 @@ mihomo_read() {
     }
     { if (NR == 1 && substr($0, 1, 3) == "\357\273\277") $0 = substr($0, 4)
       sub(/\r$/, "") }
+    # yaml.v3 ends a line at a lone CR, NEL (U+0085), LS (U+2028) and PS (U+2029) as well as at LF: a line holding
+    # one is one line to these rules and several to mihomo, so it is refused (as openvpn.sh refuses a lone CR)
+    index($0, "\r") || index($0, "\302\205") || index($0, "\342\200\250") || index($0, "\342\200\251") {
+        atline("has a line break inside a line (a lone CR, NEL, LS or PS), which YAML reads as a line end"); next }
     length($0) > 4096 { atline("has a line over 4096 bytes"); next }
     /^\t/ { if ($0 ~ /[^ \t]/) { atline("has a TAB at the start of a line (YAML does not indent with tabs)"); next } }
     /^%/ { atline("has a YAML directive (%)"); next }
@@ -187,6 +211,14 @@ mihomo_read() {
     /^\.\.\.[ \t]*$/ { atline("has a document end marker (...)"); next }
     /(^|[[{, \t])\?([ \t]|$)/ { atline("has an explicit key (?), which this driver does not read"); next }
     /\\[xuU][0-9A-Fa-f]/ { atline("has a hex escape (\\x, \\u, \\U), which could spell a key"); next }
+    # a tag (!!binary spells a key without its text), a line continued on the next by a backslash and a quoted
+    # scalar left open on its line (the two ways a quoted key can span lines) are refused; not on a comment line,
+    # which is only a comment. A "!" or a quote in the middle of a value belongs to the value and stays.
+    !/^[ \t]*#/ {
+        if ($0 ~ /(^|[[{, \t])!/) { atline("has a tag (!), which this driver does not read"); next }
+        if ($0 ~ /\\$/) { atline("has a line ending in a backslash (a scalar continued on the next line)"); next }
+        if (openq($0)) { atline("has a quoted scalar that is not closed on its line"); next }
+    }
     # indented, blank and comment lines: the current block
     /^[ \t]/ || /^#/ || /^$/ {
         if (keeping) body($0)
@@ -263,14 +295,17 @@ EOF
     [ -z "$2" ] || printf "external-controller: '%s'\n" "$2"
 }
 
-# mihomo_written_ok CONTROLLER FILE: the guard behind the rebuild, on the file mihomo gets: every column-0 line a
-# "KEY:" line whose key is one of the kept list, ours or an anchor holder of ours (mu300-anchor-N, see
-# flush_dropped), tun and dns exactly once, routing-mark 720 and allow-lan
+# mihomo_written_ok CONTROLLER FILE: the guard behind the rebuild, on the file mihomo gets: no line break but LF
+# (yaml.v3's line is the guard's line), every column-0 line a "KEY:" line whose key is one of the kept list, ours
+# or an anchor holder of ours (mu300-anchor-N, see flush_dropped), tun and dns exactly once, routing-mark 720 and allow-lan
 # false (once each), bind-address once, external-controller exactly when CONTROLLER is set. A later change to the
 # reduction that let something through fails closed here instead of reaching mihomo.
 mihomo_written_ok() {
     LC_ALL=C awk -v keep="$MIHOMO_KEYS" -v ours="$MIHOMO_OURS" -v ctl="$1" -v mark="$((MARK))" '
     BEGIN { n = split(keep " " ours, a, " "); for (i = 1; i <= n; i++) ok[a[i]] = 1 }
+    # the line model is that of yaml.v3: a CR, NEL, LS or PS anywhere is a line end to mihomo, so a line holding one
+    # fails the file (the reduction writes none: a CRLF end is stripped, a break inside a line refused)
+    index($0, "\r") || index($0, "\302\205") || index($0, "\342\200\250") || index($0, "\342\200\251") { bad = 1; exit }
     /^[ \t#]/ || /^$/ { next }
     { if (!match($0, /^[A-Za-z0-9_-]+[ \t]*:([ \t]|$)/)) { bad = 1; exit }
       k = $0; sub(/[ \t]*:.*/, "", k)

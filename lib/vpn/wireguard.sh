@@ -100,13 +100,14 @@ wg_validate() {
 }
 
 # wg_filter MAP FILE: FILE for wg setconf. The wg-quick keys (it does not know them, and PreUp, PostUp and the like
-# are commands) are left out, comments go, and an Endpoint's name is replaced by the address MAP (name=address pairs
-# separated by spaces) holds for it; a literal address stays.
+# are commands) are left out, as are ListenPort (a config opens no port on this device) and FwMark (the mark is
+# ours, set by wg set after setconf); comments go, and an Endpoint's name is replaced by the address MAP
+# (name=address pairs separated by spaces) holds for it; a literal address stays.
 wg_filter() {
     awk -v map="$1" '
     function trim(s) { sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); return s }
     BEGIN { n = split(map, t, " "); for (i = 1; i <= n; i++) { j = index(t[i], "="); m[substr(t[i], 1, j - 1)] = substr(t[i], j + 1) }
-            split("address dns mtu table preup postup predown postdown saveconfig", d, " "); for (i in d) drop[d[i]] = 1 }
+            split("address dns mtu table preup postup predown postdown saveconfig listenport fwmark", d, " "); for (i in d) drop[d[i]] = 1 }
     { sub(/\r$/, ""); sub(/#.*/, ""); l = trim($0)
       if (l == "") next
       if (l ~ /^\[.*\]$/) { print l; next }

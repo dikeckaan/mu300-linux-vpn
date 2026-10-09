@@ -200,6 +200,8 @@ ovpn_read() {
 
     {
         raw = $0; sub(/\r$/, "", raw)
+        # a UTF-8 BOM on the first line (a Windows export) is not part of the first word
+        if (NR == 1 && substr(raw, 1, 3) == "\357\273\277") raw = substr(raw, 4)
         if (index(raw, "\r")) { bad("has a carriage return inside the line"); next }
         if (length(raw) > 1024) { bad("is longer than 1024 bytes"); next }
         l = trim(raw)
@@ -430,10 +432,20 @@ drv_start() {
     rm -f "$RUN/ovpn-up" "$RUN/dns" "$RUN/ovpn.auth"
     # Our options come after --config, so that they win over anything a config could say. --route-nopull is not
     # used: it would also drop the pushed "dhcp-option DNS" our up script reads. --route-noexec keeps openvpn off the
-    # routing table, and the pull filters drop what the server would otherwise change on the device.
+    # routing table. What the server pushes is held to an accept list (a prefix match, first filter wins: the
+    # accepts first, then ignore "" for everything else): the session's addresses and topology, the DNS our up script
+    # reads ("dhcp-option DNS" also takes DNS6), the keepalive, and what the data-channel negotiation the client
+    # announced decided (peer-id, cipher, auth-token, protocol-flags, key-derivation, tun-mtu: dropping those while
+    # the server applies them leaves a data channel that cannot be decrypted or a wrong MTU). Nothing accepted runs
+    # anything or names a file; a route, redirect-gateway, setenv, compress, dns, client-nat, block-outside-dns and
+    # every other dhcp-option are ignored. --dns-updown is not given: OpenVPN 2.6 (the images' version) does not
+    # know it and would not start; on 2.7 our --up script suppresses the built-in dns-updown by itself.
     set -- "$(ovpn_bin)" --config "$RUN/openvpn.conf" --dev "$TUN" --dev-type tun --route-noexec \
-        --pull-filter ignore redirect-gateway --pull-filter ignore "route " --pull-filter ignore route-ipv6 \
-        --pull-filter ignore setenv --pull-filter ignore "dhcp-option DOMAIN" --pull-filter ignore block-outside-dns \
+        --pull-filter accept ifconfig --pull-filter accept ifconfig-ipv6 --pull-filter accept topology \
+        --pull-filter accept "dhcp-option DNS" --pull-filter accept ping --pull-filter accept ping-restart \
+        --pull-filter accept peer-id --pull-filter accept cipher --pull-filter accept auth-token \
+        --pull-filter accept route-gateway --pull-filter accept protocol-flags --pull-filter accept key-derivation \
+        --pull-filter accept tun-mtu --pull-filter ignore "" \
         --mark "$((MARK))" --script-security 2 --up "$LIB/openvpn-up" \
         --setenv MU300_VPN_RUN "$RUN" --auth-nocache --verb 3
     # The credentials are copied into the runtime directory for this one run, and go with it.
