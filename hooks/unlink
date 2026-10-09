@@ -1,0 +1,56 @@
+#!/bin/sh
+# hooks/unlink SYSROOT: undo hooks/link for one system (mu300-extra remove runs it for every installed system).
+# The links, the service and the example this module put there are removed and what the system had there itself
+# (NAME.builtin, an older image's own mu300-vpn) is put back. When nothing comes back, the service's enable link
+# goes too, and on the running system (SYSROOT "") the VPN is turned off first with this module's own mu300-vpn
+# off - the service stopped and the kill switch taken down - since nothing would be left that could take it down
+# later. Running it again changes nothing. (MU300_VPN_LIVE=1|0 as in hooks/link: tests/.)
+set -eu
+R=${1?usage: hooks/unlink SYSROOT   (SYSROOT "" = the running system)}
+R=${R%/}
+HERE=$(cd "$(dirname "$0")/.." && pwd)
+LIVE=${MU300_VPN_LIVE:-}; [ -n "$LIVE" ] || { [ -n "$R" ] && LIVE=0 || LIVE=1; }
+
+wanted() {
+    _e=$(sed -n "/^ENABLE=/{s/^ENABLE=//; s/[[:space:]]#.*//; s/[\"' ]//g; p;}" "$R/etc/mu300/vpn.conf" 2>/dev/null | tail -n1)
+    [ "$_e" = 1 ]
+}
+# back PATH: PATH.builtin, if there is one, back at PATH; true when it was
+back() {
+    if [ -e "$1.builtin" ] || [ -L "$1.builtin" ]; then
+        mv "$1.builtin" "$1" && echo "put the system's own ${1#"$R"} back"
+        return 0
+    fi
+    return 1
+}
+# drop PATH: what this module put at PATH removed (a link, or the copy of a file), and the system's own put back
+drop() {
+    if [ -L "$1" ] || [ -f "$1" ]; then rm -f "$1"; fi
+    back "$1"
+}
+
+# a system whose mu300-vpn is its own (never linked, or unlinked already) is left as it is
+if [ -e "$R/opt/mu300/bin/mu300-vpn" ] && [ ! -L "$R/opt/mu300/bin/mu300-vpn" ]; then exit 0; fi
+if [ -L "$R/opt/mu300/bin/mu300-vpn" ] && [ ! -e "$R/opt/mu300/bin/mu300-vpn.builtin" ] && [ "$LIVE" = 1 ] && [ -x "$HERE/bin/mu300-vpn" ]; then
+    # no mu300-vpn will be left: the VPN off now, while this one can still do it
+    if wanted || [ -e "$R/etc/systemd/system/multi-user.target.wants/mu300-vpn.service" ] ||
+            ls "$R"/etc/rc.d/S*mu300-vpn >/dev/null 2>&1; then
+        "$HERE/bin/mu300-vpn" off >/dev/null 2>&1 || echo "mu300-vpn off failed; the VPN may still be up" >&2
+    fi
+fi
+
+drop "$R/opt/mu300/bin/mu300-vpn" || true
+if [ -L "$R/opt/mu300/lib/vpn" ]; then rm -f "$R/opt/mu300/lib/vpn"; fi
+back "$R/opt/mu300/lib/vpn" || true
+drop "$R/etc/mu300/vpn.conf.example" || true
+if [ -e "$R/etc/openwrt_release" ]; then
+    if ! drop "$R/etc/init.d/mu300-vpn"; then
+        for l in "$R"/etc/rc.d/[SK]*mu300-vpn; do [ ! -L "$l" ] || rm -f "$l"; done
+    fi
+else
+    if ! drop "$R/etc/systemd/system/mu300-vpn.service"; then
+        rm -f "$R/etc/systemd/system/multi-user.target.wants/mu300-vpn.service"
+    fi
+    if [ "$LIVE" = 1 ] && command -v systemctl >/dev/null 2>&1; then systemctl daemon-reload >/dev/null 2>&1 || true; fi
+fi
+exit 0
