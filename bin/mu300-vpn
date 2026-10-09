@@ -37,7 +37,16 @@ TS_PREFS='5198 5199 5200'  # the rule prefs that send them through the tunnel, b
 WIFI_IF=${MU300_WIFI_IFACE:-wlan0}
 # The engine drivers and the link parser (MU300_VPN_LIB: tests). Read only when they are there: guard and off must
 # keep working on a system whose library is missing or damaged, since the kill switch depends on them.
-LIB=${MU300_VPN_LIB:-/opt/mu300/lib/vpn}
+# By default the module's own lib/vpn, next to this script's real file: the extra's bin/mu300-vpn, also when it is
+# run through the /opt/mu300/bin/mu300-vpn link hooks/link makes (busybox and coreutils both have readlink -f).
+# /opt/mu300/lib/vpn when there is none there.
+vpn_lib() {
+    _self=$(readlink -f "$0" 2>/dev/null) || _self=
+    [ -n "$_self" ] || _self=$0
+    case $_self in */*) _l=$(cd "${_self%/*}/../lib/vpn" 2>/dev/null && pwd) || _l= ;; *) _l= ;; esac
+    if [ -n "$_l" ] && [ -r "$_l/uri.sh" ]; then echo "$_l"; else echo /opt/mu300/lib/vpn; fi
+}
+LIB=${MU300_VPN_LIB:-$(vpn_lib)}
 if [ -r "$LIB/uri.sh" ]; then . "$LIB/uri.sh"; fi
 
 # ---- the store: profiles and settings under /etc/mu300/vpn --------------------------------------------------
