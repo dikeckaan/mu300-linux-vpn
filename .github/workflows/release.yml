@@ -1,0 +1,71 @@
+name: Release
+
+# Builds the module with tools/make-module.sh (the engines are the pinned downloads, checked by hash) and publishes
+# the three release files under fixed names, so releases/latest/download/NAME always works for mu300-extra:
+# mu300-linux-vpn.tar.gz, mu300-linux-vpn-mihomo.tar.gz and SHA256SUMS. Actions > Release > Run workflow on main,
+# with the tag (vMAJOR.MINOR.PATCH). The release's commit is the main commit the workflow ran on: the job refuses
+# another ref, and a tag or release that already exists.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag, e.g. v1.0.0'
+        required: true
+      prerelease:
+        description: 'Publish as a prerelease (mu300-extra takes the latest full release)'
+        type: boolean
+        default: false
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write   # the release and its assets
+    env:
+      TAG: ${{ inputs.tag }}
+      PRERELEASE: ${{ inputs.prerelease }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Tag and ref
+        run: |
+          [ "$GITHUB_REF_NAME" = main ] || { echo "releases come from main, not $GITHUB_REF_NAME"; exit 1; }
+          printf '%s\n' "$TAG" | grep -Eqx 'v[0-9]+\.[0-9]+\.[0-9]+' || { echo "not a release tag (vMAJOR.MINOR.PATCH): $TAG"; exit 1; }
+          echo "release $TAG from $GITHUB_REF_NAME@$GITHUB_SHA"
+      - uses: actions/checkout@v4
+      - name: Not yet released
+        run: |
+          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then echo "release $TAG exists"; exit 1; fi
+          [ -z "$(git ls-remote --tags origin "refs/tags/$TAG")" ] || { echo "tag $TAG exists"; exit 1; }
+      - name: Tests
+        run: |
+          sudo apt-get install -y -qq dash busybox jq unzip >/dev/null
+          cd tests && python3 -m unittest discover -s .
+      - name: Build
+        run: |
+          sh tools/make-module.sh out "$TAG"
+          cat out/SHA256SUMS
+      - name: Publish
+        run: |
+          {
+            echo "mu300-vpn and its engines as a module for [mu300-linux](https://github.com/dikeckaan/mu300-linux)"
+            echo
+            echo "Install on the device: \`sudo mu300-extra install vpn\` (needs $(tar -xzOf out/mu300-linux-vpn.tar.gz ./requires) or newer); offline: see the README."
+            echo
+            echo '| file | contents |'
+            echo '|---|---|'
+            echo "| mu300-linux-vpn.tar.gz | mu300-vpn $TAG, $(tar -xzOf out/mu300-linux-vpn.tar.gz ./components | sed 1d | paste -sd, - | sed 's/,/, /g') |"
+            echo "| mu300-linux-vpn-mihomo.tar.gz | $(tar -xzOf out/mu300-linux-vpn-mihomo.tar.gz ./components) |"
+            echo
+            echo 'Licences: the scripts are MIT (LICENSE); Xray-core is MPL-2.0, sing-box GPL-3.0-or-later, hev-socks5-tunnel MIT, mihomo GPL-3.0. The engines are the projects'"'"' own release builds, pinned and checked by hash.'
+          } > notes.md
+          flag=; [ "$PRERELEASE" = true ] && flag=--prerelease
+          gh release create "$TAG" --target "$GITHUB_SHA" --title "$TAG" --notes-file notes.md $flag \
+            out/mu300-linux-vpn.tar.gz out/mu300-linux-vpn-mihomo.tar.gz out/SHA256SUMS

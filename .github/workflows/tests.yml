@@ -1,0 +1,31 @@
+name: Tests
+
+# tests/: mu300-vpn, its engine drivers, the module's tarballs and its hooks under every shell they run with (dash
+# and bash on Ubuntu, busybox ash on OpenWrt). Run them locally with: cd tests && python3 -m unittest discover
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  unix:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: shells and jq
+        run: |
+          if [ "$RUNNER_OS" = Linux ]; then sudo apt-get install -y -qq dash busybox jq unzip >/dev/null; fi
+          if [ "$RUNNER_OS" = macOS ] && ! command -v jq >/dev/null; then brew install jq; fi
+          jq --version
+      - name: tests
+        run: |
+          cd tests
+          python3 -c 'import helpers; print("shells:", helpers.shells())'
+          python3 -m unittest discover -s . -v
