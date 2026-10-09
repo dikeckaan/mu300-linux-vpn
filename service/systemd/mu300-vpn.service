@@ -1,5 +1,5 @@
 [Unit]
-Description=MU300 VPN (VLESS via Xray or sing-box, TUN)
+Description=MU300 VPN (profiles: Xray, sing-box, mihomo, WireGuard, OpenVPN)
 After=mu300-firewall.service mu300-mobile-data.service
 Wants=mu300-mobile-data.service
 ConditionPathExists=/etc/mu300/vpn.conf
