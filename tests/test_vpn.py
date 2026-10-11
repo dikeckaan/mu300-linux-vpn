@@ -196,8 +196,10 @@ class Engines(ShellTest):
 
     def test_a_configured_vpn_gets_its_engines_back(self):
         for shell in self.each_shell():
+            # (an install that fails asks whether mu300-extra knows the engine extra at all - one from before the
+            # engine extras does not - and then gets the vpn extra, whose bundle carries xray and sing-box)
             for adopt_ok, install_ok, want in ((True, False, 'adopt'), (False, True, 'adopt install'),
-                                               (False, False, 'adopt install')):
+                                               (False, False, 'adopt install list install')):
                 self.reset()
                 (self.tmp / 'calls').unlink(missing_ok=True)
                 self.stub('extra', f'echo "$1" >> "$STUBLOG/calls"; '
@@ -238,7 +240,7 @@ class Engines(ShellTest):
 
     def test_run_puts_the_kill_switch_up_before_anything_else(self):
         src = (BIN / 'mu300-vpn').read_text()
-        run = src[src.index('    run)'):src.index('    off)')]
+        run = src[src.index('    run)'):src.index('    off|stop)')]
         self.assertLess(run.index('ENABLE'), run.index('killswitch_on'))
         self.assertLess(run.index('killswitch_on'), run.index('ensure_engines'))
         self.assertLess(run.index('ensure_engines'), run.index('gen'))
@@ -398,6 +400,12 @@ class KillSwitch(ShellTest):
                     'oifname "sipa_eth*" ip6 daddr @dns6 meta l4proto { tcp, udp } th dport 53 accept',
                     'oifname "sipa_eth*" ip daddr @fetch4 tcp dport { 80, 443 } accept',
                     'oifname "sipa_eth*" ip6 daddr @fetch6 tcp dport { 80, 443 } accept',
+                    'oifname "sipa_eth*" meta nfproto ipv6 icmpv6 type nd-router-solicit accept',
+                    'oifname "sipa_eth*" meta nfproto ipv6 icmpv6 type nd-neighbor-solicit accept',
+                    'oifname "sipa_eth*" meta nfproto ipv6 icmpv6 type nd-neighbor-advert accept',
+                    'oifname "sipa_eth*" meta nfproto ipv6 udp sport 546 udp dport 547 accept',
+                    'oifname "sipa_eth*" meta nfproto ipv6 meta l4proto tcp reject with tcp reset',
+                    'oifname "sipa_eth*" meta nfproto ipv6 reject with icmpv6 type admin-prohibited',
                     'oifname "sipa_eth*" counter drop',
                     'oifname "wlan0" meta mark 0x2d0 accept',
                     'oifname "wlan0" udp dport 123 accept',
@@ -406,6 +414,12 @@ class KillSwitch(ShellTest):
                     'oifname "wlan0" ip6 daddr @dns6 meta l4proto { tcp, udp } th dport 53 accept',
                     'oifname "wlan0" ip daddr @fetch4 tcp dport { 80, 443 } accept',
                     'oifname "wlan0" ip6 daddr @fetch6 tcp dport { 80, 443 } accept',
+                    'oifname "wlan0" meta nfproto ipv6 icmpv6 type nd-router-solicit accept',
+                    'oifname "wlan0" meta nfproto ipv6 icmpv6 type nd-neighbor-solicit accept',
+                    'oifname "wlan0" meta nfproto ipv6 icmpv6 type nd-neighbor-advert accept',
+                    'oifname "wlan0" meta nfproto ipv6 udp sport 546 udp dport 547 accept',
+                    'oifname "wlan0" meta nfproto ipv6 meta l4proto tcp reject with tcp reset',
+                    'oifname "wlan0" meta nfproto ipv6 reject with icmpv6 type admin-prohibited',
                     'oifname "wlan0" counter drop'])
                 # every allowance runs out by itself
                 for name in ('dns4', 'dns6', 'fetch4', 'fetch6'):
@@ -549,14 +563,13 @@ class KillSwitch(ShellTest):
             self.assertClosed(r.stderr)
             self.assertIn('engine sing-box run -c', self.events())
             self.assertNotIn('engine xray run', self.events())
-            # only xray: nothing runs, and the kill switch stays
+            # only xray (module v2: vpn-xray alone): the link runs on xray, its server looked up through the resolve
+            # window, and the kill switch stays up all the while
             self.fresh(('xray', 'hev-socks5-tunnel'))
             r = self.run_vpn(shell, self.conf_ks('xray'))
-            self.assertNotEqual(r.returncode, 0)
-            self.assertIn('the kill switch stays up', r.stderr)
+            self.assertIn('running this VLESS link on xray behind the kill switch', r.stderr)
             self.assertClosed(r.stderr)
-            self.assertNotIn('engine xray run', self.events())
-            self.assertNotIn('engine hev', self.events())
+            self.assertNotIn('engine sing-box run', self.events())
 
     def test_xray_with_allowinsecure_is_not_moved_to_an_unchecked_sing_box(self):
         # xray pins the certificate of an allowInsecure link; sing-box would take any: nothing runs instead

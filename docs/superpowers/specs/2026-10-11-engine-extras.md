@@ -226,8 +226,8 @@ them (`"error": "udp"`).
   uplink itself would not work behind the kill switch: the nft output hook drops the device's packets before tc
   egress, where dae would catch them.)
 * **DNS**: dae's DNS module answers; upstream `remote` = `tcp+udp://REMOTE_DNS:53` through the proxy, node and
-  subscription names through `bootstrap` = `udp://BOOTSTRAP_DNS:53` (`node() -> bootstrap`, `sub() -> bootstrap`,
-  `bootstrap_resolver`), on dae's marked sockets. The device's own lookups are DNAT'd to REMOTE_DNS as for every
+  subscription names through `bootstrap` = `udp://BOOTSTRAP_DNS:53` (`node(name_regex: '.')`, `subnode(name_regex: '.')` -> bootstrap,
+  `bootstrap_resolver`, `fallback_resolver`; dae 2.1.1 refuses `node()` without a parameter), on dae's marked sockets. The device's own lookups are DNAT'd to REMOTE_DNS as for every
   core-routed engine, which routes them into dae. Nothing goes to the carrier's resolver.
 * **Generated config** (from links): our `global` (above, plus `log_level: warn`, `pprof_port: 0`,
   `dial_mode: domain`, `allow_insecure` only when the link asks for it), `node { mu300_N: 'LINK' }`, one group
@@ -274,3 +274,32 @@ lookup in every combination), refusal paths, every `--json` output parsed and ch
 UUID, password and key must not appear), dae config generation and the raw-config reader, the kill switch with an
 engine missing, the IPv6 guard's nft rules per profile capability. mu300-linux's `tests/test_extra.py` and
 `test_update.py`: the new names, `vpn_engines_needed`, the offline staging of engine tarballs, the refusal.
+
+## 9. Decisions made while building it
+
+* **A VLESS link behind the kill switch without sing-box** (vpn-xray installed alone, the first-install default) runs
+  on Xray, its server looked up through the resolve window - as v1 already did for VMess, Trojan and Shadowsocks links.
+  With sing-box installed it still runs on sing-box (v1's behaviour; a v1 upgrade keeps vpn-singbox). A link that asks
+  for allowInsecure still refuses behind the kill switch (its pin is fetched unmarked).
+* **`mu300-vpn engine install xray|sing-box` with an mu300-extra from before the engine extras** gets the vpn extra
+  instead (the bundle carries both); mihomo and dae need the new mu300-extra.
+* The IPv6 guard is not installed when the kill switch is on: the kill switch carries the same rejects.
+
+## 10. What was tested, and how
+
+* `tests/` (dash, bash, busybox sh; in an arm64 Ubuntu 24.04 container): 188 tests, among them `test_v2.py` (engine
+  lookup in every layout, `--json` outputs parsed and searched for the fixtures' UUID, password, token and key,
+  subscriptions, latency, logs, the IPv6 guard per engine and setting, the dae driver and its raw-config reader, a
+  missing engine and a kernel without BTF failing closed) and `test_module.py` (every tarball's layout).
+* The kill switch, the download window and the IPv6 guard loaded into a real kernel's nftables (container with
+  NET_ADMIN); `nft --debug=netlink` shows the IPv6 rejects keep their `nfproto ipv6` match.
+* Every config the dae driver writes passes the real `dae validate` (v2.1.1, arm64, in a container).
+* **v1.0.0 -> v2 upgrade with a live tunnel**, in the release v2026.10.18 rootfs images (OpenWrt with LuCI and
+  Ubuntu, imported as arm64 Docker images) and in Ubuntu 24.04: module v1.0.0 (the real release) installed with the
+  image's own mu300-extra, a VLESS profile to a throwaway Xray server in a second container, the tunnel up (a third
+  container sees the server's address); then v2 (built with the real pinned engines) installed (a) with the image's
+  own, old mu300-extra (it takes the bundle) and (b) with the branch's mu300-extra (core + vpn-xray + vpn-singbox);
+  in both the same profile comes up again through the v2 tunnel, `status --json` / `profile list --json` hold no
+  UUID, the IPv6 guard is up beside the IPv4 tunnel and `off` removes it; (b) also: with the engine extras removed
+  and the release unreachable, `run` fails closed (kill switch up, no tunnel, the extra named).
+* Not tested here (device tests): see the PR.

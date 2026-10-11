@@ -35,33 +35,49 @@ sudo mu300-extra install vpn            # Ubuntu
 mu300-extra install vpn                 # OpenWrt (you are root)
 ```
 
-`mu300-extra` downloads `mu300-linux-vpn.tar.gz` from this repository's latest release, checks it against the
-release's `SHA256SUMS`, unpacks it to `/mnt/mu300-disk/extra/vpn` (the Linux partition, next to the systems) and
-links it into every installed system - Ubuntu and OpenWrt share one copy, and an update or reinstall of a system
-keeps it. For mihomo (Clash YAML) profiles, add its engine the same way: `mu300-extra install vpn-mihomo`.
+`mu300-extra` downloads the core (`mu300-linux-vpn-core.tar.gz`: mu300-vpn, no engine) and the engines the device
+needs from this repository's latest release - on a first install Xray (`vpn-xray`); `MU300_VPN_ENGINES="vpn-xray
+vpn-dae"` picks others, `none` none - checks them against the release's `SHA256SUMS`, unpacks them to
+`/mnt/mu300-disk/extra/` (the Linux partition, next to the systems) and links the core into every installed system -
+Ubuntu and OpenWrt share one copy, and an update or reinstall of a system keeps it. Each engine is an extra of its
+own, added or removed when you want it:
+
+```sh
+sudo mu300-vpn engine install sing-box     # or xray, mihomo, dae (= mu300-extra install vpn-singbox ...); wireguard, openvpn: the system's package
+sudo mu300-vpn engine remove mihomo        # refused while the VPN runs on it
+mu300-vpn engines                          # which are there, which profiles need them, how to get the rest
+```
+
+An mu300-linux from before the engine extras (its mu300-extra knows only `vpn` and `vpn-mihomo`) gets
+`mu300-linux-vpn.tar.gz`, the core with xray and sing-box in it, as module v1 was; nothing changes for it.
 
 `MU300_VPN_URL` takes another place with the same files, e.g. a pinned release:
 `MU300_VPN_URL=https://github.com/dikeckaan/mu300-linux-vpn/releases/download/v1.0.0 mu300-extra install vpn`.
 
 ### Offline
 
-Download `mu300-linux-vpn.tar.gz` and `SHA256SUMS` from the [latest release](https://github.com/dikeckaan/mu300-linux-vpn/releases/latest)
-(and `mu300-linux-vpn-mihomo.tar.gz` if you want mihomo), copy them into one directory on the device (`scp`, a USB
-stick, the SD card) and there, as root:
+Download `SHA256SUMS`, `mu300-linux-vpn-core.tar.gz` and the engines you want (`mu300-linux-vpn-xray.tar.gz`,
+`-singbox`, `-mihomo`, `-dae`) from the [latest release](https://github.com/dikeckaan/mu300-linux-vpn/releases/latest) -
+or `mu300-linux-vpn.tar.gz` alone, the core with xray and sing-box - copy them into one directory on the device
+(`scp`, a USB stick, the SD card) and there, as root:
 
 ```sh
-tar -xzf mu300-linux-vpn.tar.gz ./install.sh && sh install.sh
+tar -xzf mu300-linux-vpn-core.tar.gz ./install.sh && sh install.sh
 ```
 
-`install.sh` runs `mu300-extra install vpn --from` that directory, which checks the tarball against `SHA256SUMS`
-exactly as the online install does (and `vpn-mihomo` too when its tarball is there). `mu300-extra install vpn
---from /path/to/mu300-linux-vpn.tar.gz` does the same by hand.
+`install.sh` runs `mu300-extra install vpn --from` that directory, which checks every tarball against `SHA256SUMS`
+exactly as the online install does, and installs the other engine tarballs there too. When the profiles on the
+device need an engine that is not in the directory, nothing is changed and the message names it.
+`mu300-extra install vpn-dae --from /path/to/dir` adds one engine by hand.
 
 ### Updates and removal
 
-`mu300-update apply` brings the module to its latest release together with the systems, and refuses to update a
-device whose VPN is on when it cannot get the module (offline): an update must never leave a VPN with the kill
-switch on without its engine. Stage the module for it as its message says. `mu300-extra status` shows the
+`mu300-update apply` brings the module to its latest release together with the systems - the core and every engine
+the device has or a profile needs, as one set: all of it, or (with the bundle as the fallback) nothing - and refuses
+to update a device whose VPN is on when it cannot get the module (offline): an update must never leave a VPN with
+the kill switch on without its engine. Stage the files for it in `/mnt/mu300-disk/.mu300-update/vpn/` as its message
+says. **Upgrading from v1.0.0** keeps both of v1's engines (xray and sing-box, now `vpn-xray` and `vpn-singbox`), so
+every profile runs on what it ran on before. `mu300-extra status` shows the
 installed version; `sudo mu300-extra remove vpn` takes it off again, and the VPN with it (it is turned off first, so
 no kill switch is left behind that nothing could take down).
 
@@ -75,6 +91,20 @@ mu300-vpn profile list                                # id, type, name; * marks 
 sudo mu300-vpn profile use office                     # make it active (a running VPN restarts on it)
 sudo mu300-vpn on                                     # ENABLE=1, starts at boot; off: stops and removes the kill switch
 mu300-vpn status                                      # profile, engine, tunnel, exit IP - never a secret
+```
+
+More, for scripts and the control panel (every one has `--json`; the full interface is in
+[the spec](docs/superpowers/specs/2026-10-11-engine-extras.md), section 4):
+
+```sh
+mu300-vpn status --json                                       # state; --exit-ip adds the exit address
+mu300-vpn profile list --json                                 # never a UUID, password or key
+sudo mu300-vpn profile show office --json --reveal            # root only: with the raw config
+echo 'https://panel.example/sub/TOKEN' | sudo mu300-vpn subscription add Work -   # Clash YAML or a link list
+sudo mu300-vpn subscription refresh --all
+mu300-vpn latency --all                                       # TCP connect time to every profile's server
+sudo mu300-vpn killswitch off                                 # = settings set KILL_SWITCH 0, and a restart
+mu300-vpn logs xray -n 50
 ```
 
 (On OpenWrt, without `sudo`.) The type is sniffed from the link's scheme or the file's content; `profile add TYPE
@@ -95,24 +125,25 @@ VPN that is on uses a new value from its next `mu300-vpn restart`):
 |---|---|---|---|
 | `KILL_SWITCH` | 0, 1 | 1 | nothing but the tunnel leaves the device, also while the tunnel is down |
 | `TAILSCALE` | 0, 1 | 1 | Tailscale's own traffic through the tunnel (below) |
-| `IPV6` | 0, 1 | 0 | IPv6 through the tunnel as well, when the tunnel has an IPv6 address |
+| `IPV6` | 0, 1, auto | auto | IPv6 through the tunnel when it has an IPv6 address (auto: WireGuard's own; 1: also ask sing-box/mihomo for one); otherwise IPv6 on the uplinks is rejected while the tunnel is up, so programs fall back to IPv4 at once and nothing leaks beside it |
 | `REMOTE_DNS` | an address | 1.1.1.1 | DNS for the device and its clients, through the tunnel |
 | `BOOTSTRAP_DNS` | an address | 1.1.1.1 | for the server's own name, outside the tunnel (sing-box, mihomo) |
 | `LAN_CIDRS` | CIDRs, comma-separated | empty | more networks that stay local (the device's own LAN always does) |
-| `XRAY` `HEV` `SING_BOX` `MIHOMO` `OPENVPN` | a path | empty | another binary for that engine |
+| `XRAY` `HEV` `SING_BOX` `MIHOMO` `DAE` `OPENVPN` | a path | empty | another binary for that engine |
 
 `mu300-vpn enabled` prints the switch (0 or 1) and nothing else; `mu300-vpn restart` restarts the service.
 
 ## Engines
 
-`mu300-vpn engines` says which engines are present and how to get the missing ones; `sudo mu300-vpn engines
-install ENGINE` gets one.
+`mu300-vpn engines` says which engines are present, which profiles need them and how to get the missing ones;
+`sudo mu300-vpn engine install ENGINE` gets one, `engine remove ENGINE` takes it off again.
 
 | engine | for | where it comes from | licence |
 |---|---|---|---|
-| [Xray-core](https://github.com/XTLS/Xray-core) 26.3.27 + [hev-socks5-tunnel](https://github.com/heiher/hev-socks5-tunnel) 2.17.1 | VLESS, VMess, Trojan, Shadowsocks links, Xray JSON | in `mu300-linux-vpn.tar.gz` | MPL-2.0, MIT |
-| [sing-box](https://github.com/SagerNet/sing-box) 1.14.1 | the same links behind the kill switch, sing-box JSON | in `mu300-linux-vpn.tar.gz` | GPL-3.0-or-later |
-| [mihomo](https://github.com/MetaCubeX/mihomo) 1.19.32 | Clash/mihomo YAML | `mu300-linux-vpn-mihomo.tar.gz` (`mu300-extra install vpn-mihomo`) | GPL-3.0 |
+| [Xray-core](https://github.com/XTLS/Xray-core) 26.3.27 + [hev-socks5-tunnel](https://github.com/heiher/hev-socks5-tunnel) 2.17.1 | VLESS, VMess, Trojan, Shadowsocks links, Xray JSON | `vpn-xray` (`mu300-linux-vpn-xray.tar.gz`) | MPL-2.0, MIT |
+| [sing-box](https://github.com/SagerNet/sing-box) 1.14.1 | VLESS links behind the kill switch (when installed), sing-box JSON | `vpn-singbox` (`mu300-linux-vpn-singbox.tar.gz`) | GPL-3.0-or-later |
+| [mihomo](https://github.com/MetaCubeX/mihomo) 1.19.32 | Clash/mihomo YAML | `vpn-mihomo` (`mu300-linux-vpn-mihomo.tar.gz`) | GPL-3.0 |
+| [dae](https://github.com/daeuniverse/dae) 2.1.1 + v2fly geodata | dae configs, VLESS/VMess/Trojan/SS/Hysteria2/TUIC links and link subscriptions, as an eBPF transparent proxy; **kernels with BTF only** (mainline, not the 5.4 vendor kernel) | `vpn-dae` (`mu300-linux-vpn-dae.tar.gz`) | AGPL-3.0 |
 | WireGuard | `.conf` | the kernel's, with `wireguard-tools` (in the images; the 5.4 vendor kernel has no WireGuard, mainline does) | GPL-2.0 |
 | OpenVPN | `.ovpn` | the system's package: `apk add openvpn-openssl` (OpenWrt), `apt-get install openvpn` (Ubuntu) | GPL-2.0 |
 
@@ -120,7 +151,8 @@ The engines in the tarballs are the projects' own static arm64 release builds, d
 and checked against the hashes pinned there; the components file in each tarball names their versions. The service
 never installs a package by itself: without OpenVPN it fails closed and names the command.
 
-A VLESS link runs on Xray by default; with the kill switch it runs on sing-box, because Xray resolves the server's
+A VLESS link runs on Xray by default; with the kill switch it runs on sing-box when sing-box is installed (else on
+Xray through the resolve window, except a link that asks for allowInsecure), because Xray resolves the server's
 name and fetches its certificate (Xray 26 has no `allowInsecure`: the certificate is fetched once, pinned in the
 profile, and fetched again when the server renews it) before the tunnel exists, and the kill switch would drop both.
 Other types resolve their server's name through a short **resolve window** (only the device's DNS, only for

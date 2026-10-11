@@ -3,7 +3,7 @@
 # its policy routing itself (auto_route: rule prefs 9000-9010 and table 2022, exactly what the core's routes_up does
 # for the other drivers), so DRV_ROUTES=self for both forms; and it is exec'd in the foreground, as the service always
 # ran it (DRV_FOREGROUND=1).
-DRV_EXTRA=vpn
+DRV_EXTRA=vpn-singbox
 DRV_PKG=
 # (sing-box has no certificate pin: TLS_PIN_SHA256 is the xray driver's)
 DRV_KEYS=UPSTREAM_HTTP_PROXY

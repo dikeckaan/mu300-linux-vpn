@@ -1,6 +1,6 @@
 # The xray driver of mu300-vpn (sourced by load_driver): a vless, vmess, trojan or ss link ($PDIR/uri), or a raw
 # Xray config ($PDIR/config.json), run by Xray behind hev-socks5-tunnel.
-DRV_EXTRA=vpn
+DRV_EXTRA=vpn-xray
 # the per-profile options profile set takes (link_opt_set checks them)
 DRV_KEYS='TLS_PIN_SHA256 UPSTREAM_HTTP_PROXY'
 DRV_PKG=
