@@ -708,16 +708,36 @@ engine_install() {
            else extra_get "$_x" || exit $?; fi ;;
     esac
 }
-# engine_remove NAME [--force]: the extra, not while the running VPN's profile needs it
+# engine_in_use NAME: the VPN is on and runs on NAME - the engine the running service recorded ($RUN/engine), or the
+# one the active profile runs on as things are now (profile_engine: a VLESS xray profile behind the kill switch runs
+# on sing-box when sing-box is there, and on xray without it - both are its engines while it is the active one)
+engine_in_use() {
+    [ "$ENABLE" = 1 ] || return 1
+    [ "$(head -n1 "$RUN/engine" 2>/dev/null)" != "$1" ] || return 0
+    [ -n "$PTYPE" ] || return 1
+    [ "$(type_engine "$PTYPE")" != "$1" ] || return 0
+    _pu=; [ -z "$ACTIVE" ] || [ ! -r "$PROFILES/$ACTIVE/uri" ] || _pu=$(head -n1 "$PROFILES/$ACTIVE/uri")
+    [ -n "$ACTIVE" ] || _pu=${PURI:-}
+    [ "$PTYPE" = xray ] && [ "$1" = sing-box ] && [ "$KILL_SWITCH" = 1 ] && case $_pu in vless://*) true ;; *) false ;; esac
+}
+# engine_remove NAME [--force]: the extra, not while the running VPN needs it. With --force it goes, and the VPN fails
+# closed (the kill switch stays up while the service fetches the engine again).
 engine_remove() {
     _n=$(engine_name "$1"); [ -n "$_n" ] || engines_usage
     _x=$(engine_extra "$_n")
     [ -n "$_x" ] || { echo "$_n is a package of this system: remove it with its package manager" >&2; exit 2; }
-    if [ "${2:-}" != --force ] && [ "$ENABLE" = 1 ] && [ -n "$PTYPE" ] && [ "$(type_engine "$PTYPE")" = "$_n" ]; then
-        echo "the VPN is on and its profile ${ACTIVE:-} runs on $_n: mu300-vpn off, or profile use another one, first (or --force)" >&2
-        exit 1
+    if engine_in_use "$_n"; then
+        if [ "${2:-}" != --force ]; then
+            echo "the VPN is on and its profile ${ACTIVE:-} runs on $_n: mu300-vpn off, or profile use another one, first (or --force)" >&2
+            exit 1
+        fi
+        echo "removing $_n while the VPN runs on it: nothing leaves the device but the kill switch's download window until it is back" >&2
     fi
+    _iu=; ! engine_in_use "$_n" || _iu=1
     "$EXTRA_CMD" remove "$_x" ${2:+"$2"} || exit $?
+    # the engine that was running keeps its deleted files until it exits: restarted now, the service finds it gone and
+    # fails closed (kill switch up, the download window for the engine) instead of running on a removed engine
+    [ -z "$_iu" ] || svc restart
 }
 # engines [--json] [--check]: the list, with the status of the active profile's engines (no profile: the default
 # engine of ENGINE); engine[s] install|remove NAME
@@ -1085,14 +1105,14 @@ run_tunnel() {
         trap - EXIT INT TERM HUP
         drv_stop
         if [ "$DRV_ROUTES" = core ]; then routes_down; else tailscale_down; fi
-        rm -f "$RUN/iface"
+        rm -f "$RUN/iface" "$RUN/since"
     }
     trap 'tunnel_down; exit 0' INT TERM HUP
     trap tunnel_down EXIT
     drv_start || exit 1
     if [ "$DRV_ROUTES" = core ]; then routes_up; else tailscale_up; fi
     ipv6_guard
-    echo "$TUN" > "$RUN/iface"
+    echo "$TUN" > "$RUN/iface"; date +%s > "$RUN/since"
     while drv_alive; do
         sleep 2
         drv_poll || exit 1
@@ -1287,7 +1307,7 @@ routing_cleanup() {
     ip route flush table "$TABLE" 2>/dev/null || true
     routes6_down
     nft delete table ip mu300_vpn_dns 2>/dev/null || true
-    rm -f "$RUN/iface"
+    rm -f "$RUN/iface" "$RUN/since" "$RUN/engine"
     [ "$n" -gt 0 ] && echo "removed $n stale routing rule(s) left by a VPN engine"
     return 0
 }
@@ -1730,8 +1750,8 @@ status_json() {
     _up=; _addrs=; _v6t=; _since=
     if [ -n "$_if" ] && ip link show "$_if" >/dev/null 2>&1; then
         _up=1
-        # since: when the tunnel came up - the time run wrote $RUN/iface, after the engine started
-        _since=$(stat -c %Y "$RUN/iface" 2>/dev/null) || _since=
+        # since: when the tunnel came up - written by run next to iface ($RUN/since: OpenWrt's busybox has no stat)
+        _since=$(head -c 16 "$RUN/since" 2>/dev/null | tr -cd 0-9) || _since=
         _addrs=$(ip -o addr show dev "$_if" 2>/dev/null | awk '{print $4}')
         [ "$IPV6" = 0 ] || ! ip -6 addr show dev "$_if" scope global 2>/dev/null | grep -q inet6 || _v6t=1
         [ "$DRV_ROUTES" = core ] || [ "$IPV6" != 1 ] || _v6t=1
@@ -1815,7 +1835,8 @@ now_ms() { awk '{printf "%d\n", $1 * 1000}' /proc/uptime 2>/dev/null || echo 0; 
 # whatever is there, and only "refused", "timed out" or "unreachable" count as failures).
 tcp_ms() {
     case $1 in *:*) _h="[$1]" ;; *) _h=$1 ;; esac
-    if command -v curl >/dev/null 2>&1; then
+    # (MU300_NO_CURL: tests/, the OpenWrt path on a machine that has curl)
+    if [ -z "${MU300_NO_CURL:-}" ] && command -v curl >/dev/null 2>&1; then
         _t=$(curl -s -o /dev/null --connect-timeout 5 -m 6 -w '%{time_connect}' "telnet://$_h:$2" </dev/null 2>/dev/null) || true
         # (curl's time_connect is 0 when nothing connected)
         case $_t in ''|*[!0-9.]*) echo unreachable; return 1 ;; esac
@@ -1823,13 +1844,22 @@ tcp_ms() {
         awk -v t="$_t" 'BEGIN {printf "%d\n", t * 1000 + 0.5}'
         return 0
     fi
+    # one tool, one try: a failure counts as a connect only when the tool says the server answered something (an HTTP
+    # error, a reply that is not HTTP, a reset after the connect); anything else - a timeout above all, whatever its
+    # wording - is unreachable, and so is anything that took the whole timeout
+    if command -v wget >/dev/null 2>&1; then _tool=wget; else _tool=uclient-fetch; fi
     _s=$(now_ms)
-    _o=$( (wget -q -O /dev/null -T 5 "http://$_h:$2/" || uclient-fetch -q -O /dev/null -T 5 "http://$_h:$2/") 2>&1 ) && _r=0 || _r=1
+    _o=$("$_tool" -q -O /dev/null -T 5 "http://$_h:$2/" 2>&1 </dev/null) && _r=0 || _r=1
     _e=$(now_ms)
+    _ms=$((_e - _s))
+    [ "$_ms" -lt 4900 ] || { echo unreachable; return 1; }
     if [ "$_r" = 1 ]; then
-        case $_o in *[Rr]efused*|*[Tt]imed\ out*|*[Uu]nreachable*|*resolve*|*[Bb]ad\ address*|*"can't connect"*) echo unreachable; return 1 ;; esac
+        case $_o in
+            *"server returned error"*|*"error getting response"*|*"HTTP/"*|*[Bb]ad\ header*|*"onnection reset"*|*"Invalid"*) ;;
+            *) echo unreachable; return 1 ;;
+        esac
     fi
-    echo $((_e - _s))
+    echo "$_ms"
 }
 # latency_one ID: one profile's line of the result (JSON)
 latency_one() {
@@ -2198,7 +2228,9 @@ case "${1:-status}" in
         # servers up over the bearer, not into a tunnel with nothing at the other end. Then what this run's driver
         # writes, and nothing a previous profile left.
         routes_down
-        rm -f "$RUN/server-ip" "$RUN/dns" "$RUN/iface"
+        rm -f "$RUN/server-ip" "$RUN/dns" "$RUN/iface" "$RUN/since"
+        # the engine this run uses (a VLESS xray profile behind the kill switch runs on sing-box): engine remove asks it
+        { mkdir -p "$RUN" && chmod 700 "$RUN" && type_engine "${DRIVER:-$PTYPE}" > "$RUN/engine"; } || true
         if [ "$DRV_FOREGROUND" = 1 ]; then drv_gen >/dev/null; else drv_gen; fi
         ensure_firewall_zone
         [ "$DRV_FOREGROUND" = 1 ] || run_tunnel
@@ -2206,7 +2238,7 @@ case "${1:-status}" in
         # after it exits they are again: table $TABLE is empty then. mu300-vpn off and the next start clear them.
         tailscale_up
         ipv6_guard
-        echo "$TUN" > "$RUN/iface"
+        echo "$TUN" > "$RUN/iface"; date +%s > "$RUN/since"
         drv_start ;;
     # guard: before the modem's bearer comes up (mobile-data calls it), so a VPN with the kill switch is never
     # without it at boot, before the service has started

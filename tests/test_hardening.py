@@ -191,3 +191,61 @@ class Hardening(Base):
             self.fresh()
             s = json.loads(self.vpn(shell, 'status', '--json').stdout)
             self.assertIsNone(s['since'])
+
+
+class RunState(Base):
+    """the LuCI agent's findings: a latency timeout is no time; the engine the running VPN really uses is protected"""
+
+    def test_a_timeout_is_unreachable_without_curl(self):
+        for shell in self.each_shell():
+            self.fresh()
+            self.assertEqual(self.vpn(shell, 'profile', 'import', '-', stdin=VLESS).returncode, 0)
+            # no curl here (a stub that hides the machine's own and fails as "not found" would), wget that waits out
+            # its -T and says so in its own words, or says nothing
+            for msg in ('wget: download timed out', '', 'wget: something else'):
+                self.stub('curl', 'exit 127')
+                self.stub('wget', f'echo "{msg}" >&2; exit 1')
+                r = self.vpn(shell, 'latency', 'home', '--json', MU300_NO_CURL='1')
+                self.assertEqual(r.returncode, 1, msg)
+                self.assertEqual(json.loads(r.stdout), {'error': 'unreachable'}, msg)
+                r = self.vpn(shell, 'latency', '--all', '--json', MU300_NO_CURL='1')
+                self.assertEqual(json.loads(r.stdout)[0]['error'], 'unreachable', msg)
+                self.assertIsNone(json.loads(r.stdout)[0]['ms'])
+            # a server that answers something (not HTTP): a time
+            self.stub('wget', 'echo "wget: error getting response" >&2; exit 1')
+            r = self.vpn(shell, 'latency', 'home', '--json', MU300_NO_CURL='1')
+            self.assertEqual(r.returncode, 0, r.stdout)
+            self.assertIsInstance(json.loads(r.stdout)['ms'], int)
+
+    def test_engine_remove_looks_at_the_engine_really_in_use(self):
+        for shell in self.each_shell():
+            self.fresh()
+            self.assertEqual(self.vpn(shell, 'profile', 'import', '-', stdin=VLESS).returncode, 0)
+            self.assertEqual(self.vpn(shell, 'profile', 'use', 'home').returncode, 0)
+            self.put('vpn-xray', 'xray', 'hev-socks5-tunnel')
+            self.put('vpn-singbox', 'sing-box')
+            self.conf.write_text('ENABLE=1\n')
+            # an xray VLESS profile behind the kill switch runs on sing-box: sing-box is in use
+            r = self.vpn(shell, 'engine', 'remove', 'sing-box')
+            self.assertEqual(r.returncode, 1)
+            self.assertIn('runs on sing-box', r.stderr)
+            # what the running service recorded counts, whatever the profile says
+            (self.tmp / 'run').mkdir(exist_ok=True)
+            (self.tmp / 'run/engine').write_text('mihomo\n')
+            self.assertEqual(self.vpn(shell, 'engine', 'remove', 'mihomo').returncode, 1)
+            # --force: removed, and the service restarted, so it fails closed now
+            (self.tmp / 'svc.log').unlink(missing_ok=True)
+            r = self.vpn(shell, 'engine', 'remove', 'sing-box', '--force')
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn('svc restart', self.log('svc.log'))
+            self.assertIn('extra remove vpn-singbox --force', self.log('extra.log'))
+            # the VPN off: nothing is in use
+            self.conf.write_text('ENABLE=0\n')
+            self.assertEqual(self.vpn(shell, 'engine', 'remove', 'mihomo').returncode, 0)
+
+    def test_run_records_since_and_engine(self):
+        src = (BIN / 'mu300-vpn').read_text()
+        run = src[src.index('    run)'):src.index('    off|stop)')]
+        self.assertIn('> "$RUN/engine"', run)
+        self.assertIn('date +%s > "$RUN/since"', run)
+        self.assertNotIn('stat -c', src)

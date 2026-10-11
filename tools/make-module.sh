@@ -67,7 +67,8 @@ core() {
     cp "$TOP/bin/mu300-vpn" "$1/bin/"
     cp -R "$TOP/lib/vpn" "$1/lib/vpn"
     cp "$TOP/etc/vpn.conf.example" "$1/etc/"
-    cp "$TOP/service/systemd/mu300-vpn.service" "$1/service/systemd/"
+    cp "$TOP/service/systemd/mu300-vpn.service" "$TOP/service/systemd/mu300-vpn-subscriptions.service" \
+        "$TOP/service/systemd/mu300-vpn-subscriptions.timer" "$1/service/systemd/"
     cp "$TOP/service/procd/mu300-vpn" "$1/service/procd/"
     cp "$TOP/hooks/link" "$TOP/hooks/unlink" "$1/hooks/"
     cp "$TOP/install.sh" "$1/"

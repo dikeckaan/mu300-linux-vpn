@@ -131,7 +131,7 @@ which need root and print the raw config.
 ```
 `profile` is `null` without an active profile; `engine.reason` says why an installed engine cannot run (dae: no BTF);
 `missing_engine` is the extra to install when the active profile's engine is not there. `since`: epoch seconds the
-tunnel came up (when `running`), else `null`.
+tunnel came up (when `running`; `/run/mu300-vpn/since`, written by the service), else `null`.
 
 ### Profiles
 
@@ -163,7 +163,7 @@ except the secret ones (`OVPN_PASS` is shown as `"set"` or `""`). `server` is `n
 |---|---|
 | `engines [--json] [--check]` | every engine; `--check` downloads the release's `VERSIONS` for `available` |
 | `engine install NAME [--from FILE\|DIR]` | the engine's extra (`mu300-extra install vpn-NAME`), or its package |
-| `engine remove NAME [--force]` | the extra (`mu300-extra remove vpn-NAME`); refused while the running profile needs it |
+| `engine remove NAME [--force]` | the extra (`mu300-extra remove vpn-NAME`); refused while the VPN is on and runs on it - the engine the running service recorded (`/run/mu300-vpn/engine`) or the one the active profile runs on (an xray VLESS profile behind the kill switch runs on sing-box); with `--force` it goes and the service is restarted, so it fails closed at once |
 | `engines install NAME` | the v1 spelling, still accepted |
 
 NAME: `xray` (also `hev-socks5-tunnel`), `sing-box` (also `singbox`), `mihomo`, `dae`, `wireguard`, `openvpn`.
@@ -185,7 +185,7 @@ The plain-text form keeps v1's TSV lines (`name TAB present|missing TAB path|how
 | `subscription add NAME URL\|- [--type auto\|links\|mihomo\|dae] [--interval HOURS] [--insecure]` | fetch (https, certificate checked; http only with `--insecure`, remembered), store and import; prints the id |
 | `subscription list [--json]` | id, name, type, host of the URL (never the path or the query), updated, count, interval, insecure, profile ids |
 | `subscription show ID [--json] [--reveal]` | one; `--reveal` (root) adds the URL |
-| `subscription refresh [ID\|--all\|--due]` | fetch again and update its profiles (the active one in place: the running VPN restarts). `--due`: those whose `--interval` has passed since their last refresh - **no timer is installed**: the panel (or cron) calls `subscription refresh --due` hourly |
+| `subscription refresh [ID\|--all\|--due]` | fetch again and update its profiles (the active one in place: the running VPN restarts). `--due`: those whose `--interval` has passed since their last refresh. The module runs it hourly itself: hooks/link installs `mu300-vpn-subscriptions.timer` (systemd, Ubuntu) or a marked line in `/etc/crontabs/root` (OpenWrt, cron enabled and restarted); hooks/unlink removes them |
 | `subscription remove ID [--keep-profiles]` | the subscription and (unless kept) its profiles; not the active one while on |
 
 `subscription --json` object: `{"id", "name", "type", "format", "host", "updated", "count", "interval", "insecure",

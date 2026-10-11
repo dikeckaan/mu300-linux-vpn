@@ -74,7 +74,9 @@ class Tarballs(unittest.TestCase):
     def core_files(self):
         drivers = {'lib/vpn/' + p.name for p in (TOP / 'lib/vpn').iterdir()}
         return META | {'install.sh', 'bin/mu300-vpn', 'etc/vpn.conf.example', 'service/systemd/mu300-vpn.service',
-                       'service/procd/mu300-vpn', 'hooks/link', 'hooks/unlink'} | drivers
+                       'service/procd/mu300-vpn', 'hooks/link', 'hooks/unlink',
+                       'service/systemd/mu300-vpn-subscriptions.service',
+                       'service/systemd/mu300-vpn-subscriptions.timer'} | drivers
 
     def test_core_layout(self):
         m, data = self.members('mu300-linux-vpn-core.tar.gz')
@@ -293,6 +295,32 @@ class Hooks(ShellTest):
                         self.assertEqual(r.returncode, 0, r.stderr)
                         self.assertEqual({p: v for p, v in tree(root).items() if v[0] != 'd'}, left, 'unlink twice')
 
+    def test_the_subscription_refresh_timer(self):
+        """an hourly `subscription refresh --due`: a systemd timer on Ubuntu, a line of root's crontab on OpenWrt
+        (an existing crontab keeps its own lines); both gone again with unlink"""
+        for shell in self.each_shell():
+            root = self.system('ubuntu', 'ENABLE=0\n')
+            self.assertEqual(self.hook(shell, 'link', root).returncode, 0)
+            sd = root / 'etc/systemd/system'
+            self.assertIn('subscription refresh --due', (sd / 'mu300-vpn-subscriptions.service').read_text())
+            self.assertIn('OnUnitActiveSec=1h', (sd / 'mu300-vpn-subscriptions.timer').read_text())
+            self.assertEqual(os.readlink(sd / 'timers.target.wants/mu300-vpn-subscriptions.timer'),
+                             '/etc/systemd/system/mu300-vpn-subscriptions.timer')
+            self.assertEqual(self.hook(shell, 'unlink', root).returncode, 0)
+            self.assertFalse((sd / 'mu300-vpn-subscriptions.timer').exists())
+            self.assertFalse(os.path.lexists(sd / 'timers.target.wants/mu300-vpn-subscriptions.timer'))
+            root = self.system('openwrt', 'ENABLE=0\n')
+            (root / 'etc/crontabs').mkdir(parents=True, exist_ok=True)
+            (root / 'etc/crontabs/root').write_text('0 3 * * * /usr/bin/mine\n')
+            for _ in range(2):
+                self.assertEqual(self.hook(shell, 'link', root).returncode, 0)
+            lines = (root / 'etc/crontabs/root').read_text().splitlines()
+            self.assertEqual(lines[0], '0 3 * * * /usr/bin/mine')
+            self.assertEqual(len(lines), 2)
+            self.assertIn('/opt/mu300/bin/mu300-vpn subscription refresh --due', lines[1])
+            self.assertEqual(self.hook(shell, 'unlink', root).returncode, 0)
+            self.assertEqual((root / 'etc/crontabs/root').read_text(), '0 3 * * * /usr/bin/mine\n')
+
     def test_an_older_images_own_vpn_is_kept_aside_and_put_back(self):
         for shell in self.each_shell():
             for kind in ('ubuntu', 'openwrt'):
@@ -356,10 +384,10 @@ class Hooks(ShellTest):
 
     def test_the_running_system_reloads_and_starts_a_wanted_vpn(self):
         for shell in self.each_shell():
-            for enable, active, want in (('ENABLE=1\n', False, ['systemctl daemon-reload', 'systemctl is-active --quiet mu300-vpn',
+            for enable, active, want in (('ENABLE=1\n', False, ['systemctl daemon-reload', 'systemctl --no-block start mu300-vpn-subscriptions.timer', 'systemctl is-active --quiet mu300-vpn',
                                                                   'systemctl --no-block start mu300-vpn']),
-                                         ('ENABLE=1\n', True, ['systemctl daemon-reload', 'systemctl is-active --quiet mu300-vpn']),
-                                         ('ENABLE=0\n', False, ['systemctl daemon-reload'])):
+                                         ('ENABLE=1\n', True, ['systemctl daemon-reload', 'systemctl --no-block start mu300-vpn-subscriptions.timer', 'systemctl is-active --quiet mu300-vpn']),
+                                         ('ENABLE=0\n', False, ['systemctl daemon-reload', 'systemctl --no-block start mu300-vpn-subscriptions.timer'])):
                 with self.subTest(enable=enable, active=active):
                     (self.tmp / 'calls').unlink(missing_ok=True)
                     (self.tmp / 'active').unlink(missing_ok=True)

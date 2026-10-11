@@ -56,6 +56,11 @@ link() {
     if [ "$(readlink "$2" 2>/dev/null)" != "$1" ]; then ln -sfn "$1" "$2"; fi
 }
 
+# OpenWrt's crontab line for the subscriptions (hooks/unlink removes the line with the mark)
+CRON_MARK='# mu300-vpn subscriptions'
+CRON_LINE="17 * * * * /opt/mu300/bin/mu300-vpn subscription refresh --due >/dev/null 2>&1 $CRON_MARK"
+cron_new=
+
 # first: this system has not been linked yet (no link at its mu300-vpn), so what is there is its own
 first=; [ -L "$R/opt/mu300/bin/mu300-vpn" ] || first=1
 mkdir -p "$R/opt/mu300/bin" "$R/opt/mu300/lib" "$R/etc/mu300"
@@ -69,6 +74,11 @@ if [ -e "$R/etc/openwrt_release" ]; then
     if wanted && ! ls "$R"/etc/rc.d/S*mu300-vpn >/dev/null 2>&1; then
         ln -s ../init.d/mu300-vpn "$R/etc/rc.d/S${start:-95}mu300-vpn"
     fi
+    # the hourly refresh of the subscriptions that are due: one line of root's crontab, marked as ours
+    mkdir -p "$R/etc/crontabs"
+    if ! grep -qF "$CRON_MARK" "$R/etc/crontabs/root" 2>/dev/null; then
+        printf '%s\n' "$CRON_LINE" >> "$R/etc/crontabs/root"; cron_new=1
+    fi
 else
     mkdir -p "$R/etc/systemd/system"
     put "$HERE/service/systemd/mu300-vpn.service" "$R/etc/systemd/system/mu300-vpn.service" 644
@@ -77,6 +87,13 @@ else
     if wanted && [ ! -L "$w/mu300-vpn.service" ]; then
         mkdir -p "$w"; ln -sfn /etc/systemd/system/mu300-vpn.service "$w/mu300-vpn.service"
     fi
+    # the hourly refresh of the subscriptions that are due: a timer, always enabled (it does nothing without any)
+    put "$HERE/service/systemd/mu300-vpn-subscriptions.service" "$R/etc/systemd/system/mu300-vpn-subscriptions.service" 644
+    put "$HERE/service/systemd/mu300-vpn-subscriptions.timer" "$R/etc/systemd/system/mu300-vpn-subscriptions.timer" 644
+    t=$R/etc/systemd/system/timers.target.wants
+    mkdir -p "$t"
+    [ -L "$t/mu300-vpn-subscriptions.timer" ] ||
+        ln -sfn /etc/systemd/system/mu300-vpn-subscriptions.timer "$t/mu300-vpn-subscriptions.timer"
 fi
 link "$EXTRA/lib/vpn" "$R/opt/mu300/lib/vpn"
 # the command last: its link is what says this system is linked (first above)
@@ -87,8 +104,13 @@ if [ "$LIVE" = 1 ]; then
         if wanted && ! "$R/etc/init.d/mu300-vpn" running >/dev/null 2>&1; then
             "$R/etc/init.d/mu300-vpn" start >/dev/null 2>&1 || echo "could not start the mu300-vpn service" >&2
         fi
+        # cron reads its crontab when it starts: a new line needs it (re)started, and enabled
+        if [ -n "$cron_new" ] && [ -x "$R/etc/init.d/cron" ]; then
+            { "$R/etc/init.d/cron" enable && "$R/etc/init.d/cron" restart; } >/dev/null 2>&1 || true
+        fi
     elif command -v systemctl >/dev/null 2>&1; then
         systemctl daemon-reload >/dev/null 2>&1 || true
+        systemctl --no-block start mu300-vpn-subscriptions.timer >/dev/null 2>&1 || true
         # --no-block: at boot this runs from a unit the VPN's own start may be ordered after
         if wanted && ! systemctl is-active --quiet mu300-vpn 2>/dev/null; then
             systemctl --no-block start mu300-vpn >/dev/null 2>&1 || echo "could not start the mu300-vpn service" >&2

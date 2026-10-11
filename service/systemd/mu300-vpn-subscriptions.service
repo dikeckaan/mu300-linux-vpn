@@ -1,0 +1,7 @@
+[Unit]
+Description=MU300 VPN: refresh the subscriptions that are due (mu300-vpn subscription refresh --due)
+ConditionPathIsDirectory=/etc/mu300/vpn/subscriptions
+
+[Service]
+Type=oneshot
+ExecStart=/opt/mu300/bin/mu300-vpn subscription refresh --due
