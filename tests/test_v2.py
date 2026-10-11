@@ -423,7 +423,7 @@ class Dae(Base):
             for want in ('so_mark_from_dae: 720', 'wan_interface: mu300dae', 'pprof_port: 0',
                          "bootstrap_resolver: '1.0.0.1:53'", "mu300_remote: 'tcp+udp://9.9.9.9:53'",
                          "mu300_bootstrap: 'udp://1.0.0.1:53'", "node(name_regex: '.') -> mu300_bootstrap",
-                         f"mu300_1: '{VLESS}'", 'policy: fixed(0)', 'fallback: proxy'):
+                         f"mu300_1: '{VLESS.split('#')[0]}'", 'policy: fixed(0)', 'fallback: proxy'):
                 self.assertIn(want, c)
             self.assertNotIn('lan_interface', c)     # no LAN interface here (the ip stub has none)
             self.assertEqual(c.count('global {'), 1)
@@ -434,13 +434,13 @@ class Dae(Base):
             c = self.rebuild(shell, 'true').stdout
             self.assertIn('lan_interface: usb0,wlan0', c)
             self.assertIn('policy: min\n', c)
-            self.assertIn("mu300_2: '" + TROJAN + "'", c)
+            self.assertIn("mu300_2: '" + TROJAN.split('#')[0] + "'", c)
             # a raw config: its global goes, ours is the only one; a listener in dns goes; its sections stay
             (p / 'links').unlink()
             (p / 'config.dae').write_text(
                 "global { wan_interface: auto\n so_mark_from_dae: 0\n pprof_port: 6060 }\n"
                 "dns { bind: '0.0.0.0:53'\n upstream { g: 'udp://8.8.8.8:53' }\n routing { request { fallback: g } } }\n"
-                "node { a: 'ss://YWVzLTEyOC1nY206cA==@h.example:1' } # a comment { with braces }\n"
+                "node { a: 'ss://YWVzLTEyOC1nY206cA==@h.example:1' }\n# a comment { with braces }\n"
                 "group { proxy { policy: min } }\nrouting {\n  dip(geoip:private) -> direct\n  fallback: proxy\n}\n")
             r = self.rebuild(shell, 'true')
             self.assertEqual(r.returncode, 0, r.stderr)
@@ -449,7 +449,9 @@ class Dae(Base):
             self.assertNotIn('6060', c)
             self.assertNotIn('bind', c)
             self.assertNotIn('wan_interface: auto', c)
-            self.assertIn("g: 'udp://8.8.8.8:53'", c)
+            # its dns section is replaced by ours (REMOTE_DNS through the proxy): nothing of it is left
+            self.assertNotIn('8.8.8.8:53', c.split('dns {')[1].split('\nnode {')[0])
+            self.assertEqual(c.count('dns {'), 1)
             self.assertIn('dip(geoip:private) -> direct', c)
             self.assertNotIn('comment', c)
             self.assertIn('so_mark_from_dae: 720', c)
@@ -457,8 +459,8 @@ class Dae(Base):
     def test_the_raw_readers_refusals(self):
         bad = {
             'include { a.dae }': 'an include',
-            'foo { }': 'not subscription, node, group, routing or dns',
-            "subscription { 'file://x.sub' }": 'file://',
+            'foo { }': 'not node, group or routing',
+            "subscription { 'file://x.sub' }": 'a subscription section',
             "node { a: 'x' ": 'a { without its }',
             '}': 'a } without its {',
             'stray words': 'text at the top level',
@@ -517,7 +519,9 @@ class Subscriptions(Base):
     def serve(self, body):
         (self.tmp / 'sub.body').write_bytes(body)
         # curl, as http_get calls it: the body for every URL (and the URL noted, to check it was the one stored)
-        self.stub('curl', 'for a; do u=$a; done; echo "$u" >> "$STUBLOG/urls"; cat "$STUBLOG/sub.body"')
+        # (the URL comes as curl's config on stdin, never as an argument; the arguments are noted to check that)
+        self.stub('curl', 'echo "$*" >> "$STUBLOG/argv"; u=$(sed -n \'s/^url = "\\(.*\\)"$/\\1/p\'); '
+                          'echo "$u" >> "$STUBLOG/urls"; cat "$STUBLOG/sub.body"')
 
     def test_links_base64_add_refresh_remove(self):
         url = f'https://panel.example.com/api/sub/{TOKEN}?flag=1'
@@ -586,7 +590,7 @@ class Subscriptions(Base):
         for shell in self.each_shell():
             self.fresh()
             self.serve(b'')
-            for url in ('ftp://x/y', 'file:///etc/shadow', "https://x/'a"):
+            for url in ('ftp://x/y', 'file:///etc/shadow', "https://x/'a", 'http://x.example/plain', 'https://x/a\\b'):
                 r = self.vpn(shell, 'subscription', 'add', 'X', url)
                 self.assertEqual(r.returncode, 2, url)
             r = self.vpn(shell, 'subscription', 'add', 'X', 'https://x.example/empty')

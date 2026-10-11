@@ -635,10 +635,31 @@ engines_list() {
 }
 # The module's release (engines --check reads its VERSIONS: extra, version, bytes, components - one TSV line each)
 VPN_URL=${MU300_VPN_URL:-https://github.com/dikeckaan/mu300-linux-vpn/releases/latest/download}
+# http_get URL: a public document (VERSIONS, the exit address); nothing secret in the URL
 http_get() {
     if command -v curl >/dev/null 2>&1; then curl -fsSL -m 20 "$1"
     elif command -v wget >/dev/null 2>&1; then wget -qO- -T 20 "$1"
     else uclient-fetch -qO- -T 20 "$1"; fi 2>/dev/null
+}
+# url_get URL: a document whose URL is a secret (a subscription's, a panel's config link: they carry tokens), over
+# HTTPS with the certificate checked - plain HTTP only with URL_INSECURE=1 (--insecure, which the panel never sets),
+# redirects included. The URL is never a command-line argument where that can be avoided (the process list is every
+# local user's): curl reads it from its config on stdin, GNU wget from its URL list on stdin. uclient-fetch (OpenWrt,
+# where every process is root's) takes it as an argument; it checks certificates. Nothing else is used: busybox's own
+# wget does not check them.
+url_get() {
+    _p='=https'; [ "${URL_INSECURE:-}" != 1 ] || _p='=http,https'
+    case $1 in https://*) ;; http://*) [ "${URL_INSECURE:-}" = 1 ] || return 1 ;; *) return 1 ;; esac
+    if command -v curl >/dev/null 2>&1; then
+        printf 'url = "%s"\n' "$1" | curl -fsSL -m 30 --proto "$_p" --proto-redir "$_p" -K - 2>/dev/null
+    elif wget --version 2>/dev/null | grep -q 'GNU Wget'; then
+        if [ "${URL_INSECURE:-}" = 1 ]; then printf '%s\n' "$1" | wget -qO- -T 30 -i - 2>/dev/null
+        else printf '%s\n' "$1" | wget -qO- -T 30 --https-only -i - 2>/dev/null; fi
+    elif command -v uclient-fetch >/dev/null 2>&1; then
+        uclient-fetch -qO- -T 30 "$1" 2>/dev/null
+    else
+        echo "no curl, GNU wget or uclient-fetch here to download it with its certificate checked" >&2; return 1
+    fi
 }
 # engines_json [VERSIONS]: the array the spec describes
 engines_json() {
@@ -1479,8 +1500,12 @@ profile_cmd() {
             profile_import "$SRC" "$2" "$1" || exit 1 ;;
         import)
             if [ "${1:-}" = --url ]; then
-                [ $# -ge 2 ] && [ $# -le 3 ] || profile_usage
-                profile_import_url "$2" "${3:-}"; return 0
+                shift; URL_INSECURE=
+                # --insecure (plain http): anywhere after --url
+                _ua=; _un=
+                for _a; do case $_a in --insecure) URL_INSECURE=1 ;; *) if [ -z "$_ua" ]; then _ua=$_a; elif [ -z "$_un" ]; then _un=$_a; else profile_usage; fi ;; esac; done
+                [ -n "$_ua" ] || profile_usage
+                profile_import_url "$_ua" "$_un"; return 0
             fi
             [ $# -ge 1 ] && [ $# -le 2 ] || profile_usage
             store_need; src_arg "$1"
@@ -1702,9 +1727,11 @@ status_json() {
         else _use=; [ -z "$_x" ] || _miss=$_x; fi
     fi
     _if=$(cat "$RUN/iface" 2>/dev/null) || _if=
-    _up=; _addrs=; _v6t=
+    _up=; _addrs=; _v6t=; _since=
     if [ -n "$_if" ] && ip link show "$_if" >/dev/null 2>&1; then
         _up=1
+        # since: when the tunnel came up - the time run wrote $RUN/iface, after the engine started
+        _since=$(stat -c %Y "$RUN/iface" 2>/dev/null) || _since=
         _addrs=$(ip -o addr show dev "$_if" 2>/dev/null | awk '{print $4}')
         [ "$IPV6" = 0 ] || ! ip -6 addr show dev "$_if" scope global 2>/dev/null | grep -q inet6 || _v6t=1
         [ "$DRV_ROUTES" = core ] || [ "$IPV6" != 1 ] || _v6t=1
@@ -1717,8 +1744,9 @@ status_json() {
     jq -n --arg ver "$(module_version)" --arg en "$ENABLE" --arg ks "$KILL_SWITCH" --arg ksa "$_ksa" \
         --arg v6 "$IPV6" --arg v6t "$_v6t" --arg v6g "$_v6g" --arg id "$ACTIVE" --arg pn "$_pn" --arg pt "$PTYPE" \
         --arg eng "$_eng" --arg x "$_x" --arg inst "$_inst" --arg use "$_use" --arg why "$_why" --arg if "$_if" \
-        --arg up "$_up" --arg addrs "$_addrs" --arg ip "$_ip" --arg miss "$_miss" '
+        --arg up "$_up" --arg addrs "$_addrs" --arg ip "$_ip" --arg miss "$_miss" --arg since "${_since:-}" '
         {version: $ver, enabled: ($en == "1"), running: ($up == "1"),
+         since: (if $up == "1" then ($since | tonumber? // null) else null end),
          kill_switch: {setting: ($ks == "1"), active: ($ksa == "1")},
          ipv6: {setting: $v6, tunnel: ($v6t == "1"), guard: ($v6g == "1")},
          profile: (if $id == "" and $pt == "" then null
@@ -1829,19 +1857,26 @@ latency_one() {
         '{id: $id, host: (if $h == "" then null else $h end), port: ($p | tonumber? // null),
           ms: ($ms | tonumber? // null), via: $via, error: (if $err == "" then null else $err end)}'
 }
+# latency ID --json: one object, and exit 1 with the error (the wrapper prints {"error": ...}) when no time was had;
+# latency --all --json, or several ids: always an array, exit 0
 latency_cmd() {
-    _json=; _ids=
+    _json=; _ids=; _all=; _n=0
     for _a; do
         case $_a in
             --json) _json=1 ;;
-            --all) for _p in "$PROFILES"/*; do _i=${_p##*/}; valid_id "$_i" && [ -d "$_p" ] && _ids="$_ids $_i"; done ;;
-            *) profile_arg "$_a"; _ids="$_ids $_a" ;;
+            --all) _all=1; for _p in "$PROFILES"/*; do _i=${_p##*/}; valid_id "$_i" && [ -d "$_p" ] && _ids="$_ids $_i"; done ;;
+            *) profile_arg "$_a"; _ids="$_ids $_a"; _n=$((_n + 1)) ;;
         esac
     done
-    [ -n "$_ids" ] || { echo "usage: mu300-vpn latency ID...|--all [--json]" >&2; exit 2; }
+    [ -n "$_ids" ] || [ -n "$_all" ] || { echo "usage: mu300-vpn latency ID...|--all [--json]" >&2; exit 2; }
     store_read
-    if [ -n "$_json" ]; then
-        for _i in $_ids; do latency_one "$_i"; done | jq -s 'if length == 1 then .[0] else . end'
+    if [ -n "$_json" ] && [ -z "$_all" ] && [ "$_n" = 1 ]; then
+        _o=$(latency_one $_ids)
+        _e=$(printf '%s' "$_o" | jq -r '.error // empty')
+        [ -z "$_e" ] || { echo "$_e" >&2; exit 1; }
+        printf '%s\n' "$_o"
+    elif [ -n "$_json" ]; then
+        for _i in $_ids; do latency_one "$_i"; done | jq -s .
     else
         for _i in $_ids; do latency_one "$_i"; done |
             jq -r '"\(.id)\t\(if .ms == null then "-" else "\(.ms) ms" end)\t\(.via)\t\(.error // "")"'
@@ -1858,19 +1893,26 @@ sub_usage() {
 }
 # sub_host URL: only the scheme and host of a URL, which is all a listing shows (the path and query carry tokens)
 sub_host() { printf '%s' "$1" | sed 's#^\([a-zA-Z][a-zA-Z0-9+.-]*://\)\([^/?#@]*@\)\{0,1\}\([^/?#:]*\).*#\1\3#' | tr -cd 'A-Za-z0-9.:/_-'; }
-# url_arg URL|-: the URL, from stdin when it is - (one line); only http and https
+# url_arg URL|-: the URL, from stdin when it is - (one line); https, or http with URL_INSECURE=1. A refusal never
+# repeats it (it carries a token).
 url_arg() {
     _u=$1
     if [ "$_u" = - ]; then IFS= read -r _u || [ -n "$_u" ] || { echo "nothing on stdin" >&2; exit 1; }; fi
     _u=$(printf '%s' "$_u" | tr -d '\r' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
-    case $_u in http://*|https://*) ;; *) echo "the URL must be http:// or https://" >&2; exit 2 ;; esac
-    case $_u in *[[:space:]]*|*"'"*|*'"'*|*'`'*) echo "the URL has a character a URL does not have" >&2; exit 2 ;; esac
+    case $_u in
+        https://*) ;;
+        http://*) [ "${URL_INSECURE:-}" = 1 ] || { echo "the URL must be https:// (plain http only with --insecure: anyone on the way could read the token and change the profiles)" >&2; exit 2; }
+                  echo "warning: plain http - the token and the profiles can be read and changed on the way" >&2 ;;
+        *) echo "the URL must be https://" >&2; exit 2 ;;
+    esac
+    _bad=$(printf '%s' "$_u" | LC_ALL=C tr -d 'A-Za-z0-9._~:/?#@!$&()*+,;=%\133\135-')
+    [ -z "$_bad" ] || { echo "the URL has a character a URL does not have" >&2; exit 2; }
     URL=$_u
 }
 # fetch_to URL FILE: the document at URL into FILE (0600), at most 1 MiB
 fetch_to() {
     rm -f "$2"
-    ( umask 077; http_get "$1" | head -c $((SUB_MAX + 1)) > "$2" ) || true
+    ( umask 077; url_get "$1" | head -c $((SUB_MAX + 1)) > "$2" ) || true
     [ -s "$2" ] || { rm -f "$2"; echo "could not download it (with the kill switch up and the tunnel down nothing gets out)" >&2; return 1; }
     [ "$(wc -c < "$2" | tr -d ' ')" -le "$SUB_MAX" ] || { rm -f "$2"; echo "it is larger than 1 MiB" >&2; return 1; }
 }
@@ -1926,7 +1968,16 @@ sub_apply() {
         mihomo) _put "$_sname" mihomo "$_file" ;;
         links)
             if [ "$_want" = dae ]; then
-                _put "$_sname" dae "$_file"
+                # every link dae can take safely, one profile; the others (a character a dae config cannot hold, the
+                # certificate check turned off, a kind dae does not speak) are left out and counted
+                ( umask 077; : > "$_file.dae" )
+                load_driver dae >/dev/null || return 1
+                while IFS= read -r _l; do
+                    if _dl=$(dae_link "$_l" 2>/dev/null); then printf '%s\n' "$_dl" >> "$_file.dae"
+                    else _skipped=$((_skipped + 1)); fi
+                done < "$_file"
+                if [ -s "$_file.dae" ]; then _put "$_sname" dae "$_file.dae"; fi
+                rm -f "$_file.dae"
             else
                 _k=0; _seen=
                 while IFS= read -r _l; do
@@ -1967,7 +2018,10 @@ sub_fetch_apply() {
     trap 'rm -f "$_f" "$_f.l"' EXIT
     URL=$(cat "$SUBS/$1/url" 2>/dev/null) || URL=
     [ -n "$URL" ] || { echo "subscription $1 has no URL" >&2; return 1; }
-    fetch_to "$URL" "$_f" || { URL=; return 1; }
+    kv_var _ins "$SUBS/$1/meta" INSECURE
+    [ "$_ins" != 1 ] || URL_INSECURE=1
+    fetch_to "$URL" "$_f" || { URL=; URL_INSECURE=; return 1; }
+    URL_INSECURE=
     URL=
     _fmt=$(sub_format "$_f") || return 1
     kv_var _want "$SUBS/$1/meta" TYPE
@@ -1979,12 +2033,14 @@ sub_fetch_apply() {
 }
 sub_json() {
     _d=$SUBS/$1
-    for _k in NAME TYPE FORMAT UPDATED COUNT; do kv_var "_s$_k" "$_d/meta" "$_k"; done
+    for _k in NAME TYPE FORMAT UPDATED COUNT INTERVAL INSECURE; do kv_var "_s$_k" "$_d/meta" "$_k"; done
     _u=$(cat "$_d/url" 2>/dev/null) || _u=
     jq -n --arg id "$1" --arg n "$_sNAME" --arg t "$_sTYPE" --arg f "$_sFORMAT" --arg up "$_sUPDATED" \
-        --arg c "$_sCOUNT" --arg h "$(sub_host "$_u")" --arg p "$(sub_profiles "$1")" --arg rev "${2:-}" --arg u "$_u" '
+        --arg c "$_sCOUNT" --arg h "$(sub_host "$_u")" --arg p "$(sub_profiles "$1")" --arg rev "${2:-}" --arg u "$_u" \
+        --arg iv "$_sINTERVAL" --arg ins "$_sINSECURE" '
         {id: $id, name: $n, type: (if $t == "" then "auto" else $t end), format: (if $f == "" then null else $f end),
          host: $h, updated: ($up | tonumber? // null), count: ($c | tonumber? // 0),
+         interval: ($iv | tonumber? // null), insecure: ($ins == "1"),
          profiles: ($p | split("\n") | map(select(. != "")))} | if $rev == "1" then .url = $u else . end'
     _u=
 }
@@ -1993,11 +2049,18 @@ subscription_cmd() {
     case $_sub in
         add)
             [ $# -ge 2 ] || sub_usage
-            _name=$1; _type=auto
-            store_need; url_arg "$2"; shift 2
+            _name=$1; _type=auto; _url=$2; _ivl=; URL_INSECURE=
+            shift 2
             while [ $# -gt 0 ]; do
-                case $1 in --type) [ $# -ge 2 ] || sub_usage; _type=$2; shift 2 ;; *) sub_usage ;; esac
+                case $1 in
+                    --type) [ $# -ge 2 ] || sub_usage; _type=$2; shift 2 ;;
+                    --interval) [ $# -ge 2 ] || sub_usage; _ivl=$2; shift 2
+                                case $_ivl in ''|*[!0-9]*|????*) sub_usage ;; esac ;;
+                    --insecure) URL_INSECURE=1; shift ;;
+                    *) sub_usage ;;
+                esac
             done
+            store_need; url_arg "$_url"; _url=
             case $_type in auto|links|mihomo|dae) ;; *) sub_usage ;; esac
             [ -n "$_name" ] || { echo "a subscription needs a name" >&2; exit 2; }
             case $_name in *'
@@ -2012,6 +2075,8 @@ subscription_cmd() {
             ( umask 077; printf '%s\n' "$URL" > "$SUBS/$_sid/url" ); URL=
             kv_set "$SUBS/$_sid/meta" NAME "$_name"; kv_set "$SUBS/$_sid/meta" TYPE "$_type"
             kv_set "$SUBS/$_sid/meta" CREATED "$(date +%s)"
+            [ -z "$_ivl" ] || kv_set "$SUBS/$_sid/meta" INTERVAL "$_ivl"
+            [ "${URL_INSECURE:-}" != 1 ] || kv_set "$SUBS/$_sid/meta" INSECURE 1
             if ! sub_fetch_apply "$_sid"; then
                 for _p in $(sub_profiles "$_sid"); do rm -rf "${PROFILES:?}/${_p:?}"; done
                 rm -rf "${SUBS:?}/${_sid:?}"; echo "subscription not added" >&2; exit 1
@@ -2038,6 +2103,15 @@ subscription_cmd() {
             _ids=
             case ${1:---all} in
                 --all) for _p in "$SUBS"/*; do _i=${_p##*/}; valid_id "$_i" && [ -d "$_p" ] && _ids="$_ids $_i"; done ;;
+                # --due: those with an INTERVAL (hours) whose last refresh is that old (for a timer: hourly is enough)
+                --due) _now=$(date +%s)
+                       for _p in "$SUBS"/*; do
+                           _i=${_p##*/}; valid_id "$_i" && [ -d "$_p" ] || continue
+                           kv_var _iv "$_p/meta" INTERVAL; kv_var _up "$_p/meta" UPDATED
+                           case $_iv in ''|*[!0-9]*|0) continue ;; esac
+                           case $_up in ''|*[!0-9]*) _up=0 ;; esac
+                           [ $((_up + _iv * 3600)) -le "$_now" ] && _ids="$_ids $_i"
+                       done ;;
                 *) valid_id "$1" && [ -d "$SUBS/$1" ] || { echo "no such subscription" >&2; exit 1; }; _ids=$1 ;;
             esac
             _rc=0
@@ -2175,7 +2249,9 @@ esac
 case " $* " in
     *" --json "*)
         case ${1:-} in run|gen|guard) main "$@"; exit ;; esac
-        _ef=$(mktemp 2>/dev/null) || _ef=/tmp/mu300-vpn.err.$$
+        # (mktemp: a new file of a random name, created exclusively, 0600; never a name of our choosing in /tmp. Without
+        # mktemp the command runs as it is, its messages on stderr only)
+        _ef=$(umask 077; mktemp "${TMPDIR:-/tmp}/mu300-vpn.XXXXXXXX" 2>/dev/null) || { main "$@"; exit; }
         # (set -e again inside: a subshell on the left of || would run without it)
         set +e
         ( set -e; main "$@" ) 2> "$_ef"

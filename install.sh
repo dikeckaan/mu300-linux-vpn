@@ -9,7 +9,8 @@
 # engines the profiles on the device need first and the core last (and refuses, changing nothing, when one of them is
 # not there), unpacks them to /mnt/mu300-disk/extra/ and links the core into every installed system (hooks/link).
 # Every other engine tarball in the directory is installed as well.
-#   sh install.sh [DIR|TARBALL]   another directory, or the tarball itself (then nothing checks it against SHA256SUMS)
+#   sh install.sh [DIR|TARBALL]   another directory, or the tarball itself (checked against a SHA256SUMS next to it;
+#                                 without one the current mu300-extra refuses it unless MU300_VPN_UNVERIFIED=1)
 # Needs mu300-linux v2026.10.16 or newer (its mu300-extra installs modules: see requires); the split engines need an
 # mu300-extra that knows them (mu300-linux with the engine extras) - an older one takes mu300-linux-vpn.tar.gz.
 set -eu

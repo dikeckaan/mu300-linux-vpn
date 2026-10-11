@@ -121,7 +121,7 @@ which need root and print the raw config.
 
 `status --json`:
 ```json
-{"version": "v2.0.0", "enabled": true, "running": true,
+{"version": "v2.0.0", "enabled": true, "running": true, "since": 1760180000,
  "kill_switch": {"setting": true, "active": true},
  "ipv6": {"setting": "auto", "tunnel": false, "guard": true},
  "profile": {"id": "office", "name": "Office", "type": "xray", "engine": "sing-box"},
@@ -130,16 +130,17 @@ which need root and print the raw config.
  "exit_ip": null, "missing_engine": null}
 ```
 `profile` is `null` without an active profile; `engine.reason` says why an installed engine cannot run (dae: no BTF);
-`missing_engine` is the extra to install when the active profile's engine is not there.
+`missing_engine` is the extra to install when the active profile's engine is not there. `since`: epoch seconds the
+tunnel came up (when `running`), else `null`.
 
 ### Profiles
 
 | command | does |
 |---|---|
 | `profile list [--json]` | every profile |
-| `profile show ID [--json] [--reveal]` | one; `--reveal` (root, `--json` only) adds `"config"`: the raw config text |
-| `profile import SRC\|- [NAME]` | from a link, a file, or stdin (`-`); prints the new id (unchanged) |
-| `profile import --url URL\|- [NAME]` | a config file downloaded from URL (URL from stdin with `-`: it can hold a token) |
+| `profile show ID [--json] [--reveal]` | one; `--reveal` (root only, with `--json` only: exit 2 without it, exit 1 for non-root) adds `"config"`: the raw config text as stored (a link, JSON, YAML, `.conf`, `.ovpn` or dae config) |
+| `profile import SRC\|- [NAME]` | from a link, a file, or stdin (`-`); prints the new id (unchanged). The type is sniffed: vless/vmess/trojan/ss links -> `xray`; **hysteria2://, hy2:// and tuic:// -> `dae`** (only dae runs them here; sing-box is not given links of these kinds); `.conf` -> wireguard, `.ovpn` -> openvpn, YAML -> mihomo, JSON -> xray/sing-box, a dae config -> dae |
+| `profile import --url URL\|- [NAME] [--insecure]` | a config file (or one link) downloaded from URL: **https only, the certificate checked**; plain http only with `--insecure` (a warning; the panel never sets it). URL from stdin with `-` (it can hold a token) |
 | `profile add TYPE NAME SRC\|-` | with the type said (unchanged); TYPE: xray sing-box mihomo wireguard openvpn dae |
 | `profile edit ID SRC\|-` | the raw config replaced (stdin with `-`), checked first (unchanged) |
 | `profile set ID KEY VALUE` | NAME, or an option of its type (unchanged) |
@@ -148,7 +149,7 @@ which need root and print the raw config.
 A profile object (`list` gives an array of them, `show` one):
 ```json
 {"id": "office", "name": "Office", "type": "xray", "engine": "xray", "extra": "vpn-xray",
- "active": true, "source": "manual", "subscription": null, "created": 1760000000,
+ "active": true, "source": "manual", "subscription": null, "stale": false, "created": 1760000000,
  "server": {"host": "vpn.example.com", "port": 443}, "protocol": "vless", "transport": "ws", "security": "tls",
  "options": {"UPSTREAM_HTTP_PROXY": ""}, "engine_installed": true}
 ```
@@ -170,7 +171,7 @@ NAME: `xray` (also `hev-socks5-tunnel`), `sing-box` (also `singbox`), `mihomo`, 
 ```json
 [{"name": "xray", "extra": "vpn-xray", "kind": "extra", "installed": true, "path": "/mnt/mu300-disk/extra/vpn-xray/bin/xray",
   "version": "26.3.27", "available": "26.3.27", "size": 31457280, "needed_by": ["office"],
-  "usable": true, "reason": null, "install": "mu300-vpn engine install xray"}]
+  "usable": true, "reason": null, "install": "mu300-vpn engines install xray (mu300-extra install vpn-xray)"}]
 ```
 `kind`: `extra`, `package` (wireguard, openvpn) or `bundle` (found in the `vpn` bundle or a v1 extra). `size`: bytes
 on disk, or the download size when not installed and `--check` gave it, else `null`. `needed_by`: the ids of the
@@ -181,34 +182,48 @@ The plain-text form keeps v1's TSV lines (`name TAB present|missing TAB path|how
 
 | command | does |
 |---|---|
-| `subscription add NAME URL\|- [--type auto\|links\|mihomo\|dae]` | fetch, store and import (URL from stdin with `-`) |
-| `subscription list [--json]` | id, name, type, host of the URL (never the path or the query), updated, count, profile ids |
+| `subscription add NAME URL\|- [--type auto\|links\|mihomo\|dae] [--interval HOURS] [--insecure]` | fetch (https, certificate checked; http only with `--insecure`, remembered), store and import; prints the id |
+| `subscription list [--json]` | id, name, type, host of the URL (never the path or the query), updated, count, interval, insecure, profile ids |
 | `subscription show ID [--json] [--reveal]` | one; `--reveal` (root) adds the URL |
-| `subscription refresh [ID\|--all]` | fetch again and update its profiles (the active one in place: the running VPN restarts) |
+| `subscription refresh [ID\|--all\|--due]` | fetch again and update its profiles (the active one in place: the running VPN restarts). `--due`: those whose `--interval` has passed since their last refresh - **no timer is installed**: the panel (or cron) calls `subscription refresh --due` hourly |
 | `subscription remove ID [--keep-profiles]` | the subscription and (unless kept) its profiles; not the active one while on |
+
+`subscription --json` object: `{"id", "name", "type", "format", "host", "updated", "count", "interval", "insecure",
+"profiles": [ids]}` (+ `"url"` with `--reveal`).
 
 Formats: a Clash/mihomo YAML (`proxies:`) becomes **one mihomo profile**; a list of share links (plain or base64,
 one per line) becomes **one profile per link** (vless/vmess/trojan/ss on xray; hysteria2/tuic on dae, or skipped
-with a note when vpn-dae cannot run) - or, with `--type dae`, **one dae profile** with every node in one group
-(`min_moving_avg`). A refresh keeps the ids of profiles whose name is unchanged, adds new ones, removes the ones
-that vanished (never the active one while the VPN is on; it is kept and marked `stale`). The subscription is stored
-under `/etc/mu300/vpn/subscriptions/ID/` (`url` 0600, `meta`). Fetched over the device's own connection: through the
-tunnel when the VPN is up, directly otherwise; with the kill switch up and the tunnel down it fails (no window is
-opened for arbitrary hosts).
+when vpn-dae is not installed) - or, with `--type dae`, **one dae profile** with every node in one group
+(`min_moving_avg`); a link dae cannot take safely (section 5) is left out and counted as skipped. A refresh keeps the
+ids of profiles whose name is unchanged, adds new ones, removes the ones that vanished (never the active one while
+the VPN is on; it is kept and marked `stale`). Stored under `/etc/mu300/vpn/subscriptions/ID/` (0700; `url` and
+`meta` 0600). The URL is never a command-line argument (curl reads it from its config on stdin, GNU wget from its
+URL list on stdin; only OpenWrt's uclient-fetch, where every process is root's, takes it as one). Fetched over the
+device's own connection: through the tunnel when the VPN is up, directly otherwise; with the kill switch up and the
+tunnel down it fails (no window is opened for arbitrary hosts).
 
 ### Latency
 
-`mu300-vpn latency ID|--all [--json]`: a TCP connect to the profile's server (host:port from its config), timed;
-`{"id": "office", "host": "vpn.example.com", "port": 443, "ms": 48, "via": "direct"}`, `ms: null` with
-`"error"` on failure. `via` is `tunnel` when the VPN is up (the test connection is not the engine's and is routed
-like any other), and the active profile's own server is not tested while the kill switch is up (it would be dropped:
-`"error": "kill switch"`). wireguard/openvpn servers are UDP more often than not: a TCP test says nothing about
-them (`"error": "udp"`).
+`mu300-vpn latency ID [--json]`: one object `{"id", "host", "port", "ms", "via", "error": null}`; when no time was
+had, **exit 1** and (as every failing `--json` command) `{"error": "unreachable" | "kill switch" | "udp" | "no
+server"}`. `latency --all --json` (or several ids): **always an array** of those objects, exit 0, `ms: null` with
+`"error"` for the ones that failed. `via` is `tunnel` when the VPN is up (the test connection is not the engine's and
+is routed like any other); the active profile's own server is not tested while the kill switch is up (`"kill
+switch"`); wireguard/openvpn-over-UDP, hysteria2 and tuic servers are UDP: a TCP test says nothing (`"udp"`).
 
 ### Settings
 
-`settings [--json]`, `settings get KEY`, `settings set KEY VALUE` (unchanged), new keys: `DAE` (a dae binary),
-`IPV6` takes `auto` (the new default, section 7).
+`settings --json`: one object, every key a string value (empty: the default in force is shown, never `null`):
+```json
+{"KILL_SWITCH": "1", "TAILSCALE": "1", "IPV6": "auto", "REMOTE_DNS": "1.1.1.1", "BOOTSTRAP_DNS": "1.1.1.1",
+ "LAN_CIDRS": "", "XRAY": "", "HEV": "", "SING_BOX": "", "MIHOMO": "", "OPENVPN": "", "DAE": ""}
+```
+Types: `KILL_SWITCH`, `TAILSCALE` `0|1`; `IPV6` `0|1|auto`; `REMOTE_DNS`, `BOOTSTRAP_DNS` an IPv4 or IPv6 address;
+`LAN_CIDRS` CIDRs comma-separated; the engine paths an absolute path or empty. `settings set KEY VALUE`: exit 0 set
+(an empty VALUE puts the default back; a running VPN uses it from its next restart, said on stderr), exit 2 an unknown
+key or an invalid value (nothing written), exit 1 the store cannot be written (not root). `killswitch on|off` is
+`settings set KILL_SWITCH` plus the restart. Not offered (yet): the mihomo mode (rule/global/direct) and an engine
+log level - the mihomo mode is the YAML's own `mode:`, which the profile keeps.
 
 ## 5. dae
 
@@ -230,13 +245,25 @@ them (`"error": "udp"`).
   `bootstrap_resolver`, `fallback_resolver`; dae 2.1.1 refuses `node()` without a parameter), on dae's marked sockets. The device's own lookups are DNAT'd to REMOTE_DNS as for every
   core-routed engine, which routes them into dae. Nothing goes to the carrier's resolver.
 * **Generated config** (from links): our `global` (above, plus `log_level: warn`, `pprof_port: 0`,
-  `dial_mode: domain`, `allow_insecure` only when the link asks for it), `node { mu300_N: 'LINK' }`, one group
-  `proxy` (`min_moving_avg`), routing: multicast and private ranges direct, `fallback: proxy`. No geodata needed.
-* **Raw config** is hostile input, as the JSON drivers' (it runs as root): parsed once by an awk reader that knows
-  dae's lexical rules (quotes, comments, braces); our `global` replaces the file's (every listener, interface and
-  mark option of it is gone), `include` refuses the config, top-level sections other than `subscription node group
-  routing dns` refuse it, inside `dns` the `bind` key is removed, a `file://` subscription refuses it. The rebuilt
-  file is checked with `dae validate` (no BPF, no network) before it runs.
+  `dial_mode: domain`, **`allow_insecure: false` always**), `node { mu300_N: 'LINK' }`, one group `proxy`
+  (`min_moving_avg`, `fixed(0)` for one link), routing: multicast and private ranges direct, `fallback: proxy`. No
+  geodata needed.
+* **Links into the config** (`dae_link`, the security review's injection finding): a link is written only when it
+  holds nothing but URL characters (RFC 3986 unreserved, reserved and `%`) - never a quote, backslash, blank, brace,
+  backquote or line break - so it cannot end its single-quoted string or start a directive; its `#fragment` is never
+  written; it must take apart (`parse_link`) and be a kind dae speaks.
+* **Certificates** (the review's TLS finding): Xray and sing-box keep checking unless a link asks, and Xray then pins
+  the certificate it saw; dae has no pin, so **a link that turns the check off (`allowInsecure`, `insecure`,
+  `allow_insecure`, `skip-cert-verify`, also in vmess's JSON) is refused for dae** with what to do instead (run it
+  on xray). A dae subscription leaves such links out.
+* **Raw config** (the review's parser-differential finding) is taken only in a subset this reader parses exactly as
+  dae does, and anything outside it refuses the config (fail closed), nothing is "cleaned up": no double quote,
+  backslash, backquote or non-ASCII anywhere; strings single-quoted on one line; comments whole lines only; top level
+  `node`, `group`, `routing` kept, `global` and `dns` replaced by ours, `subscription` refused (dae would fetch nodes
+  nobody checked: `subscription add --type dae` does it checked), `include` and anything else refused; every node
+  string a link `dae_link` accepts, every other string URL characters and blanks only. The rebuilt file is checked
+  again (`dae_written_ok`: one global and one dns, ours, no include/subscription/bind, no insecure link, printable
+  ASCII only) and by `dae validate` (no BPF, no network) before it runs.
 * Geodata: `DAE_LOCATION_ASSET` points at the extra's `share/dae`.
 * Tailscale: dae catches tailscaled's packets like any other on `mu300dae`; the Tailscale rules are not installed.
 
@@ -303,3 +330,20 @@ engine missing, the IPv6 guard's nft rules per profile capability. mu300-linux's
   UUID, the IPv6 guard is up beside the IPv4 tunnel and `off` removes it; (b) also: with the engine extras removed
   and the release unreachable, `run` fails closed (kill switch up, no tunnel, the extra named).
 * Not tested here (device tests): see the PR.
+
+## 11. The security review (and what changed for it)
+
+* **dae config injection** and **TLS verification**: section 5 (`dae_link`); tests in `tests/test_hardening.py`
+  (hostile links yield no extra line or directive, insecure links never reach dae, the config always says
+  `allow_insecure: false`).
+* **dae parser differential**: section 5 (the raw-config subset, fail closed); adversarial configs tested.
+* **Temporary files**: the one temp file outside the 0700 run directory (the `--json` error capture) is `mktemp`'s,
+  never a fixed name; everything else lives in `/run/mu300-vpn` (0700) or the store (0700 directories, 0600 files).
+* **Transport and secret exposure**: subscription and `profile import --url` fetches are HTTPS with the certificate
+  checked (curl `--proto =https --proto-redir =https`, GNU wget `--https-only`, uclient-fetch; busybox's own wget is
+  never used for them); plain http only with `--insecure`. The URL goes to curl/wget on stdin, never on the command
+  line (OpenWrt's uclient-fetch excepted, see section 4). No output prints a URL's path or query or a profile's
+  secret except `--reveal` (root). Engines come only through mu300-extra, from the pinned release, checked by
+  SHA-256 (and mu300-extra hashes and unpacks the same private copy: mu300-linux PR).
+* **JSON**: every JSON this version adds is built by `jq --arg`; nothing new is `eval`ed (`kv_var` assigns to names
+  of our own).
