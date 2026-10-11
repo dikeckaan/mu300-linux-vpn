@@ -1,0 +1,25 @@
+#!/bin/sh
+# hooks/link SYSROOT of an engine extra (vpn-xray, vpn-singbox, vpn-mihomo, vpn-dae; tools/make-module.sh puts this
+# file there as hooks/link). mu300-extra runs it after an install for every installed system and at every boot for
+# the running one, as MU300_DISK=DISK MU300_EXTRA_DIR=DISK/extra/NAME sh hooks/link SYSROOT. Nothing in the system
+# changes: mu300-vpn finds the engine in the extra by itself. On the running system (SYSROOT ""), a VPN that is wanted
+# and not running is started: it may have been waiting for exactly this engine (the kill switch up meanwhile).
+# (MU300_VPN_LIVE=1|0: those service calls or not, by default for SYSROOT "" only - tests/.)
+set -eu
+R=${1?usage: hooks/link SYSROOT   (SYSROOT "" = the running system)}
+R=${R%/}
+LIVE=${MU300_VPN_LIVE:-}; [ -n "$LIVE" ] || { [ -n "$R" ] && LIVE=0 || LIVE=1; }
+[ "$LIVE" = 1 ] || exit 0
+# the VPN is on in this system: ENABLE=1 in its vpn.conf, read as mu300-vpn enabled reads it (never sourced)
+_e=$(sed -n "/^ENABLE=/{s/^ENABLE=//; s/[[:space:]]#.*//; s/[\"' ]//g; p;}" "$R/etc/mu300/vpn.conf" 2>/dev/null | tail -n1)
+[ "$_e" = 1 ] || exit 0
+if [ -e "$R/etc/openwrt_release" ]; then
+    if [ -x "$R/etc/init.d/mu300-vpn" ] && ! "$R/etc/init.d/mu300-vpn" running >/dev/null 2>&1; then
+        "$R/etc/init.d/mu300-vpn" start >/dev/null 2>&1 || echo "could not start the mu300-vpn service" >&2
+    fi
+elif command -v systemctl >/dev/null 2>&1; then
+    if ! systemctl is-active --quiet mu300-vpn 2>/dev/null; then
+        systemctl --no-block start mu300-vpn >/dev/null 2>&1 || echo "could not start the mu300-vpn service" >&2
+    fi
+fi
+exit 0

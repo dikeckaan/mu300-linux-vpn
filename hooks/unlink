@@ -48,7 +48,24 @@ if [ -e "$R/etc/openwrt_release" ]; then
     if ! drop "$R/etc/init.d/mu300-vpn"; then
         for l in "$R"/etc/rc.d/[SK]*mu300-vpn; do [ ! -L "$l" ] || rm -f "$l"; done
     fi
+    # the subscriptions' crontab line (and only it: the line with our mark)
+    c=$R/etc/crontabs/root
+    if grep -qF '# mu300-vpn subscriptions' "$c" 2>/dev/null; then
+        grep -vF '# mu300-vpn subscriptions' "$c" > "$c.new.$$" || true
+        # (a crontab that held only our line goes with it, as hooks/link made it)
+        if [ -s "$c.new.$$" ]; then cat "$c.new.$$" > "$c"; else rm -f "$c"; fi
+        rm -f "$c.new.$$"
+        if [ "$LIVE" = 1 ] && [ -x "$R/etc/init.d/cron" ]; then "$R/etc/init.d/cron" restart >/dev/null 2>&1 || true; fi
+    fi
+    rmdir "$R/etc/crontabs" 2>/dev/null || true
 else
+    if [ "$LIVE" = 1 ] && command -v systemctl >/dev/null 2>&1; then
+        systemctl stop mu300-vpn-subscriptions.timer >/dev/null 2>&1 || true
+    fi
+    rm -f "$R/etc/systemd/system/timers.target.wants/mu300-vpn-subscriptions.timer"
+    rmdir "$R/etc/systemd/system/timers.target.wants" 2>/dev/null || true
+    drop "$R/etc/systemd/system/mu300-vpn-subscriptions.timer" || true
+    drop "$R/etc/systemd/system/mu300-vpn-subscriptions.service" || true
     if ! drop "$R/etc/systemd/system/mu300-vpn.service"; then
         rm -f "$R/etc/systemd/system/multi-user.target.wants/mu300-vpn.service"
     fi

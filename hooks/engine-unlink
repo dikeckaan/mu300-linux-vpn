@@ -1,0 +1,9 @@
+#!/bin/sh
+# hooks/unlink SYSROOT of an engine extra (tools/make-module.sh puts this file there as hooks/unlink). An engine puts
+# nothing into a system, so nothing is taken out. Whether it may go at all is decided before: mu300-extra refuses to
+# remove an engine that a system's active profile runs on while its VPN is on (unless --force), and a VPN whose
+# engine is gone fails closed - the kill switch stays up and the service fetches the engine again (mu300-vpn
+# ensure_engines).
+set -eu
+: "${1?usage: hooks/unlink SYSROOT   (SYSROOT "" = the running system)}"
+exit 0

@@ -127,3 +127,32 @@ connects but the TLS handshake times out, while the same `.ovpn` completes from 
 drops that UDP and DPI-blocks OpenVPN's TLS; the VLESS profile goes through. The WireGuard and OpenVPN drivers were
 verified on the device up to that point, no further.
 
+
+### 26g. IPv6 beside an IPv4 tunnel: the carrier's address, and a leak where it works
+Seen on an F50 (OpenWrt, v2026.10.18, the VPN on with an xray profile): the carrier hands out a global IPv6 address
+on `sipa_eth0` (2a00:...), and in Turkey nothing routes over it. The tunnel carries IPv4 only, so the device's own
+programs that prefer IPv6 fail: OpenWrt's `uclient-fetch` (wget) does not fall back to IPv4, `wget -4` works. Where
+the carrier's IPv6 does route, the same situation is a leak: IPv6 from the device and the LAN leaves on the bearer
+beside the tunnel. The kill switch (an `inet` table) already dropped unmarked IPv6 on the uplinks, so with it on
+nothing leaked - but silently, and programs waited out their IPv6 attempt first.
+
+Module v2: while a tunnel is up that has no IPv6 address of its own, `table inet mu300_vpn_v6` (the IPv6 guard,
+whatever KILL_SWITCH says) **rejects** IPv6 on the uplinks - TCP with a reset, the rest with ICMPv6
+administratively prohibited - for the device and for forwarded traffic, so programs fall back to IPv4 at once; the
+engine's marked sockets, neighbour/router discovery and DHCPv6 from the device stay allowed. The kill switch carries
+the same rejects before its drop. `nft list` shows these rules without their `meta nfproto ipv6`; the bytecode
+(`nft --debug=netlink list table ...`) keeps the match (`meta load nfproto`, `cmp eq 0x0a`): only IPv6 is
+rejected. The `IPV6` setting's new default `auto` routes IPv6 into a tunnel that has an IPv6 address (WireGuard with
+IPv6 in its config); LAN clients keep the address the router gives them and are rejected the same way.
+Tested: the rulesets load into a real kernel's nftables (a Docker container with NET_ADMIN); on the device: not yet.
+
+### 26h. dae behind the kill switch: the wan side on a dummy interface
+dae (eBPF, kernels with BTF and 5.17 or newer, so mainline only here) catches the device's own traffic on the
+egress of its `wan_interface` with tc. The kill switch drops unmarked traffic in nft's output hook, which runs before
+tc egress: with the uplink itself as dae's wan interface, the device's packets would be dropped before dae ever saw
+them. So the dae driver routes as the TUN engines do (rules 9000-9010, table 2022) into a dummy interface,
+`mu300dae`, and gives dae that as its wan interface; dae's own sockets carry the mark (`so_mark_from_dae: 720`) and
+leave by rule 9000. A dead dae leaves the dummy as a dead end: closed. `dae validate` (v2.1.1) accepts every config
+the driver writes (checked in a container); `node()` without a parameter is refused by it ("empty parameter list"),
+so the node lookups go to the bootstrap resolver with `node(name_regex: '.')`. Whether dae's node and subscription
+lookups really leave marked is the device test that remains.

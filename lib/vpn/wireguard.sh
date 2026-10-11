@@ -220,9 +220,9 @@ drv_start() {
     wg set "$TUN" fwmark "$MARK" || { echo "cannot mark $TUN's packets" >&2; return 1; }
     while IFS= read -r _a; do
         [ -n "$_a" ] || continue
-        # IPv6 through the tunnel only when the setting asks for it (as sing-box's TUN does): an address of its own
+        # IPv6 through the tunnel unless the setting says 0 (auto: the config's own IPv6 addresses are used): an address of its own
         # with no route into it would only make programs prefer a path that does not exist
-        case $_a in *:*) [ "${IPV6:-0}" = 1 ] || continue ;; esac
+        case $_a in *:*) [ "${IPV6:-auto}" != 0 ] || continue ;; esac
         ip addr add "$_a" dev "$TUN" || { echo "cannot add the address $_a to $TUN" >&2; return 1; }
     done < "$RUN/wg.addr"
     _m=$(cat "$RUN/wg.mtu")

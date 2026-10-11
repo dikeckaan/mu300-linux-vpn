@@ -21,6 +21,18 @@ def build(out, tag='v1.2.3', **env):
     return subprocess.run(['sh', str(MAKE), str(out), tag], capture_output=True, text=True, env=e, timeout=120)
 
 
+ASSETS = ['mu300-linux-vpn-core.tar.gz', 'mu300-linux-vpn.tar.gz', 'mu300-linux-vpn-xray.tar.gz',
+          'mu300-linux-vpn-singbox.tar.gz', 'mu300-linux-vpn-mihomo.tar.gz', 'mu300-linux-vpn-dae.tar.gz']
+# the extra each tarball is, and the programs it carries besides the core's
+EXTRA_OF = {'mu300-linux-vpn-core.tar.gz': 'vpn', 'mu300-linux-vpn.tar.gz': 'vpn',
+            'mu300-linux-vpn-xray.tar.gz': 'vpn-xray', 'mu300-linux-vpn-singbox.tar.gz': 'vpn-singbox',
+            'mu300-linux-vpn-mihomo.tar.gz': 'vpn-mihomo', 'mu300-linux-vpn-dae.tar.gz': 'vpn-dae'}
+ENGINE_FILES = {'vpn-xray': {'bin/xray', 'bin/hev-socks5-tunnel'}, 'vpn-singbox': {'bin/sing-box'},
+                'vpn-mihomo': {'bin/mihomo'},
+                'vpn-dae': {'bin/dae', 'share/dae/geoip.dat', 'share/dae/geosite.dat'}}
+META = {'VERSION', 'components', 'requires', 'name', 'release', 'manifest'}
+
+
 class Tarballs(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -38,44 +50,75 @@ class Tarballs(unittest.TestCase):
             return {m.name: m for m in t.getmembers()}, {m.name: t.extractfile(m).read() for m in t.getmembers()
                                                           if m.isfile()}
 
-    def test_the_three_release_files(self):
-        self.assertEqual(sorted(p.name for p in self.out.iterdir()),
-                         ['SHA256SUMS', 'mu300-linux-vpn-mihomo.tar.gz', 'mu300-linux-vpn.tar.gz'])
+    def test_the_release_files(self):
+        self.assertEqual(sorted(p.name for p in self.out.iterdir()), sorted(ASSETS + ['SHA256SUMS', 'VERSIONS']))
         sums = {}
         for line in (self.out / 'SHA256SUMS').read_text().splitlines():
             h, name = line.split('  ')
             sums[name] = h
-        self.assertEqual(set(sums), {'mu300-linux-vpn.tar.gz', 'mu300-linux-vpn-mihomo.tar.gz'})
+        self.assertEqual(set(sums), set(ASSETS) | {'VERSIONS'})
         for name, h in sums.items():
             self.assertEqual(hashlib.sha256((self.out / name).read_bytes()).hexdigest(), h, name)
 
-    def test_module_layout(self):
-        m, data = self.members('mu300-linux-vpn.tar.gz')
-        files = {n[2:] for n, ti in m.items() if ti.isfile()}
+    def test_versions_lists_every_tarball(self):
+        rows = [l.split('\t') for l in (self.out / 'VERSIONS').read_text().splitlines()]
+        self.assertEqual([r[4] for r in rows], ASSETS)
+        self.assertEqual([r[0] for r in rows],
+                         ['vpn', 'vpn-bundle', 'vpn-xray', 'vpn-singbox', 'vpn-mihomo', 'vpn-dae'])
+        for r in rows:
+            self.assertEqual(r[1], 'v1.2.3')
+            self.assertEqual(int(r[2]), (self.out / r[4]).stat().st_size)
+        self.assertRegex(rows[2][3], r'^xray [0-9.]+,hev-socks5-tunnel [0-9.]+$')
+        self.assertRegex(rows[5][3], r'^dae [0-9.]+$')
+
+    def core_files(self):
         drivers = {'lib/vpn/' + p.name for p in (TOP / 'lib/vpn').iterdir()}
-        self.assertEqual(files, {'VERSION', 'components', 'requires', 'name', 'release', 'manifest', 'install.sh',
-                                 'bin/mu300-vpn', 'bin/xray', 'bin/hev-socks5-tunnel', 'bin/sing-box',
-                                 'etc/vpn.conf.example', 'service/systemd/mu300-vpn.service',
-                                 'service/procd/mu300-vpn', 'hooks/link', 'hooks/unlink'} | drivers)
+        return META | {'install.sh', 'bin/mu300-vpn', 'etc/vpn.conf.example', 'service/systemd/mu300-vpn.service',
+                       'service/procd/mu300-vpn', 'hooks/link', 'hooks/unlink',
+                       'service/systemd/mu300-vpn-subscriptions.service',
+                       'service/systemd/mu300-vpn-subscriptions.timer'} | drivers
+
+    def test_core_layout(self):
+        m, data = self.members('mu300-linux-vpn-core.tar.gz')
+        self.assertEqual({n[2:] for n, ti in m.items() if ti.isfile()}, self.core_files())
         self.assertEqual(data['./VERSION'], b'v1.2.3\n')
-        self.assertEqual(data['./release'], b'v1.2.3\n')
         self.assertEqual(data['./name'], b'vpn\n')
         self.assertEqual(data['./requires'], b'mu300-linux v2026.10.16\n')
-        comp = data['./components'].decode().splitlines()
-        self.assertEqual([c.split()[0] for c in comp], ['mu300-linux-vpn', 'xray', 'hev-socks5-tunnel', 'sing-box'])
-        self.assertEqual(comp[0], 'mu300-linux-vpn v1.2.3')
-        for rel in ('bin/mu300-vpn', 'hooks/link', 'etc/vpn.conf.example', 'lib/vpn/uri.sh'):
+        self.assertEqual(data['./components'], b'mu300-linux-vpn v1.2.3\n')
+        for rel in ('bin/mu300-vpn', 'hooks/link', 'etc/vpn.conf.example', 'lib/vpn/uri.sh', 'lib/vpn/dae.sh'):
             self.assertEqual(data['./' + rel], (TOP / rel).read_bytes(), rel)
 
-    def test_mihomo_layout(self):
-        m, data = self.members('mu300-linux-vpn-mihomo.tar.gz')
+    def test_the_bundle_is_v1s_layout(self):
+        """mu300-linux-vpn.tar.gz is what mu300-extra and mu300-update from before the engine extras download as vpn:
+        it must carry v1's three engines, where v1 had them"""
+        m, data = self.members('mu300-linux-vpn.tar.gz')
         self.assertEqual({n[2:] for n, ti in m.items() if ti.isfile()},
-                         {'VERSION', 'components', 'requires', 'name', 'release', 'manifest', 'bin/mihomo'})
-        self.assertEqual(data['./name'], b'vpn-mihomo\n')
-        self.assertRegex(data['./components'].decode(), r'^mihomo \d+\.\d+\.\d+\n$')
+                         self.core_files() | {'bin/xray', 'bin/hev-socks5-tunnel', 'bin/sing-box'})
+        self.assertEqual(data['./name'], b'vpn\n')
+        comp = data['./components'].decode().splitlines()
+        self.assertEqual([c.split()[0] for c in comp], ['mu300-linux-vpn', 'xray', 'hev-socks5-tunnel', 'sing-box'])
+        # the core's files are the same bytes
+        _, core = self.members('mu300-linux-vpn-core.tar.gz')
+        for n in core:
+            if n not in ('./components', './manifest'):
+                self.assertEqual(data[n], core[n], n)
+
+    def test_engine_layouts(self):
+        for name, extra in EXTRA_OF.items():
+            if extra == 'vpn':
+                continue
+            with self.subTest(tarball=name):
+                m, data = self.members(name)
+                self.assertEqual({n[2:] for n, ti in m.items() if ti.isfile()},
+                                 META | {'hooks/link', 'hooks/unlink'} | ENGINE_FILES[extra])
+                self.assertEqual(data['./name'], (extra + '\n').encode())
+                self.assertEqual(data['./hooks/link'], (TOP / 'hooks/engine-link').read_bytes())
+                self.assertEqual(data['./hooks/unlink'], (TOP / 'hooks/engine-unlink').read_bytes())
+                for line in data['./components'].decode().splitlines():
+                    self.assertRegex(line, r'^[a-z0-9-]+ \d+\.\d+\.\d+$')
 
     def test_entries_modes_and_owner(self):
-        for name in ('mu300-linux-vpn.tar.gz', 'mu300-linux-vpn-mihomo.tar.gz'):
+        for name in ASSETS:
             m, _ = self.members(name)
             for n, ti in m.items():
                 with self.subTest(tarball=name, entry=n):
@@ -92,7 +135,7 @@ class Tarballs(unittest.TestCase):
                     self.assertEqual(ti.mode, want)
 
     def test_manifest_lists_every_other_file(self):
-        for name in ('mu300-linux-vpn.tar.gz', 'mu300-linux-vpn-mihomo.tar.gz'):
+        for name in ASSETS:
             _, data = self.members(name)
             lines = data['./manifest'].decode().splitlines()
             self.assertEqual(lines, sorted(lines, key=lambda l: l[66:]))
@@ -104,15 +147,15 @@ class Tarballs(unittest.TestCase):
     def test_the_same_bytes_again(self):
         r = build(self.tmp / 'again')
         self.assertEqual(r.returncode, 0, r.stderr)
-        for name in ('mu300-linux-vpn.tar.gz', 'mu300-linux-vpn-mihomo.tar.gz', 'SHA256SUMS'):
+        for name in ASSETS + ['SHA256SUMS', 'VERSIONS']:
             self.assertEqual((self.tmp / 'again' / name).read_bytes(), (self.out / name).read_bytes(), name)
 
     def test_what_mu300_extra_accepts(self):
         """mu300-extra's checks (mu300-linux's spec, As implemented): plain files and directories only, names of
         [A-Za-z0-9._+-] not starting with a dot, at most four levels deep; VERSION one line of [A-Za-z0-9._-]{1,40};
-        requires exactly 'mu300-linux v2026.10.16'; bin/mu300-vpn and the hooks there (vpn-mihomo: a program)."""
+        requires exactly 'mu300-linux v2026.10.16'; bin/mu300-vpn and the hooks for vpn, a program for the others."""
         import re
-        for name in ('mu300-linux-vpn.tar.gz', 'mu300-linux-vpn-mihomo.tar.gz'):
+        for name in ASSETS:
             m, data = self.members(name)
             for n, ti in m.items():
                 with self.subTest(tarball=name, entry=n):
@@ -124,16 +167,15 @@ class Tarballs(unittest.TestCase):
                         self.assertRegex(c, r'^[A-Za-z0-9_+-][A-Za-z0-9._+-]*$')
             self.assertRegex(data['./VERSION'].decode(), r'^[A-Za-z0-9._-]{1,40}\n$')
             self.assertEqual(data['./requires'], b'mu300-linux v2026.10.16\n')
-        m, data = self.members('mu300-linux-vpn.tar.gz')
-        for rel in ('bin/mu300-vpn', 'hooks/link', 'hooks/unlink'):
-            self.assertTrue(m['./' + rel].isreg() and m['./' + rel].mode & 0o111, rel)
-        m, _ = self.members('mu300-linux-vpn-mihomo.tar.gz')
-        self.assertTrue(m['./bin/mihomo'].isreg() and m['./bin/mihomo'].mode & 0o111)
+            self.assertTrue(any(n.startswith('./bin/') and ti.isreg() and ti.mode & 0o111 for n, ti in m.items()))
+        for name in ('mu300-linux-vpn-core.tar.gz', 'mu300-linux-vpn.tar.gz'):
+            m, data = self.members(name)
+            for rel in ('bin/mu300-vpn', 'hooks/link', 'hooks/unlink'):
+                self.assertTrue(m['./' + rel].isreg() and m['./' + rel].mode & 0o111, rel)
 
     def test_tag_is_checked(self):
         r = build(self.tmp / 'bad', tag='1.0')
         self.assertNotEqual(r.returncode, 0)
-
 
 def tree(root):
     """{relative path: ('l', target) | ('d', mode) | ('f', mode, sha256)} of everything under ROOT."""
@@ -253,6 +295,32 @@ class Hooks(ShellTest):
                         self.assertEqual(r.returncode, 0, r.stderr)
                         self.assertEqual({p: v for p, v in tree(root).items() if v[0] != 'd'}, left, 'unlink twice')
 
+    def test_the_subscription_refresh_timer(self):
+        """an hourly `subscription refresh --due`: a systemd timer on Ubuntu, a line of root's crontab on OpenWrt
+        (an existing crontab keeps its own lines); both gone again with unlink"""
+        for shell in self.each_shell():
+            root = self.system('ubuntu', 'ENABLE=0\n')
+            self.assertEqual(self.hook(shell, 'link', root).returncode, 0)
+            sd = root / 'etc/systemd/system'
+            self.assertIn('subscription refresh --due', (sd / 'mu300-vpn-subscriptions.service').read_text())
+            self.assertIn('OnUnitActiveSec=1h', (sd / 'mu300-vpn-subscriptions.timer').read_text())
+            self.assertEqual(os.readlink(sd / 'timers.target.wants/mu300-vpn-subscriptions.timer'),
+                             '/etc/systemd/system/mu300-vpn-subscriptions.timer')
+            self.assertEqual(self.hook(shell, 'unlink', root).returncode, 0)
+            self.assertFalse((sd / 'mu300-vpn-subscriptions.timer').exists())
+            self.assertFalse(os.path.lexists(sd / 'timers.target.wants/mu300-vpn-subscriptions.timer'))
+            root = self.system('openwrt', 'ENABLE=0\n')
+            (root / 'etc/crontabs').mkdir(parents=True, exist_ok=True)
+            (root / 'etc/crontabs/root').write_text('0 3 * * * /usr/bin/mine\n')
+            for _ in range(2):
+                self.assertEqual(self.hook(shell, 'link', root).returncode, 0)
+            lines = (root / 'etc/crontabs/root').read_text().splitlines()
+            self.assertEqual(lines[0], '0 3 * * * /usr/bin/mine')
+            self.assertEqual(len(lines), 2)
+            self.assertIn('/opt/mu300/bin/mu300-vpn subscription refresh --due', lines[1])
+            self.assertEqual(self.hook(shell, 'unlink', root).returncode, 0)
+            self.assertEqual((root / 'etc/crontabs/root').read_text(), '0 3 * * * /usr/bin/mine\n')
+
     def test_an_older_images_own_vpn_is_kept_aside_and_put_back(self):
         for shell in self.each_shell():
             for kind in ('ubuntu', 'openwrt'):
@@ -316,10 +384,10 @@ class Hooks(ShellTest):
 
     def test_the_running_system_reloads_and_starts_a_wanted_vpn(self):
         for shell in self.each_shell():
-            for enable, active, want in (('ENABLE=1\n', False, ['systemctl daemon-reload', 'systemctl is-active --quiet mu300-vpn',
+            for enable, active, want in (('ENABLE=1\n', False, ['systemctl daemon-reload', 'systemctl --no-block start mu300-vpn-subscriptions.timer', 'systemctl is-active --quiet mu300-vpn',
                                                                   'systemctl --no-block start mu300-vpn']),
-                                         ('ENABLE=1\n', True, ['systemctl daemon-reload', 'systemctl is-active --quiet mu300-vpn']),
-                                         ('ENABLE=0\n', False, ['systemctl daemon-reload'])):
+                                         ('ENABLE=1\n', True, ['systemctl daemon-reload', 'systemctl --no-block start mu300-vpn-subscriptions.timer', 'systemctl is-active --quiet mu300-vpn']),
+                                         ('ENABLE=0\n', False, ['systemctl daemon-reload', 'systemctl --no-block start mu300-vpn-subscriptions.timer'])):
                 with self.subTest(enable=enable, active=active):
                     (self.tmp / 'calls').unlink(missing_ok=True)
                     (self.tmp / 'active').unlink(missing_ok=True)

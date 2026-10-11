@@ -198,7 +198,7 @@ class Store(ShellTest):
                                                  "LAN_CIDRS=10.0.0.0\nXRAY=xray\nHEV='/x/h e v'\n")
             r = self.vpn(shell, 'echo "$KILL_SWITCH $REMOTE_DNS $IPV6 $TAILSCALE [$_xray] [$_hev]"; '
                                 'setting LAN_CIDRS; echo "[$(setting XRAY)]"')
-            self.assertEqual(r.stdout.split('\n')[:3], ['1 1.1.1.1 0 0 [] [/x/h e v]', '', '[]'], r.stderr)
+            self.assertEqual(r.stdout.split('\n')[:3], ['1 1.1.1.1 auto 0 [] [/x/h e v]', '', '[]'], r.stderr)
 
     def test_kv_round_trip(self):
         values = ["plain", "it's", "a'\\''b", "$(x) `y` \"z\"", "", "  spaced  ", "x=y=z"]
@@ -792,7 +792,7 @@ class Cli(ShellTest):
             got = dict(l.split('=', 1) for l in r.stdout.splitlines())
             self.assertEqual((got['REMOTE_DNS'], got['KILL_SWITCH'], got['LAN_CIDRS'], got['XRAY']),
                              ('9.9.9.9', '1', '', ''))
-            self.assertEqual(len(got), 11)
+            self.assertEqual(len(got), 12)
             self.assertNotIn('MIHOMO_CONTROLLER', got)
             # empty: back to the default
             r = self.vpn(shell, 'settings', 'set', 'REMOTE_DNS', '')
@@ -1985,7 +1985,7 @@ class WireGuard(ShellTest):
             self.assertEqual(self.run_lib(shell, 'drv_gen').returncode, 0)
             for p in ('ip.log', 'wg.log'):
                 (self.tmp / p).unlink(missing_ok=True)
-            r = self.run_lib(shell, 'drv_start && echo STARTED; echo "tun=$TUN"')
+            r = self.run_lib(shell, 'IPV6=0; drv_start && echo STARTED; echo "tun=$TUN"')
             self.assertEqual(r.returncode, 0, r.stderr)
             self.assertIn('tunnel up on wg-mu300', r.stdout)
             self.assertIn('tun=wg-mu300', r.stdout)
@@ -1995,10 +1995,11 @@ class WireGuard(ShellTest):
             self.assertEqual(ip, ['link del wg-mu300', 'link add wg-mu300 type wireguard',
                                   'addr add 10.7.0.2/32 dev wg-mu300', 'link set wg-mu300 mtu 1380 up'])
             self.assertEqual(wg, [f'setconf wg-mu300 {self.tmp}/run/wg.conf', 'set wg-mu300 fwmark 0x2d0'])
-            # with IPV6=1 the IPv6 address goes on too
-            (self.tmp / 'ip.log').unlink()
-            r = self.run_lib(shell, 'IPV6=1; drv_start')
-            self.assertIn('addr add fd00:7::2/128 dev wg-mu300', (self.tmp / 'ip.log').read_text())
+            # with IPV6=1, and with auto (the default: the config's own addresses), the IPv6 address goes on too
+            for v in ('1', 'auto'):
+                (self.tmp / 'ip.log').unlink()
+                r = self.run_lib(shell, f'IPV6={v}; drv_start')
+                self.assertIn('addr add fd00:7::2/128 dev wg-mu300', (self.tmp / 'ip.log').read_text())
             # alive follows the interface; stop removes it and the runtime copy of the config
             r = self.run_lib(shell, 'drv_alive || echo "alive=$?"')
             self.assertIn('alive=1', r.stdout)
@@ -3575,6 +3576,8 @@ class EnginesCmd(ShellTest):
     def engine(self, name, where):
         """an executable NAME in the vpn extra, the vpn-mihomo extra, /opt/mu300/bin or on PATH; its path"""
         d = {'vpn': self.disk / 'extra/vpn/bin', 'vpn-mihomo': self.disk / 'extra/vpn-mihomo/bin',
+             'vpn-dae': self.disk / 'extra/vpn-dae/bin', 'vpn-xray': self.disk / 'extra/vpn-xray/bin',
+             'vpn-singbox': self.disk / 'extra/vpn-singbox/bin',
              'opt': self.opt / 'bin', 'path': self.stubs}[where]
         d.mkdir(parents=True, exist_ok=True)
         (d / name).write_text('#!/bin/sh\nexit 0\n')
@@ -3584,7 +3587,7 @@ class EnginesCmd(ShellTest):
     def fresh(self):
         for d in (self.store, self.disk, self.opt, self.sysroot, self.tmp / 'run'):
             shutil.rmtree(d, ignore_errors=True)
-        for n in ('wg', 'openvpn', 'mihomo'):
+        for n in ('wg', 'openvpn', 'mihomo', 'dae'):
             (self.stubs / n).unlink(missing_ok=True)
         for n in ('extra.log', 'pkg.log'):
             (self.tmp / n).unlink(missing_ok=True)
@@ -3612,30 +3615,31 @@ class EnginesCmd(ShellTest):
             self.fresh()
             r = self.vpn(shell, 'engines')
             self.assertEqual(r.stdout.splitlines(), [
-                'xray\tmissing\tmu300-extra install vpn',
-                'hev-socks5-tunnel\tmissing\tmu300-extra install vpn',
-                'sing-box\tmissing\tmu300-extra install vpn',
+                'xray\tmissing\tmu300-extra install vpn-xray',
+                'hev-socks5-tunnel\tmissing\tmu300-extra install vpn-xray',
+                'sing-box\tmissing\tmu300-extra install vpn-singbox',
                 'mihomo\tmissing\tmu300-extra install vpn-mihomo',
+                'dae\tmissing\tmu300-extra install vpn-dae',
                 'wireguard\tmissing\tmu300-vpn engines install wireguard (apt-get install -y wireguard-tools)',
                 'openvpn\tmissing\tmu300-vpn engines install openvpn (apt-get install -y openvpn)'], r.stderr)
             # no active profile: the status is the vpn extra's engines for the default type
             self.assertEqual(r.returncode, 1)
-            self.assertIn('mu300-extra install vpn', r.stderr)
+            self.assertIn('mu300-extra install vpn-xray', r.stderr)
             # the package command is this system's: apk on OpenWrt (where openvpn is openvpn-openssl), pacman
             # without apt-get, and none at all is said
             self.openwrt(); self.pkg('apk', 'apt-get')
             lines = self.vpn(shell, 'engines').stdout.splitlines()
-            self.assertEqual(lines[4:], [
+            self.assertEqual(lines[5:], [
                 'wireguard\tmissing\tmu300-vpn engines install wireguard (apk add wireguard-tools)',
                 'openvpn\tmissing\tmu300-vpn engines install openvpn (apk add openvpn-openssl)'])
             shutil.rmtree(self.sysroot); self.pkg('pacman')
             lines = self.vpn(shell, 'engines').stdout.splitlines()
-            self.assertEqual(lines[4:], [
+            self.assertEqual(lines[5:], [
                 'wireguard\tmissing\tmu300-vpn engines install wireguard (pacman -S --noconfirm --needed wireguard-tools)',
                 'openvpn\tmissing\tmu300-vpn engines install openvpn (pacman -S --noconfirm --needed openvpn)'])
             self.pkg()
             lines = self.vpn(shell, 'engines').stdout.splitlines()
-            self.assertEqual(lines[4:], [
+            self.assertEqual(lines[5:], [
                 'wireguard\tmissing\tmu300-vpn engines install wireguard (no apk, apt-get or pacman here: wireguard-tools by hand)',
                 'openvpn\tmissing\tmu300-vpn engines install openvpn (no apk, apt-get or pacman here: openvpn by hand)'])
 
@@ -3646,6 +3650,7 @@ class EnginesCmd(ShellTest):
                     'hev-socks5-tunnel\tpresent\t' + self.engine('hev-socks5-tunnel', 'vpn'),
                     'sing-box\tpresent\t' + self.engine('sing-box', 'vpn'),
                     'mihomo\tpresent\t' + self.engine('mihomo', 'vpn-mihomo'),
+                    'dae\tpresent\t' + self.engine('dae', 'vpn-dae'),
                     'wireguard\tpresent\t' + self.engine('wg', 'path'),
                     'openvpn\tpresent\t' + self.engine('openvpn', 'path')]
             r = self.vpn(shell, 'engines')
@@ -3694,7 +3699,7 @@ class EnginesCmd(ShellTest):
                 self.engine(n, 'vpn')
             r = self.vpn(shell, 'engines')
             self.assertEqual(r.returncode, 1, r.stdout)
-            self.assertEqual(len(r.stdout.splitlines()), 6)
+            self.assertEqual(len(r.stdout.splitlines()), 7)
             self.assertIn('wireguard engine is not installed: run mu300-vpn engines install wireguard', r.stderr)
             self.engine('wg', 'path')
             self.kernel(False)
@@ -3704,7 +3709,7 @@ class EnginesCmd(ShellTest):
             self.assertEqual((r.returncode, r.stderr), (0, ''), r.stdout)
             # the lines are the same whatever the active profile; the loaded driver leaves no trace in them
             state = [l.split('\t')[1] for l in r.stdout.splitlines()]
-            self.assertEqual(state, ['present', 'present', 'present', 'missing', 'present', 'missing'])
+            self.assertEqual(state, ['present', 'present', 'present', 'missing', 'missing', 'present', 'missing'])
             # no engines at all, no profile: as before profiles existed
             self.fresh()
             r = self.vpn(shell, 'engines')
@@ -3716,8 +3721,8 @@ class EnginesCmd(ShellTest):
     def test_install_runs_the_extra_or_the_package_manager(self):
         for shell in self.each_shell():
             self.fresh()
-            for eng, extra in (('xray', 'vpn'), ('hev-socks5-tunnel', 'vpn'), ('sing-box', 'vpn'),
-                               ('mihomo', 'vpn-mihomo')):
+            for eng, extra in (('xray', 'vpn-xray'), ('hev-socks5-tunnel', 'vpn-xray'), ('sing-box', 'vpn-singbox'),
+                               ('singbox', 'vpn-singbox'), ('mihomo', 'vpn-mihomo'), ('dae', 'vpn-dae')):
                 (self.tmp / 'extra.log').unlink(missing_ok=True)
                 r = self.vpn(shell, 'engines', 'install', eng)
                 self.assertEqual(r.returncode, 0, r.stderr)
@@ -3750,7 +3755,7 @@ class EnginesCmd(ShellTest):
             self.assertEqual(r.returncode, 1)
             self.assertIn('openvpn', r.stderr)
             self.assertEqual(r.stdout, '')
-            self.assertEqual(self.extra_log(), ['extra install vpn-mihomo'])
+            self.assertEqual(self.extra_log(), ['extra install vpn-dae'])
 
     def test_install_takes_only_a_known_engine(self):
         for shell in self.each_shell():

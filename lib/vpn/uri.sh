@@ -64,7 +64,8 @@ vmess_field() {
     printf '%s' "$_vm" | jq -r --arg k "$1" '.[$k] // empty | tostring | explode | map(select(. >= 32)) | implode'
 }
 
-# parse_link URI: a vless, vmess, trojan or ss (Shadowsocks) share link taken apart into LINK_FIELDS. Returns 1
+# parse_link URI: a vless, vmess, trojan, ss (Shadowsocks), hysteria2 or tuic share link taken apart into LINK_FIELDS
+# (the last two only dae runs here: the xray driver refuses them by scheme, link_import). Returns 1
 # with a message on a link it cannot use; the message never repeats the link, which carries the credentials.
 parse_link() {
     for _f in $LINK_FIELDS; do eval "$_f="; done
@@ -140,7 +141,30 @@ parse_link() {
             case $METHOD in ''|*[!A-Za-z0-9-]*) echo "the ss link's method is not one Xray knows" >&2; return 1 ;; esac
             link_hostport "$_hp" || { echo "cannot parse the ss link's server" >&2; return 1; }
             case $METHOD in none|plain) ;; *) [ -n "$PASSWORD" ] || { echo "the ss link has no password" >&2; return 1; } ;; esac ;;
-        *) echo "not a vless, vmess, trojan or ss link" >&2; return 1 ;;
+        hysteria2://*|hy2://*)
+            # Hysteria 2 (dae, sing-box): auth@host:port?sni=..&insecure=1&obfs=..; the auth is the password
+            PROTO=hysteria2; _u=${_u#*://}
+            case $_u in *\?*) QUERY=${_u#*\?}; _u=${_u%%\?*} ;; esac
+            _u=${_u%/}
+            case $_u in *@*) ;; *) echo "cannot parse the hysteria2 link" >&2; return 1 ;; esac
+            PASSWORD=$(urldecode "${_u%@*}")
+            link_hostport "${_u##*@}" || { echo "cannot parse the hysteria2 link's server" >&2; return 1; }
+            SNI=$(urldecode "$(param sni)"); INSECURE=$(param insecure); ALPN=$(urldecode "$(param alpn)")
+            SECURITY=tls; TYPE=udp
+            [ -n "$PASSWORD" ] || { echo "the hysteria2 link has no password" >&2; return 1; } ;;
+        tuic://*)
+            # TUIC v5 (dae, sing-box): uuid:password@host:port?congestion_control=..&alpn=..&sni=..
+            PROTO=tuic; _u=${_u#tuic://}
+            case $_u in *\?*) QUERY=${_u#*\?}; _u=${_u%%\?*} ;; esac
+            _u=${_u%/}
+            case $_u in *@*) ;; *) echo "cannot parse the tuic link" >&2; return 1 ;; esac
+            _d=$(urldecode "${_u%@*}")
+            case $_d in *:*) UUID=${_d%%:*}; PASSWORD=${_d#*:} ;; *) echo "the tuic link has no uuid:password" >&2; return 1 ;; esac
+            link_hostport "${_u##*@}" || { echo "cannot parse the tuic link's server" >&2; return 1; }
+            SNI=$(urldecode "$(param sni)"); INSECURE=$(param allow_insecure); ALPN=$(urldecode "$(param alpn)")
+            SECURITY=tls; TYPE=udp
+            [ -n "$UUID" ] || { echo "the tuic link has no uuid" >&2; return 1; } ;;
+        *) echo "not a vless, vmess, trojan, ss, hysteria2 or tuic link" >&2; return 1 ;;
     esac
     TYPE=${TYPE:-tcp}; SECURITY=${SECURITY:-none}
     return 0

@@ -1,0 +1,10 @@
+[Unit]
+Description=MU300 VPN: refresh the subscriptions that are due, hourly
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=1h
+RandomizedDelaySec=5min
+
+[Install]
+WantedBy=timers.target
