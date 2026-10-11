@@ -1794,9 +1794,9 @@ settings_json() {
 ks_cannot_run() {
     [ "$ENABLE" = 1 ] && [ "$PTYPE" = xray ] || return 1
     case ${PURI:-} in *[?\&]allowInsecure=1*|*[?\&]allowInsecure=true*) ;; *) return 1 ;; esac
+    # (short: the panel shows the first 300 bytes)
     echo "the kill switch would keep the VPN down: the active profile ${ACTIVE:-} asks for allowInsecure, which cannot" \
-        "run behind the kill switch (its certificate could not be pinned). Use a link that verifies the certificate, or" \
-        "turn it on anyway with --force (nothing then leaves the device until the profile is changed)" >&2
+        "run behind it. Use a link that verifies the certificate (or: mu300-vpn killswitch on --force)" >&2
     return 0
 }
 # killswitch [on|off] [--json] | killswitch on --force
