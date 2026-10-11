@@ -222,7 +222,9 @@ Types: `KILL_SWITCH`, `TAILSCALE` `0|1`; `IPV6` `0|1|auto`; `REMOTE_DNS`, `BOOTS
 `LAN_CIDRS` CIDRs comma-separated; the engine paths an absolute path or empty. `settings set KEY VALUE`: exit 0 set
 (an empty VALUE puts the default back; a running VPN uses it from its next restart, said on stderr), exit 2 an unknown
 key or an invalid value (nothing written), exit 1 the store cannot be written (not root). `killswitch on|off` is
-`settings set KILL_SWITCH` plus the restart. Not offered (yet): the mihomo mode (rule/global/direct) and an engine
+`settings set KILL_SWITCH` plus the restart. Both refuse to turn the kill switch on (exit 1, nothing written) while the
+VPN is on with an xray link that asks for allowInsecure, which cannot run behind it (the device would stay offline);
+`killswitch on --force` turns it on anyway. Not offered (yet): the mihomo mode (rule/global/direct) and an engine
 log level - the mihomo mode is the YAML's own `mode:`, which the profile keeps.
 
 ## 5. dae

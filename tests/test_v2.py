@@ -259,6 +259,35 @@ class Json(Base):
             self.assertEqual(self.vpn(shell, 'killswitch', 'on').returncode, 0)
             self.assertIn('svc restart', self.log('svc.log'))
 
+    def test_the_kill_switch_is_not_turned_on_under_a_profile_that_cannot_run_behind_it(self):
+        """an xray link with allowInsecure cannot run behind the kill switch (run refuses it and the device stays
+        offline): killswitch on and settings set KILL_SWITCH refuse it while the VPN is on, --force overrides"""
+        insecure = VLESS.replace('&sni=', '&allowInsecure=1&sni=').replace('#Home', '#Lab')
+        for shell in self.each_shell():
+            self.fresh()
+            r = self.vpn(shell, 'profile', 'import', '-', stdin=insecure)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            pid = r.stdout.strip().splitlines()[-1]
+            self.assertEqual(self.vpn(shell, 'profile', 'use', pid).returncode, 0)
+            self.assertEqual(self.vpn(shell, 'killswitch', 'off').returncode, 0)
+            # the VPN off: nothing to keep down, the setting is only stored
+            self.conf.write_text('ENABLE=0\n')
+            self.assertEqual(self.vpn(shell, 'killswitch', 'on').returncode, 0)
+            self.assertEqual(self.vpn(shell, 'killswitch', 'off').returncode, 0)
+            self.conf.write_text('ENABLE=1\n')
+            for args in (('killswitch', 'on'), ('settings', 'set', 'KILL_SWITCH', '1'),
+                         ('settings', 'set', 'KILL_SWITCH', '')):
+                r = self.vpn(shell, *args)
+                self.assertEqual(r.returncode, 1, args)
+                self.assertIn('allowInsecure', r.stderr)
+                self.no_secret(r.stdout, r.stderr)
+                self.assertEqual(self.vpn(shell, 'settings', 'get', 'KILL_SWITCH').stdout.strip(), '0')
+            self.assertEqual(self.vpn(shell, 'settings', 'set', 'KILL_SWITCH', '0').returncode, 0)
+            r = self.vpn(shell, 'killswitch', 'on', '--force')
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(self.vpn(shell, 'settings', 'get', 'KILL_SWITCH').stdout.strip(), '1')
+            self.assertEqual(self.vpn(shell, 'killswitch', 'off', '--force').returncode, 2)
+
     def test_a_json_command_that_fails_says_so_in_json(self):
         for shell in self.each_shell():
             self.fresh()

@@ -1611,6 +1611,8 @@ settings_cmd() {
             _known "$2"
             # an empty value puts the setting back to its default
             [ -z "$3" ] || setting_valid "$2" "$3" || { echo "$2: not a valid value" >&2; exit 2; }
+            # (the kill switch's default is on: an empty value turns it on too)
+            if [ "$2" = KILL_SWITCH ] && [ "$3" != 0 ] && ks_cannot_run; then exit 1; fi
             store_need
             if [ -n "$3" ]; then kv_set "$SETTINGS" "$2" "$3" || exit 1; else kv_del "$SETTINGS" "$2" || exit 1; fi
             if [ "$ENABLE" = 1 ]; then echo "the VPN uses it from its next start: mu300-vpn restart" >&2; fi ;;
@@ -1785,7 +1787,19 @@ settings_json() {
     for _k in $SETTING_KEYS; do printf '%s\t%s\n' "$_k" "$(setting_show "$_k")"; done | kv_json
 }
 
-# killswitch [on|off] [--json]
+# ks_cannot_run: the VPN is on with a profile that cannot run behind the kill switch - an xray link that asks for
+# allowInsecure (sing-box would not check the certificate at all, and Xray's pin is fetched unmarked: run refuses
+# both, vless_on_sing_box and gen_xray), so turning the kill switch on would keep the device offline. The reason on
+# stderr. (--force turns it on anyway; the service then fails closed, as it does when the link changes later.)
+ks_cannot_run() {
+    [ "$ENABLE" = 1 ] && [ "$PTYPE" = xray ] || return 1
+    case ${PURI:-} in *[?\&]allowInsecure=1*|*[?\&]allowInsecure=true*) ;; *) return 1 ;; esac
+    echo "the kill switch would keep the VPN down: the active profile ${ACTIVE:-} asks for allowInsecure, which cannot" \
+        "run behind the kill switch (its certificate could not be pinned). Use a link that verifies the certificate, or" \
+        "turn it on anyway with --force (nothing then leaves the device until the profile is changed)" >&2
+    return 0
+}
+# killswitch [on|off] [--json] | killswitch on --force
 killswitch_cmd() {
     case ${1:-} in
         ''|--json)
@@ -1793,7 +1807,9 @@ killswitch_cmd() {
             if [ "${1:-}" = --json ]; then jq -n --arg s "$KILL_SWITCH" --arg a "$_a" '{setting: ($s == "1"), active: ($a == "1")}'
             else [ "$KILL_SWITCH" = 1 ] && echo on || echo off; fi ;;
         on|off)
-            [ $# -eq 1 ] || { echo "usage: mu300-vpn killswitch [on|off] [--json]" >&2; exit 2; }
+            [ $# -eq 1 ] || { [ $# -eq 2 ] && [ "$1" = on ] && [ "$2" = --force ]; } ||
+                { echo "usage: mu300-vpn killswitch [on|off] [--json]" >&2; exit 2; }
+            if [ "$1" = on ] && [ "${2:-}" != --force ] && ks_cannot_run; then exit 1; fi
             store_need
             if [ "$1" = on ]; then kv_set "$SETTINGS" KILL_SWITCH 1 || exit 1; else kv_set "$SETTINGS" KILL_SWITCH 0 || exit 1; fi
             echo "kill switch $1"
