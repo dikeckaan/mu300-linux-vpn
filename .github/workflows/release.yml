@@ -69,7 +69,7 @@ jobs:
             echo "| mu300-linux-vpn.tar.gz | the compatibility bundle for mu300-extra and mu300-update from before the engine extras: mu300-vpn $TAG with $(tar -xzOf out/mu300-linux-vpn.tar.gz ./components | sed 1d | paste -sd, - | sed 's/,/, /g') |"
             echo "| VERSIONS | each tarball's version, size and components |"
             echo
-            echo 'Licences: the scripts are MIT (LICENSE); Xray-core is MPL-2.0, sing-box GPL-3.0-or-later, hev-socks5-tunnel MIT, mihomo GPL-3.0, dae AGPL-3.0 (geoip.dat and geosite.dat: v2fly, CC-BY-SA-4.0 / MIT). The engines are the projects'"'"' own release builds, pinned and checked by hash.'
+            echo 'Licences: the scripts are MIT (LICENSE); Xray-core is MPL-2.0, sing-box GPL-3.0-or-later, hev-socks5-tunnel MIT, mihomo GPL-3.0 (its Country.mmdb and GeoSite.dat: Loyalsoldier, CC-BY-SA-4.0 with GeoLite2 data created by MaxMind / GPL-3.0), dae AGPL-3.0 (geoip.dat and geosite.dat: v2fly, CC-BY-SA-4.0 / MIT). The engines are the projects'"'"' own release builds, pinned and checked by hash.'
           } > notes.md
           flag=; [ "$PRERELEASE" = true ] && flag=--prerelease
           gh release create "$TAG" --target "$GITHUB_SHA" --title "$TAG" --notes-file notes.md $flag \

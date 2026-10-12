@@ -6,6 +6,7 @@ import os
 import re
 import shutil
 import stat
+import unittest
 
 from helpers import BIN, LIB, SYSBIN, ShellTest
 
@@ -846,7 +847,10 @@ class Cli(ShellTest):
             r = self.vpn(shell, 'run')
             self.assertEqual(r.returncode, 0, r.stderr)
             ev = self.ev.read_text()
-            self.assertEqual(ev.count('nft -f\n'), 2, ev)
+            # two runs, each: the kill switch, the resolve window for the bootstrap resolver's test (bootstrap_pick),
+            # the kill switch again - replaced in one transaction every time, never deleted - and the DNS redirect
+            self.assertEqual(ev.count('nft -f\n'), 8, ev)
+            self.assertEqual(ev.count('table inet mu300_vpn {'), 6, ev)
             self.assertNotIn('nft delete table inet mu300_vpn', ev)
             self.assertIn('other.example.com', (self.tmp / 'run/config.json').read_text())
 
@@ -2700,6 +2704,8 @@ rules:
   - MATCH,a
 '''
 MH_OURS = ('routing-mark', 'allow-lan', 'bind-address', 'tun', 'dns')
+# what the driver appends to a file that names no log level of its own: its log level, then ours
+MH_ADDED = ('log-level',) + MH_OURS
 # the smallest file the driver takes: one proxy and one rule
 MH_BASE = ('proxies:\n  - {name: a, type: ss, server: ss.example, port: 8388, cipher: aes-256-gcm, password: hunter2}\n'
            'rules:\n  - MATCH,a\n')
@@ -2768,6 +2774,9 @@ class Mihomo(ShellTest):
             self.src.write_text(text)
         r = self.cli(shell, 'profile', 'import', self.src, 'Sub')
         self.assertEqual((r.returncode, r.stdout.strip()), (0, 'sub'), r.stderr)
+        # (the import's check has mihomo test the rebuilt file: what a test reads of the stub's record from here on
+        # is its own step's)
+        (self.tmp / 'mihomo.t.args').unlink(missing_ok=True)
 
     def run_lib(self, shell, code, pre='', stdin=None):
         return self.lib(shell, f'{pre}profile_load sub; load_driver "$PTYPE"; {code}', stdin=stdin)
@@ -2832,9 +2841,13 @@ class Mihomo(ShellTest):
             # the check names the top-level keys it does not use, nothing else of the file
             for k in ('port', 'allow-lan', 'external-controller', 'secret', 'tun', 'dns'):
                 self.assertIn(f' {k}', r.stderr)
-            # nothing for the profile is left in its directory by the check, and the check ran without mihomo
+            # nothing for the profile is left in its directory by the check; mihomo tested the rebuilt file there
+            # (never the profile's own), which is gone again
             self.assertEqual(sorted(p.name for p in pdir.iterdir()), ['config.yaml', 'meta'])
-            self.assertFalse((self.tmp / 'mihomo.t.args').exists())
+            t = (self.tmp / 'mihomo.t.args').read_text().splitlines()
+            self.assertEqual(t[:4], ['-t', '-d', str(self.home), '-f'])
+            self.assertTrue(t[4].startswith(str(pdir / '.check.')), t)
+            self.assertFalse(os.path.exists(t[4]))
             # from stdin, and with the type given
             self.fresh()
             r = self.cli(shell, 'profile', 'import', '-', 'Low', stdin=MH_CONF)
@@ -2859,7 +2872,7 @@ class Mihomo(ShellTest):
             gen = self.gen(shell)
             self.assertEqual(stat.S_IMODE((self.run_dir / 'mihomo.yaml').stat().st_mode), 0o600)
             # the kept blocks as they were, then ours; nothing else at the top level
-            self.assertEqual(self.top_keys(gen), ['proxies', 'rules'] + list(MH_OURS))
+            self.assertEqual(self.top_keys(gen), ['proxies', 'rules'] + list(MH_ADDED))
             self.assertEqual(self.block(gen, 'proxies'),
                              ['proxies:', '  - {name: a, type: ss, server: ss.example, port: 8388, cipher: aes-256-gcm, password: hunter2}'])
             self.assertEqual(self.block(gen, 'rules'), ['rules:', '  - MATCH,a'])
@@ -2875,7 +2888,7 @@ class Mihomo(ShellTest):
             self.assertEqual(self.block(gen, 'tun'),
                              ['tun:', '  enable: true', '  device: mh-mu300', '  stack: gvisor', '  auto-route: false',
                               '  auto-redirect: false', '  auto-detect-interface: false', '  dns-hijack: []',
-                              '  mtu: 1400', '  inet4-address: [198.18.8.1/30]'])
+                              '  mtu: 1400', '  inet4-address: [198.18.8.1/30]', '  inet6-address: []'])
             self.assertEqual(self.block(gen, 'dns'),
                              ['dns:', '  enable: true', '  ipv6: false', '  respect-rules: true',
                               "  default-nameserver: ['1.1.1.1']", "  proxy-server-nameserver: ['1.1.1.1']",
@@ -2902,7 +2915,7 @@ class Mihomo(ShellTest):
             gen = self.gen(shell, 'MIHOMO_CONTROLLER=127.0.0.1:9090; ')
             self.assertNotIn('external-controller', gen)
             self.assertNotIn('9090', gen)
-            self.assertEqual(self.top_keys(gen), ['proxies', 'rules'] + list(MH_OURS))
+            self.assertEqual(self.top_keys(gen), ['proxies', 'rules'] + list(MH_ADDED))
             # a mihomo that rejects the file fails the gen, without repeating what mihomo said
             self.mihomo_stub('echo "yaml: cannot unmarshal !!str hunter2" >&2; exit 1')
             r = self.run_lib(shell, 'drv_gen')
@@ -3100,7 +3113,7 @@ rules:
             self.setup_profile(shell, text)
             gen = self.gen(shell)
             self.assertEqual(self.top_keys(gen),
-                             ['mode', 'log-level', 'ipv6', 'hosts', 'geodata-mode', 'geodata-loader', 'geox-url',
+                             ['mode', 'log-level', 'ipv6', 'hosts', 'geodata-loader', 'geox-url',
                               'profile', 'sniffer', 'proxies', 'proxy-groups', 'rule-providers', 'sub-rules', 'rules']
                              + list(MH_OURS))
             for gone in ('mixed-port', 'socks-port', 'redir-port', 'tproxy-port', 'lan-allowed-ips', 'authentication',
@@ -3186,7 +3199,7 @@ rules:
                     self.setup_profile(shell, text)
                     gen = self.gen(shell)
                     self.assertIn(kept, gen, name)
-                    self.assertEqual(self.top_keys(gen), ['proxies', 'rules'] + list(MH_OURS))
+                    self.assertEqual(self.top_keys(gen), ['proxies', 'rules'] + list(MH_ADDED))
             # too large: refused before anything reads it
             big = base + '# ' + 'x' * (1 << 20) + '\n'
             r = self.refused(shell, big, '1 MiB', 'too large')
@@ -3199,7 +3212,7 @@ rules:
                     self.setup_profile(shell, text)
                     gen = self.gen(shell)
                     self.assertEqual(self.block(gen, 'rules'), ['rules:', '  - MATCH,a'])
-                    self.assertEqual(self.top_keys(gen), ['proxies', 'rules'] + list(MH_OURS))
+                    self.assertEqual(self.top_keys(gen), ['proxies', 'rules'] + list(MH_ADDED))
                     self.assertNotIn('\r', gen)
                     self.assertNotIn('\ufeff', gen)
                     self.assertNotIn('---', gen)
@@ -3262,7 +3275,7 @@ rules:
             # (x&y is not an anchor: secret goes with the other dropped keys)
             self.assertEqual(self.top_keys(gen),
                              ['mu300-anchor-1', 'mu300-anchor-2', 'mu300-anchor-3',
-                              'proxy-providers', 'proxies', 'proxy-groups', 'rules'] + list(MH_OURS))
+                              'proxy-providers', 'proxies', 'proxy-groups', 'rules'] + list(MH_ADDED))
             lines = gen.splitlines()
             self.assertIn('mu300-anchor-1: &p {type: http, interval: 3600, health-check: {enable: true, url: "https://g.example/204?a=1&b=2", interval: 300}}', lines)
             self.assertEqual(self.block(gen, 'mu300-anchor-2'), ['mu300-anchor-2: &pg', '  type: select', '  proxies: [auto, a]', '  use: [sub]'])
@@ -3285,7 +3298,7 @@ rules:
             r = self.refused(shell, text.replace('p: &p {type: http,', 'p: &p {type: http, "interface-name": eth0,'), 'interface-name')
             # a dropped block without an anchor is still gone, "&" in a URL or a password is not an anchor
             self.setup_profile(shell, MH_CONF + 'x:\n  url: "https://a.example/?a=1&b=2"\n  password: "p&q"\n')
-            self.assertEqual(self.top_keys(self.gen(shell)), ['proxies', 'rules'] + list(MH_OURS))
+            self.assertEqual(self.top_keys(self.gen(shell)), ['proxies', 'rules'] + list(MH_ADDED))
 
     def test_written_file_guard_fails_closed(self):
         # the guard behind the rebuild, on files that are not what the driver writes
@@ -3425,7 +3438,7 @@ rules:
             self.setup_profile(shell, text)
             (self.store / 'settings').write_text("MIHOMO_CONTROLLER='127.0.0.1:9090'\n")
             gen = self.gen(shell, 'MIHOMO_CONTROLLER=127.0.0.1:9090; ')
-            self.assertEqual(self.top_keys(gen), ['proxies', 'rules'] + list(MH_OURS))
+            self.assertEqual(self.top_keys(gen), ['proxies', 'rules'] + list(MH_ADDED))
             for gone in ('\nport:', '-port:', 'listen', 'external', 'External', 'EXTERNAL', 'secret', 'ctl-secret', 'authentication',
                          'skip-auth', 'lan-allowed', 'lan-disallowed', '/etc/ssl', 'certificate', 'private-key',
                          'tunnels', 'ss-config', 'vmess-config', 'tuic-server', '0.0.0.0', '9090', '9443', '.sock',
@@ -3504,7 +3517,7 @@ rules:
             gen = self.gen(shell)
             lines = gen.splitlines()
             self.assertEqual(self.top_keys(gen), ['mu300-anchor-1', 'mu300-anchor-2', 'mu300-anchor-3',
-                                                  'proxies', 'rules', 'proxy-groups', 'profile', 'sniffer'] + list(MH_OURS))
+                                                  'proxies', 'rules', 'proxy-groups', 'profile', 'sniffer'] + list(MH_ADDED))
             self.assertEqual(self.block(gen, 'mu300-anchor-1'), ['mu300-anchor-1: &x', '  udp: true'])
             self.assertIn('mu300-anchor-2: &t {enable: true, auto-route: true, auto-detect-interface: true}', lines)
             self.assertIn('mu300-anchor-3: &d {enable: true, listen: 0.0.0.0:53}', lines)
@@ -3522,6 +3535,120 @@ rules:
             self.assertEqual(r.returncode, 0, r.stderr)
             self.assertIn(' x t d\n', r.stderr)
             self.no_secrets(r)
+
+
+    # ---- what the device test of 2026-10-12 found (docs/FINDINGS.md 26i, 26j) ----
+    def test_the_bootstrap_resolver_mihomo_gets(self):
+        """the resolver the core found to answer on this uplink (bootstrap_pick), for the servers' names and only for
+        those"""
+        for shell in self.each_shell():
+            self.setup_profile(shell)
+            gen = self.gen(shell, 'BOOTSTRAP_DNS=10.177.0.34; ')
+            dns = self.block(gen, 'dns')
+            self.assertIn("  default-nameserver: ['10.177.0.34']", dns)
+            self.assertIn("  proxy-server-nameserver: ['10.177.0.34']", dns)
+            self.assertIn("  nameserver: ['1.1.1.1']", dns)
+            self.assertTrue(self.run_lib(shell, 'echo "boot=[$DRV_BOOTSTRAP]"').stdout.startswith('boot=[1]'))
+
+    def test_the_tun_has_no_ipv6_address_unless_asked(self):
+        """mihomo gives its TUN an IPv6 address by default; the core takes a tunnel with one for a tunnel that carries
+        IPv6, routes IPv6 into it and leaves the IPv6 guard off. Only the IPV6 setting 1 asks for that."""
+        for shell in self.each_shell():
+            self.setup_profile(shell)
+            for v6, want in (('auto', True), ('0', True), ('1', False)):
+                tun = self.block(self.gen(shell, f'IPV6={v6}; '), 'tun')
+                self.assertEqual('  inet6-address: []' in tun, want, v6)
+
+    def test_the_log_level_is_warning_unless_the_file_names_one(self):
+        """mihomo's default, info, logs every connection of every client"""
+        for shell in self.each_shell():
+            self.setup_profile(shell)
+            lines = self.gen(shell).splitlines()
+            self.assertEqual([l for l in lines if l.startswith('log-level')], ['log-level: warning'])
+            self.setup_profile(shell, 'log-level: debug\n' + MH_BASE)
+            lines = self.gen(shell).splitlines()
+            self.assertEqual([l for l in lines if l.startswith('log-level')], ['log-level: debug'])
+
+    GEO_RULES = ('proxies:\n  - {name: a, type: ss, server: ss.example, port: 8388, cipher: aes-256-gcm, password: hunter2}\n'
+                 'rules:\n  - GEOSITE,category-ads-all,REJECT\n  - GEOIP,CN,DIRECT\n  - MATCH,a\n')
+
+    def share(self, **files):
+        """the extra's geodata, next to the engine's bin (the stub mihomo is in self.stubs: ../share/mihomo)"""
+        d = self.tmp / 'share/mihomo'
+        shutil.rmtree(d, ignore_errors=True)
+        d.mkdir(parents=True)
+        for name, text in files.items():
+            (d / name).write_text(text)
+
+    def test_geodata_comes_from_the_extra(self):
+        """a config with GEOIP or GEOSITE rules: mihomo would download the data before the tunnel is up, and refuse
+        the config when it cannot. The extra's files are in its home before it reads the config."""
+        # the stub notes what its home held when it was asked to test the config
+        self.mihomo_stub('case " $* " in *" -t "*) ls "$3" > "$STUBLOG/home.at.t"; exit 0 ;; esac\nexit 0')
+        for shell in self.each_shell():
+            self.share(**{'Country.mmdb': 'MMDB', 'GeoSite.dat': 'SITE'})
+            self.setup_profile(shell, self.GEO_RULES)
+            shutil.rmtree(self.home, ignore_errors=True)
+            self.gen(shell)
+            self.assertEqual((self.home / 'Country.mmdb').read_text(), 'MMDB')
+            self.assertEqual((self.home / 'GeoSite.dat').read_text(), 'SITE')
+            self.assertEqual((self.tmp / 'home.at.t').read_text().split(), ['Country.mmdb', 'GeoSite.dat'])
+            # root's only, and no half-copied file is left under a name mihomo reads
+            self.assertEqual(stat.S_IMODE((self.home / 'GeoSite.dat').stat().st_mode), 0o600)
+            self.assertEqual(sorted(p.name for p in self.home.iterdir()), ['Country.mmdb', 'GeoSite.dat'])
+            # what mihomo has (it keeps them fresh itself, under any of the names it reads) is not replaced
+            (self.home / 'Country.mmdb').unlink()
+            (self.home / 'geoip.metadb').write_text('NEWER')
+            (self.home / 'GeoSite.dat').unlink()
+            (self.home / 'geosite.DAT').write_text('NEWER')
+            self.gen(shell)
+            # (compared without regard to case, as mihomo does: a file system that folds case holds one file either way)
+            self.assertEqual(sorted(p.name.lower() for p in self.home.iterdir()), ['geoip.metadb', 'geosite.dat'])
+            self.assertEqual((self.home / 'geosite.DAT').read_text(), 'NEWER')
+            # a config without such rules takes nothing
+            self.setup_profile(shell)
+            shutil.rmtree(self.home, ignore_errors=True)
+            self.gen(shell)
+            self.assertEqual([p.name for p in self.home.iterdir()], [])
+            # geodata-mode would make GEOIP read a third file the extra does not carry: it does not reach mihomo;
+            # whether mihomo updates the geodata itself is the file's to say
+            self.setup_profile(shell, 'geodata-mode: true\ngeo-auto-update: true\ngeo-update-interval: 168\n'
+                               + self.GEO_RULES)
+            gen = self.gen(shell)
+            self.assertNotIn('geodata-mode', gen)
+            self.assertEqual(self.top_keys(gen)[:2], ['geo-auto-update', 'geo-update-interval'])
+        self.mihomo_stub()
+
+    def test_a_config_mihomo_refuses_is_refused_at_the_import(self):
+        """mihomo tests the rebuilt file when a profile is imported or checked (where it is installed), not only at
+        the start: a config it refuses never becomes a profile, and the reason names the geodata when that is it"""
+        # (mihomo's message quotes the rule: only where it points is passed on)
+        self.mihomo_stub('case " $* " in *" -t "*)\n'
+                         '  echo "time=x level=error msg=\\"rules[1] [GEOIP,hunter2,DIRECT] error: hunter2 not found\\"" >&2\n'
+                         '  exit 1 ;;\nesac\nexit 0')
+        for shell in self.each_shell():
+            shutil.rmtree(self.tmp / 'share', ignore_errors=True)
+            r = self.refused(shell, self.GEO_RULES, 'mihomo rejects the config')
+            self.assertIn('(at rules[1], as mihomo counts)', r.stderr)
+            self.assertIn('(GeoSite.dat Country.mmdb)', r.stderr)
+            self.assertIn('vpn-mihomo', r.stderr)
+            r = self.refused(shell, self.GEO_RULES.replace('GEOIP,CN', 'IP-ASN,13335'), 'mihomo rejects the config')
+            self.assertIn('(GeoSite.dat ASN.mmdb)', r.stderr)
+            # without such rules there is no talk of geodata
+            r = self.refused(shell, MH_BASE, 'mihomo rejects the config')
+            self.assertNotIn('geodata', r.stderr)
+        self.mihomo_stub()
+        # and the start says which command tells why (the file stays for it)
+        self.mihomo_stub('case " $* " in *" -t "*) [ -e "$STUBLOG/reject" ] && exit 1; exit 0 ;; esac\nexit 0')
+        for shell in self.each_shell():
+            self.setup_profile(shell)
+            (self.tmp / 'reject').write_text('')
+            r = self.run_lib(shell, 'drv_gen')
+            (self.tmp / 'reject').unlink()
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn(f'-t -d {self.home} -f {self.run_dir}/mihomo.yaml says why', r.stderr)
+            self.no_secrets(r)
+        self.mihomo_stub()
 
 
 class EnginesCmd(ShellTest):
@@ -3768,3 +3895,208 @@ class EnginesCmd(ShellTest):
                 self.assertEqual(r.stdout, '', args)
             self.assertEqual(self.extra_log(), [])
             self.assertEqual(self.pkglog(), [])
+
+
+class Bootstrap(ShellTest):
+    """The resolver sing-box, mihomo and dae find their servers at (docs/FINDINGS.md 26i): BOOTSTRAP_DNS when it
+    answers on this uplink, else the first of the uplink's own resolvers that does - asked from the device before the
+    engine's config is written, through the resolve window behind the kill switch."""
+
+    NFT = ('case "$1" in\n'
+           '  -f) r=$(cat); { echo "nft -f"; printf "%s\\n" "$r" | sed "s/^/  | /"; } >> "$STUBLOG/events" ;;\n'
+           '  list) exit 1 ;;\n'
+           '  *) echo "nft $*" >> "$STUBLOG/events" ;;\n'
+           'esac; exit 0')
+
+    def setUp(self):
+        super().setUp()
+        self.conf = self.tmp / 'vpn.conf'
+        self.conf.write_text('ENABLE=1\nKILL_SWITCH=0\n')
+        # the uplink's resolvers: two of the carrier's, the local stub and a link-local one with a scope (neither asked)
+        (self.tmp / 'resolv.conf').write_text('nameserver 127.0.0.53\nnameserver 10.177.0.34\n'
+                                              'nameserver 10.177.0.35\nnameserver fe80::1%eth0\n')
+        self.stub('ip', 'case "$*" in\n'
+                        '  "-4 route show default") [ -e "$STUBLOG/uplink" ] && echo "default dev sipa_eth0" ;;\n'
+                        '  "rule del"*|"-6 rule del"*|"link show"*) exit 1 ;;\n'
+                        'esac; exit 0')
+        # in the resolvers' place: the addresses in $STUBLOG/answers answer; every question is noted
+        self.stub('probe', 'echo "$1" >> "$STUBLOG/asked"; grep -qxF "$1" "$STUBLOG/answers" 2>/dev/null')
+        self.stub('nft', self.NFT)
+        self.stub('sleep', 'exit 0')
+
+    def vpn(self, shell, code, **env):
+        e = dict(MU300_LIB=1, MU300_VPN_CONF=self.conf, MU300_VPN_RUN=self.tmp / 'run', MU300_VPN_LIB=LIB,
+                 MU300_LAN_CONF=self.tmp / 'no', MU300_BIN=SYSBIN, MU300_OPT=self.tmp / 'opt',
+                 MU300_DISK=self.tmp / 'disk', MU300_RESOLV_FILES=self.tmp / 'resolv.conf',
+                 MU300_DNS_PROBE=self.stubs / 'probe')
+        e.update(env)
+        return self.sh(shell, f'. "{BIN}/mu300-vpn"; {code}', **e)
+
+    def pick(self, shell, answers, pre='DRV_BOOTSTRAP=1; ', **env):
+        (self.tmp / 'answers').write_text(''.join(a + '\n' for a in answers))
+        for f in ('asked', 'events'):
+            (self.tmp / f).unlink(missing_ok=True)
+        r = self.vpn(shell, pre + 'bootstrap_pick && rc=0 || rc=$?; echo "rc=$rc dns=$BOOTSTRAP_DNS"',
+                     **env)
+        asked = (self.tmp / 'asked').read_text().split() if (self.tmp / 'asked').exists() else []
+        return r, asked
+
+    def test_the_first_that_answers(self):
+        for shell in self.each_shell():
+            # BOOTSTRAP_DNS answers: it stays, and nothing else is asked
+            r, asked = self.pick(shell, ['1.1.1.1', '10.177.0.34'])
+            self.assertEqual(r.stdout.strip(), 'rc=0 dns=1.1.1.1', r.stderr)
+            self.assertEqual(asked, ['1.1.1.1'])
+            self.assertEqual(r.stderr, '')
+            # it does not (a carrier that lets DNS through to its own resolvers only): the uplink's, in their order
+            r, asked = self.pick(shell, ['10.177.0.35'])
+            self.assertEqual(r.stdout.strip(), 'rc=0 dns=10.177.0.35', r.stderr)
+            self.assertEqual(asked, ['1.1.1.1', '10.177.0.34', '10.177.0.35'])
+            self.assertIn('BOOTSTRAP_DNS 1.1.1.1 does not answer on this uplink', r.stderr)
+            self.assertIn('10.177.0.35', r.stderr)
+            # the setting is not changed: the next start asks again
+            self.assertEqual(self.vpn(shell, 'setting BOOTSTRAP_DNS').stdout.strip(), '1.1.1.1')
+
+    def test_only_for_the_engines_that_look_names_up_themselves(self):
+        for shell in self.each_shell():
+            r, asked = self.pick(shell, [], pre='')
+            self.assertEqual(r.stdout.strip(), 'rc=0 dns=1.1.1.1')
+            self.assertEqual(asked, [])
+            # the drivers that do say so; sing-box not when its lookups go through an upstream proxy
+            for drv, pre, want in (('mihomo', '', '1'), ('dae', '', '1'), ('sing-box', '', '1'),
+                                   ('sing-box', 'UPSTREAM_HTTP_PROXY=10.0.0.9:3128; ', ''),
+                                   ('xray', '', ''), ('wireguard', '', ''), ('openvpn', '', '')):
+                r = self.vpn(shell, f'{pre}load_driver {drv}; echo "boot=[$DRV_BOOTSTRAP]"')
+                self.assertIn(f'boot=[{want}]', r.stdout, (drv, pre, r.stderr))
+
+    def test_nothing_answers(self):
+        for shell in self.each_shell():
+            # no uplink yet (the service came up before the bearer): the run ends, the service manager tries again
+            (self.tmp / 'uplink').unlink(missing_ok=True)
+            r, asked = self.pick(shell, [])
+            self.assertEqual(r.stdout.strip(), 'rc=1 dns=1.1.1.1')
+            self.assertIn('no uplink yet', r.stderr)
+            # three rounds over every candidate
+            self.assertEqual(asked, ['1.1.1.1', '10.177.0.34', '10.177.0.35'] * 3)
+            # an uplink where no DNS server answers at all: on with what is set (a server given by its address
+            # needs none)
+            (self.tmp / 'uplink').write_text('')
+            r, asked = self.pick(shell, [])
+            self.assertEqual(r.stdout.strip(), 'rc=0 dns=1.1.1.1')
+            self.assertIn('going on with 1.1.1.1', r.stderr)
+            (self.tmp / 'uplink').unlink()
+
+    def test_behind_the_kill_switch_through_the_resolve_window(self):
+        self.conf.write_text('ENABLE=1\nKILL_SWITCH=1\n')
+        for shell in self.each_shell():
+            r, asked = self.pick(shell, ['10.177.0.34'])
+            self.assertEqual(r.stdout.strip(), 'rc=0 dns=10.177.0.34', r.stderr)
+            ev = (self.tmp / 'events').read_text()
+            sets = ev.split('nft -f\n')[1:]
+            # the window, then the full kill switch again: never a moment without either
+            self.assertEqual(len(sets), 2, ev)
+            window, full = ('\n'.join(l[4:] for l in s.splitlines() if l.startswith('  | ')) for s in sets)
+            self.assertIn('@dns4', window)
+            self.assertNotIn('dns4', full)
+            self.assertIn('oifname "sipa_eth*" counter drop', full)
+            # the device's own DNS to the candidates, for 30 s, and nothing for HTTP
+            adds = [l for l in ev.splitlines() if l.startswith('nft add element')]
+            self.assertIn('nft add element inet mu300_vpn dns4 { 1.1.1.1 timeout 30s, 10.177.0.34 timeout 30s, '
+                          '10.177.0.35 timeout 30s }', adds)
+            self.assertFalse(any('fetch' in a for a in adds), adds)
+            self.assertNotIn('nft delete table', ev)
+
+    def test_asking_with_nslookup(self):
+        # busybox's and BIND's nslookup: no answer is "timed out" / "no servers could be reached"; any answer, an
+        # NXDOMAIN too, is an answer
+        self.stub('nslookup', 'printf "%s\\n" "$@" > "$STUBLOG/nslookup.args"\n'
+                              'for a; do s=$a; done\n'
+                              'case $s in\n'
+                              '  10.0.0.1) echo ";; connection timed out; no servers could be reached"; exit 1 ;;\n'
+                              '  10.0.0.2) echo "Name: example.com"; echo "Address: 93.184.215.14"; exit 0 ;;\n'
+                              '  10.0.0.3) echo "** server can\'t find example.com: NXDOMAIN"; exit 1 ;;\n'
+                              '  10.0.0.4) echo "nslookup: write to \'10.0.0.4\': Network unreachable"; exit 1 ;;\n'
+                              'esac; exit 1')
+        for shell in self.each_shell():
+            for addr, want in (('10.0.0.1', 1), ('10.0.0.2', 0), ('10.0.0.3', 0), ('10.0.0.4', 1), ('10.0.0.5', 1)):
+                r = self.vpn(shell, f'dns_answers {addr} && rc=0 || rc=$?; echo "rc=$rc"', MU300_DNS_PROBE='')
+                self.assertEqual(r.stdout.strip(), f'rc={want}', addr)
+            args = (self.tmp / 'nslookup.args').read_text().split()
+            self.assertEqual(args, ['-timeout=3', '-retry=1', '-port=53', 'example.com', '10.0.0.5'])
+
+    @unittest.skipUnless(shutil.which('bash'), 'no bash')
+    def test_asking_without_nslookup(self):
+        """Ubuntu's image has no nslookup: bash sends one query (/dev/udp) and waits for the reply's first byte"""
+        import socket
+        import threading
+        srv = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        srv.bind(('127.0.0.1', 0))
+        srv.settimeout(0.2)
+        port = srv.getsockname()[1]
+        got, stop = [], threading.Event()
+
+        def serve():
+            while not stop.is_set():
+                try:
+                    data, peer = srv.recvfrom(512)
+                except socket.timeout:
+                    continue
+                got.append(data)
+                # the answer to "who serves the root": the query's id and question, the response bit set
+                srv.sendto(data[:2] + b'\x81\x80' + data[4:], peer)
+        t = threading.Thread(target=serve, daemon=True)
+        t.start()
+        dead = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        dead.bind(('127.0.0.1', 0))
+        try:
+            for shell in self.each_shell():
+                del got[:]
+                r = self.vpn(shell, 'dns_answers 127.0.0.1 && rc=0 || rc=$?; echo "rc=$rc"', MU300_DNS_PROBE='', MU300_NO_NSLOOKUP=1,
+                             MU300_DNS_PORT=port)
+                self.assertEqual(r.stdout.strip(), 'rc=0', r.stderr)
+                # one well-formed query: id "mu", recursion desired, one question, . NS IN
+                self.assertEqual(got, [b'mu\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x01'])
+                # a port where something listens and never answers
+                r = self.vpn(shell, 'dns_answers 127.0.0.1 && rc=0 || rc=$?; echo "rc=$rc"', MU300_DNS_PROBE='', MU300_NO_NSLOOKUP=1,
+                             MU300_DNS_PORT=dead.getsockname()[1])
+                self.assertEqual(r.stdout.strip(), 'rc=1', r.stderr)
+        finally:
+            stop.set()
+            t.join()
+            srv.close()
+            dead.close()
+
+    def test_the_run_asks_before_the_config_is_written(self):
+        """mu300-vpn run, with a driver that says DRV_BOOTSTRAP=1: its drv_gen sees the resolver that answered"""
+        lib = self.tmp / 'lib'
+        lib.mkdir()
+        shutil.copy(LIB / 'uri.sh', lib / 'uri.sh')
+        (lib / 'fake.sh').write_text('DRV_EXTRA=; DRV_BOOTSTRAP=1; TUN=fk0\n'
+                                     'drv_engines() { :; }\ndrv_engines_ok() { :; }\ndrv_check() { :; }\n'
+                                     'drv_gen() { echo "gen: dns=$BOOTSTRAP_DNS"; }\n'
+                                     'drv_start() { echo "start"; return 1; }\ndrv_alive() { return 1; }\n'
+                                     'drv_stop() { :; }\ndrv_import() { :; }\n')
+        store = self.tmp / 'vpn'
+        (store / 'profiles/p').mkdir(parents=True)
+        (store / 'profiles/p/meta').write_text("NAME='p'\nTYPE='fake'\n")
+        (store / 'active').write_text('p\n')
+        (store / 'settings').write_text('')
+        (self.tmp / 'answers').write_text('10.177.0.34\n')
+        self.stub('pgrep', 'exit 1')
+        env = dict(MU300_VPN_CONF=self.conf, MU300_VPN_RUN=self.tmp / 'run', MU300_VPN_LIB=lib,
+                   MU300_LAN_CONF=self.tmp / 'no', MU300_BIN=SYSBIN, MU300_OPT=self.tmp / 'opt',
+                   MU300_DISK=self.tmp / 'disk', MU300_RESOLV_FILES=self.tmp / 'resolv.conf',
+                   MU300_DNS_PROBE=self.stubs / 'probe')
+        for shell in self.each_shell():
+            r = self.script(shell, BIN / 'mu300-vpn', 'run', **env)
+            self.assertEqual(r.returncode, 1, r.stderr)
+            out = r.stdout.splitlines()
+            self.assertIn('gen: dns=10.177.0.34', out)
+            self.assertLess(out.index('gen: dns=10.177.0.34'), out.index('start'))
+            # no uplink and no answer: nothing is written or started, the run ends for the service manager to repeat
+            (self.tmp / 'answers').write_text('')
+            r = self.script(shell, BIN / 'mu300-vpn', 'run', **env)
+            self.assertEqual(r.returncode, 1)
+            self.assertIn('no uplink yet', r.stderr)
+            self.assertNotIn('gen:', r.stdout)
+            (self.tmp / 'answers').write_text('10.177.0.34\n')

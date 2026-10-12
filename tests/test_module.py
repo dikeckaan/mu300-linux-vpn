@@ -28,7 +28,8 @@ EXTRA_OF = {'mu300-linux-vpn-core.tar.gz': 'vpn', 'mu300-linux-vpn.tar.gz': 'vpn
             'mu300-linux-vpn-xray.tar.gz': 'vpn-xray', 'mu300-linux-vpn-singbox.tar.gz': 'vpn-singbox',
             'mu300-linux-vpn-mihomo.tar.gz': 'vpn-mihomo', 'mu300-linux-vpn-dae.tar.gz': 'vpn-dae'}
 ENGINE_FILES = {'vpn-xray': {'bin/xray', 'bin/hev-socks5-tunnel'}, 'vpn-singbox': {'bin/sing-box'},
-                'vpn-mihomo': {'bin/mihomo'},
+                # (the geodata GEOIP and GEOSITE rules read: mihomo could download it only before the tunnel is up)
+                'vpn-mihomo': {'bin/mihomo', 'share/mihomo/Country.mmdb', 'share/mihomo/GeoSite.dat'},
                 'vpn-dae': {'bin/dae', 'share/dae/geoip.dat', 'share/dae/geosite.dat'}}
 META = {'VERSION', 'components', 'requires', 'name', 'release', 'manifest'}
 
@@ -69,6 +70,7 @@ class Tarballs(unittest.TestCase):
             self.assertEqual(r[1], 'v1.2.3')
             self.assertEqual(int(r[2]), (self.out / r[4]).stat().st_size)
         self.assertRegex(rows[2][3], r'^xray [0-9.]+,hev-socks5-tunnel [0-9.]+$')
+        self.assertRegex(rows[4][3], r'^mihomo [0-9.]+,geoip [0-9]{12},geosite [0-9]{12}$')
         self.assertRegex(rows[5][3], r'^dae [0-9.]+$')
 
     def core_files(self):
@@ -114,8 +116,9 @@ class Tarballs(unittest.TestCase):
                 self.assertEqual(data['./name'], (extra + '\n').encode())
                 self.assertEqual(data['./hooks/link'], (TOP / 'hooks/engine-link').read_bytes())
                 self.assertEqual(data['./hooks/unlink'], (TOP / 'hooks/engine-unlink').read_bytes())
+                # a name and a version each: a release (1.19.32), or a geodata set's date (202610080033)
                 for line in data['./components'].decode().splitlines():
-                    self.assertRegex(line, r'^[a-z0-9-]+ \d+\.\d+\.\d+$')
+                    self.assertRegex(line, r'^[a-z0-9-]+ (\d+\.\d+\.\d+|\d{12})$')
 
     def test_entries_modes_and_owner(self):
         for name in ASSETS:

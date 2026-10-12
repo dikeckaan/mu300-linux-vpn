@@ -544,6 +544,69 @@ class Dae(Base):
         return [x for x in self.log('nft.log').split('-- loaded\n') if x.strip()]
 
 
+    def start(self, shell, dae, tc='exit 0'):
+        """drv_start with stub programs: dae (the engine), ip and tc; (the result, seconds waited in the start)"""
+        d = self.put('vpn-dae', 'dae')
+        (d / 'dae').write_text('#!/bin/sh\n' + dae + '\n')
+        self.stub('ip', 'echo "$*" >> "$STUBLOG/ip.log"\n'
+                        'case "$*" in\n'
+                        '  "-o link show mu300dae") echo "98: mu300dae: <BROADCAST,NOARP,UP,LOWER_UP> mtu 1500" ;;\n'
+                        '  "link show mu300dae") exit 0 ;;\n'
+                        '  "link show"*|"rule del"*|"-6 rule del"*) exit 1 ;;\n'
+                        'esac; exit 0')
+        self.stub('tc', tc)
+        # the waits are counted, not waited
+        self.stub('sleep', 'echo "$1" >> "$STUBLOG/slept"; exit 0')
+        for f in ('slept', 'slept.start', 'ip.log'):
+            (self.tmp / f).unlink(missing_ok=True)
+        shutil.rmtree(self.tmp / 'proc', ignore_errors=True)
+        r = self.lib(shell, 'load_driver dae; mkdir -p "$DAE_DIR"; drv_start && echo STARTED; '
+                            'cp "$STUBLOG/slept" "$STUBLOG/slept.start" 2>/dev/null || :; '
+                            'drv_alive && echo ALIVE; drv_stop; echo "stopped=$?"',
+                     MU300_PROC=self.tmp / 'proc', **self.kernel('7.2.10', True))
+        return r, len(self.log('slept.start').split())
+
+    # what dae's open files look like in /proc/PID/fdinfo once it has bound its programs with tcx (Linux 6.6 on): a
+    # link on the LAN bridge (31), then the dummy's (98); written by the stub dae for its own pid, then it stays
+    TCX = ('d="$STUBLOG/proc/$$/fdinfo"; mkdir -p "$d"\n'
+           'printf "pos:\\t0\\nflags:\\t02000000\\nlink_type:\\ttcx\\nlink_id:\\t7\\nprog_tag:\\t0a1b\\nifindex:\\t31\\n'
+           'attach_type:\\t46 (ingress)\\n" > "$d/9"\n'
+           'printf "pos:\\t0\\nflags:\\t02000000\\nlink_type:\\ttcx\\nlink_id:\\t8\\nprog_tag:\\t0a1c\\nifindex:\\t%s\\n'
+           'attach_type:\\t47 (egress)\\n" "$IX" > "$d/10"\n'
+           'exec /bin/sleep 30')
+
+    def test_a_dae_that_binds_with_tcx_is_up(self):
+        """Kernels from 6.6 on: dae attaches its programs with tcx, which "tc filter show" does not list. Waiting for a
+        tc filter stopped a working dae every 40 s (docs/FINDINGS.md 26k). The tcx link it holds on the dummy is the
+        sign there."""
+        for shell in self.each_shell():
+            self.fresh()
+            r, waited = self.start(shell, 'IX=98\n' + self.TCX)
+            self.assertIn('STARTED', r.stdout, r.stderr)
+            self.assertIn('ALIVE', r.stdout)
+            self.assertIn('dae up on mu300dae', r.stdout)
+            self.assertNotIn('did not attach', r.stderr)
+            # (the stub writes its files a moment after it starts: one wait at most, not the 40 s that ended in a stop)
+            self.assertLessEqual(waited, 2, r.stdout)
+            # an older kernel: the tc filter on the dummy's egress, at once
+            r, waited = self.start(shell, 'exec /bin/sleep 30',
+                                   tc='case "$*" in "filter show dev mu300dae egress") echo "filter protocol all pref 2 bpf chain 0" ;; esac')
+            self.assertIn('STARTED', r.stdout, r.stderr)
+            self.assertEqual(waited, 0)
+            # a tcx link on another interface only (the LAN's) is not the dummy's: neither sign, but alive - up
+            # after 10 s, and not stopped
+            r, waited = self.start(shell, 'IX=31\n' + self.TCX)
+            self.assertIn('STARTED', r.stdout, r.stderr)
+            self.assertEqual(waited, 9)
+            # one that cannot load its programs exits: not up, and nothing of it is left
+            r, waited = self.start(shell, 'echo "FATAL load" >&2; exit 1')
+            self.assertNotIn('STARTED', r.stdout)
+            self.assertIn('dae exited during start', r.stderr)
+            self.assertIn('link del mu300dae', self.log('ip.log').splitlines())
+            # (no complaint about files that were never written)
+            self.assertNotIn("can't open", r.stderr)
+            self.assertNotIn('No such file', r.stderr)
+
 class Subscriptions(Base):
     def serve(self, body):
         (self.tmp / 'sub.body').write_bytes(body)
@@ -654,6 +717,108 @@ class Latency(Base):
             self.assertEqual(r.stdout.strip(), 'home\t48 ms\tdirect')
 
 
+    def test_openwrts_fetcher_tells_an_answer_from_none(self):
+        """OpenWrt has no curl: its wget is uclient-fetch, whose -q says nothing at all - every server that does not
+        speak plain HTTP on its port was "unreachable" (docs/FINDINGS.md 26l). Without -q its words tell them apart."""
+        self.stub('uclient-fetch',
+                  'printf "%s\\n" "$*" >> "$STUBLOG/fetch.log"\n'
+                  'case " $* " in *" -q "*) exit 4 ;; esac\n'
+                  'case "$*" in\n'
+                  # a TLS server given plain HTTP: it answered
+                  '  *vpn.example.com*) echo "Connecting to 203.0.113.10:443"; echo "HTTP error 400"; exit 8 ;;\n'
+                  # one that closes the connection on what is not its protocol: it was there
+                  '  *tr.example.net*) echo "Connection reset prematurely"; exit 4 ;;\n'
+                  # nothing listens (refused), and nothing there at all
+                  '  *192.0.2.7*) echo "Failed to send request: Operation not permitted"; exit 4 ;;\n'
+                  '  *) echo "Connection error: Connection timed out"; exit 4 ;;\n'
+                  'esac')
+        closed = 'vless://6f1c2d3e-4b5a-4c6d-8e7f-0123456789ab@192.0.2.7:443?security=tls&type=tcp#Closed'
+        for shell in self.each_shell():
+            self.fresh()
+            for link in (VLESS, TROJAN, closed):
+                self.assertEqual(self.vpn(shell, 'profile', 'import', '-', stdin=link).returncode, 0)
+            r = self.vpn(shell, 'latency', '--all', '--json', MU300_NO_CURL='1', MU300_NO_NC='1')
+            self.assertEqual(r.returncode, 0, r.stderr)
+            got = {x['id']: x for x in json.loads(r.stdout)}
+            for i in ('home', 'tro'):
+                self.assertIsNone(got[i]['error'], i)
+                self.assertIsInstance(got[i]['ms'], int, i)
+            self.assertEqual((got['closed']['ms'], got['closed']['error']), (None, 'unreachable'))
+            self.assertNotIn('-q', self.log('fetch.log').split())
+            self.no_secret(r.stdout, r.stderr)
+
+    def test_busyboxs_nc_is_the_connect_test_without_curl(self):
+        """OpenWrt: "nc HOST PORT" with nothing to send connects and ends. A server that says nothing to a stranger (a
+        Shadowsocks server never answers what is not its protocol) is reachable; a refusal and a host that never
+        answers the connect are not."""
+        self.stub('nc', 'case "$1" in --help) echo "BusyBox v1.37.0 multi-call binary." >&2; exit 1 ;; esac\n'
+                        'echo "$*" >> "$STUBLOG/nc.log"\n'
+                        'case "$1" in\n'
+                        '  vpn.example.com) exit 0 ;;\n'
+                        '  192.0.2.7) echo "nc: cannot connect to remote host (192.0.2.7): Connection refused" >&2; exit 1 ;;\n'
+                        # (/bin/sleep by its path: the stub sleep below returns at once)
+                        '  *) exec /bin/sleep 30 ;;\n'
+                        'esac')
+        # the 5 s the test waits for a connect are 1 s here (not none: the stub nc must get to answer first)
+        self.stub('sleep', 'exec /bin/sleep 1')
+        closed = 'vless://6f1c2d3e-4b5a-4c6d-8e7f-0123456789ab@192.0.2.7:443?security=tls&type=tcp#Closed'
+        for shell in self.each_shell():
+            self.fresh()
+            for link in (VLESS, TROJAN, closed):
+                self.assertEqual(self.vpn(shell, 'profile', 'import', '-', stdin=link).returncode, 0)
+            r = self.vpn(shell, 'latency', '--all', '--json', MU300_NO_CURL='1')
+            self.assertEqual(r.returncode, 0, r.stderr)
+            got = {x['id']: x for x in json.loads(r.stdout)}
+            self.assertIsNone(got['home']['error'])
+            self.assertIsInstance(got['home']['ms'], int)
+            # refused, and one that never connects (ended after the 5 s)
+            self.assertEqual((got['closed']['ms'], got['closed']['error']), (None, 'unreachable'))
+            self.assertEqual((got['tro']['ms'], got['tro']['error']), (None, 'unreachable'))
+            self.assertEqual(self.log('nc.log').splitlines(),
+                             ['192.0.2.7 443', 'vpn.example.com 443', 'tr.example.net 8443'])
+            (self.tmp / 'nc.log').unlink()
+
+    def test_which_connections_go_into_the_tunnel(self):
+        """the connect test (nc) is for a connection outside the tunnel: in one, the engine on the device answers the
+        connect itself. Outside it: no tunnel up, the running Xray profile's own server, a server on the LAN."""
+        self.stub('ip', 'case "$*" in\n'
+                        '  "link show mh-mu300") exit 0 ;;\n'
+                        '  "route get 203.0.113.10") echo "203.0.113.10 dev mh-mu300 table 2022 src 198.18.0.1 uid 0" ;;\n'
+                        '  "route get 192.168.78.100") echo "192.168.78.100 dev br-lan src 192.168.78.1 uid 0" ;;\n'
+                        '  "route get 198.51.100.7") echo "198.51.100.7 dev mh-mu300-b src 10.0.0.2" ;;\n'
+                        '  "link show"*|"-4 -o addr"*) exit 1 ;;\n'
+                        'esac; exit 0')
+        code = ('for h in 203.0.113.10 192.168.78.100 198.51.100.7 vpn.example.com; do '
+                'through_tunnel $h && echo "$h in" || echo "$h out"; done')
+        for shell in self.each_shell():
+            self.fresh()
+            # no tunnel: nothing goes into one
+            r = self.lib(shell, code)
+            self.assertEqual([l.split()[1] for l in r.stdout.splitlines()], ['out'] * 4, r.stderr)
+            (self.tmp / 'run').mkdir()
+            (self.tmp / 'run/iface').write_text('mh-mu300\n')
+            r = self.lib(shell, code)
+            # (a name: its address, here 203.0.113.10 for every name; another interface whose name only starts alike)
+            self.assertEqual(r.stdout.splitlines(), ['203.0.113.10 in', '192.168.78.100 out', '198.51.100.7 out',
+                                                     'vpn.example.com in'], r.stderr)
+
+    def test_a_profile_without_a_server_has_none_of_another(self):
+        """latency --all: a mihomo profile (no one server to test) came out with the host and port of the profile
+        before it"""
+        y = self.tmp / 'c.yaml'
+        y.write_text(MH_CONF)
+        for shell in self.each_shell():
+            self.fresh()
+            self.stub('curl', 'printf 0.020000')
+            self.assertEqual(self.vpn(shell, 'profile', 'import', '-', stdin=VLESS).returncode, 0)
+            self.assertEqual(self.vpn(shell, 'profile', 'import', y, 'Zz').returncode, 0)
+            r = self.vpn(shell, 'latency', '--all', '--json')
+            got = json.loads(r.stdout)
+            self.assertEqual([x['id'] for x in got], ['home', 'zz'])
+            self.assertEqual(got[1], {'id': 'zz', 'host': None, 'port': None, 'ms': None, 'via': 'direct',
+                                      'error': 'no server'})
+
+
 class Logs(Base):
     def test_logs_by_engine(self):
         for shell in self.each_shell():
@@ -663,3 +828,133 @@ class Logs(Base):
             r = self.vpn(shell, 'logs', '-n', '2')
             self.assertEqual(len(r.stdout.splitlines()), 2)
             self.assertEqual(self.vpn(shell, 'logs', 'nope').returncode, 2)
+
+    LOG = ('Oct 12 17:25:07 u30 mu300-vpn[10]: engine: mihomo (profile sub)\n'
+           'Oct 12 17:25:07 u30 mu300-vpn[10]: mihomo config OK (/run/mu300-vpn/mihomo.yaml)\n'
+           'Oct 12 17:25:33 u30 mu300-vpn[10]: time="2026-10-12T14:25:33Z" level=warning msg="[TCP] dial PROXY (match Match/) '
+           '198.18.0.1:56714 --> 104.26.13.205:443 error: dns resolve failed"\n'
+           'Oct 12 17:35:01 u30 mu300-vpn[11]: engine: sing-box (profile office)\n'
+           'Oct 12 17:35:03 u30 mu300-vpn[11]: \033[31mERROR\033[0m[0020] [\033[38;5;221m784163041\033[0m 9.35s] connection: '
+           'open connection to 172.67.74.152:80 using outbound/vless[proxy]: context deadline exceeded\n'
+           # a run of a module from before the runs named their engine
+           'Oct 12 17:40:00 u30 mu300-vpn[12]: mihomo config OK (/run/mu300-vpn/mihomo.yaml)\n'
+           'Oct 12 17:40:01 u30 mu300-vpn[12]: time="2026-10-12T14:40:01Z" level=info msg="[TCP] 198.18.0.1:1 --> 1.1.1.1:443 '
+           'match Match using PROXY[a]"\n')
+
+    def test_an_engines_lines_are_its_runs_lines(self):
+        """logs ENGINE took the lines that name the engine: for mihomo the two this script writes and none of
+        mihomo's own (its errors do not say "mihomo"), and for sing-box every line with "using" in it
+        (docs/FINDINGS.md 26l). A run says which engine it is; its lines carry its process id."""
+        (self.tmp / 'log').write_text(self.LOG)
+        self.stub('journalctl', 'cat "$STUBLOG/log"')
+        for shell in self.each_shell():
+            r = self.vpn(shell, 'logs', 'mihomo')
+            got = r.stdout.splitlines()
+            # the whole run on mihomo, its error too; of the run that did not say, the lines that name it
+            self.assertEqual([l.split(': ', 1)[0].rsplit(' ', 1)[1] for l in got],
+                             ['mu300-vpn[10]'] * 3 + ['mu300-vpn[12]'])
+            self.assertIn('dns resolve failed', r.stdout)
+            r = self.vpn(shell, 'logs', 'sing-box')
+            got = r.stdout.splitlines()
+            self.assertEqual(len(got), 2, got)
+            self.assertTrue(all('mu300-vpn[11]' in l for l in got))
+            # ... without the colour codes, here and in the whole log
+            self.assertIn('mu300-vpn[11]: ERROR[0020] [784163041 9.35s] connection', got[1])
+            self.assertNotIn('\033', self.vpn(shell, 'logs').stdout)
+            self.assertEqual(len(self.vpn(shell, 'logs').stdout.splitlines()), 7)
+            self.assertEqual(self.vpn(shell, 'logs', 'dae').stdout, '')
+
+
+class UseWhileOn(Base):
+    """Switching a running VPN to another profile restarts the service on it, and the old tunnel is gone before the
+    new one is tried: a profile that cannot run here is refused first, and the VPN stays as it is (docs/FINDINGS.md
+    26j). "profile check ID" is "check ID" (the name the spec's table and the control panel use)."""
+
+    def setup(self, shell):
+        self.fresh()
+        self.put('vpn-xray', 'xray', 'hev-socks5-tunnel')
+        self.assertEqual(self.vpn(shell, 'profile', 'import', '-', stdin=VLESS).returncode, 0)
+        self.assertEqual(self.vpn(shell, 'profile', 'use', 'home').returncode, 0)
+        y = self.tmp / 'c.yaml'
+        y.write_text(MH_CONF)
+        self.assertEqual(self.vpn(shell, 'profile', 'import', y, 'Sub').returncode, 0)
+        self.conf.write_text('ENABLE=1\n')
+        (self.tmp / 'vpn/settings').write_text("KILL_SWITCH='0'\n")
+        (self.tmp / 'svc.log').unlink(missing_ok=True)
+
+    def active(self):
+        return (self.tmp / 'vpn/active').read_text().strip()
+
+    def test_a_profile_whose_engine_is_missing_is_not_switched_to(self):
+        for shell in self.each_shell():
+            self.setup(shell)
+            r = self.vpn(shell, 'use', 'sub')
+            self.assertEqual(r.returncode, 1, r.stdout)
+            self.assertIn('the engines of profile sub are not installed: run mu300-vpn engines install mihomo', r.stderr)
+            self.assertIn('the VPN stays on profile home', r.stderr)
+            self.assertEqual(self.active(), 'home')
+            self.assertEqual(self.log('svc.log'), '')
+            self.no_secret(r.stdout, r.stderr)
+            # the engine installed: the switch, and the restart on it
+            self.put('vpn-mihomo', 'mihomo')
+            r = self.vpn(shell, 'use', 'sub')
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(self.active(), 'sub')
+            self.assertEqual(self.log('svc.log').split(), ['svc', 'restart'])
+            # back, and to itself: nothing to ask
+            self.assertEqual(self.vpn(shell, 'profile', 'use', 'home').returncode, 0)
+            self.assertEqual(self.vpn(shell, 'use', 'home').returncode, 0)
+            self.assertEqual(self.active(), 'home')
+
+    def test_a_config_its_engine_refuses_is_not_switched_to(self):
+        for shell in self.each_shell():
+            self.setup(shell)
+            d = self.put('vpn-mihomo', 'mihomo')
+            (d / 'mihomo').write_text('#!/bin/sh\ncase " $* " in *" -t "*) exit 1 ;; esac\nexit 0\n')
+            r = self.vpn(shell, 'use', 'sub')
+            self.assertEqual(r.returncode, 1)
+            self.assertIn('profile sub does not check: the VPN stays on profile home', r.stderr)
+            self.assertEqual(self.active(), 'home')
+            self.assertEqual(self.log('svc.log'), '')
+
+    def test_a_kernel_dae_cannot_use_is_not_switched_to(self):
+        for shell in self.each_shell():
+            self.setup(shell)
+            self.put('vpn-dae', 'dae')
+            self.conf.write_text('ENABLE=0\n')
+            self.assertEqual(self.vpn(shell, 'profile', 'import', '-', stdin=HY2).returncode, 0)
+            self.conf.write_text('ENABLE=1\n')
+            b = self.tmp / 'btf'
+            b.write_text('x')
+            r = self.vpn(shell, 'use', 'hy', MU300_KREL='5.4.210', MU300_BTF=b)
+            self.assertEqual(r.returncode, 1)
+            self.assertIn('dae needs Linux 5.17', r.stderr)
+            self.assertIn('the VPN stays on profile home', r.stderr)
+            self.assertEqual(self.active(), 'home')
+            r = self.vpn(shell, 'use', 'hy', MU300_KREL='7.2.10', MU300_BTF=b)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(self.active(), 'hy')
+
+    def test_while_the_vpn_is_off_any_profile_can_be_chosen(self):
+        for shell in self.each_shell():
+            self.setup(shell)
+            self.conf.write_text('ENABLE=0\n')
+            r = self.vpn(shell, 'use', 'sub')
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(self.active(), 'sub')
+            # ... and "on" asks then, as it always did
+            r = self.vpn(shell, 'on')
+            self.assertEqual(r.returncode, 1)
+            self.assertIn('the engines of profile sub are not installed: run mu300-vpn engines install mihomo', r.stderr)
+            self.assertIn('ENABLE=0', self.conf.read_text())
+
+    def test_profile_check_is_check(self):
+        for shell in self.each_shell():
+            self.setup(shell)
+            r = self.vpn(shell, 'profile', 'check', 'home')
+            self.assertEqual((r.returncode, r.stdout.strip()), (0, 'profile home: OK'), r.stderr)
+            self.assertEqual(self.vpn(shell, 'check', 'home').stdout, r.stdout)
+            self.assertEqual(self.vpn(shell, 'profile', 'check', 'nope').returncode, 1)
+            self.assertEqual(self.vpn(shell, 'profile', 'check', '../x').returncode, 2)
+            self.assertEqual(self.vpn(shell, 'profile', 'check').returncode, 2)
+            self.no_secret(r.stdout, r.stderr)

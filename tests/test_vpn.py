@@ -265,9 +265,13 @@ class KillSwitch(ShellTest):
         self.ev = self.tmp / 'events'
         self.state = self.tmp / 'nft.state'
         self.stub('ip', '[ "$1 $2" = "rule del" ] && exit 2; exit 0')
-        # the ruleset in force: an nft -f transaction replaces it whole; a lone delete of the table empties it
+        # the kill switch's ruleset in force: an nft -f transaction on its table replaces it whole (one on another
+        # table - the DNS redirect a run loads - leaves it alone); a lone delete of the table empties it
         self.stub('nft', 'case "$1" in\n'
-                         '  -f) r=$(cat); printf "%s\\n" "$r" > "$STUBLOG/nft.state.new"; mv "$STUBLOG/nft.state.new" "$STUBLOG/nft.state"\n'
+                         '  -f) r=$(cat)\n'
+                         '      case $r in "table inet mu300_vpn"[!_]*)\n'
+                         '          printf "%s\\n" "$r" > "$STUBLOG/nft.state.new"; mv "$STUBLOG/nft.state.new" "$STUBLOG/nft.state" ;;\n'
+                         '      esac\n'
                          '      { echo "nft -f"; printf "%s\\n" "$r" | sed "s/^/  | /"; } >> "$STUBLOG/events" ;;\n'
                          '  list) [ -s "$STUBLOG/nft.state" ] ;;\n'
                          '  *) echo "nft $*" >> "$STUBLOG/events"\n'
@@ -326,12 +330,38 @@ class KillSwitch(ShellTest):
     def events(self):
         return self.ev.read_text() if self.ev.exists() else ''
 
-    def rulesets(self):
-        """every ruleset applied, in order"""
+    def rulesets(self, table='inet mu300_vpn'):
+        """every ruleset of the kill switch's table applied, in order (another table: the DNS redirect's, which a
+        run loads once its config is written)"""
         out = []
         for chunk in self.events().split('nft -f\n')[1:]:
-            out.append('\n'.join(l[4:] for l in chunk.splitlines() if l.startswith('  | ')))
+            rs = '\n'.join(l[4:] for l in chunk.splitlines() if l.startswith('  | '))
+            if f'table {table} {{' in rs:
+                out.append(rs)
         return out
+
+    def test_sing_box_gets_the_dns_redirect_too(self):
+        """sing-box routes by itself, and a link's config answers every DNS packet; a raw config need not, and the
+        device's own lookups went to the carrier's resolver through the tunnel, which does not answer there
+        (docs/FINDINGS.md 26m). The core redirects them to REMOTE_DNS for sing-box as for every other driver, before
+        it starts, and the next start takes the redirect down first."""
+        for shell in self.each_shell():
+            self.fresh(self.ENGINES)
+            r = self.run_vpn(shell, self.conf_ks() + 'REMOTE_DNS=9.9.9.9\n')
+            self.assertEqual(r.returncode, 0, r.stderr)
+            nat = self.rulesets('ip mu300_vpn_dns')
+            self.assertEqual(len(nat), 1, self.events())
+            for want in ('type nat hook output priority -100', 'meta mark 0x2d0 return', 'ip daddr 127.0.0.0/8 return',
+                         'udp dport 53 dnat to 9.9.9.9', 'tcp dport 53 dnat to 9.9.9.9'):
+                self.assertIn(want, nat[0])
+            ev = self.events()
+            self.assertLess(ev.index('table ip mu300_vpn_dns {'), ev.index('engine sing-box run -c'))
+            self.assertClosed(r.stderr)
+            self.assertEqual(self.run_vpn(shell, self.conf_ks()).returncode, 0)
+            ev = self.events()
+            dels = [i for i in range(len(ev)) if ev.startswith('nft delete table ip mu300_vpn_dns', i)]
+            self.assertTrue(any(ev.index('table ip mu300_vpn_dns {') < d < ev.rindex('engine sing-box run -c')
+                                for d in dels), ev)
 
     def assertFull(self, ruleset, msg=None):
         """the full kill switch: device and clients dropped on the modem, nothing open for a download"""
@@ -512,7 +542,9 @@ class KillSwitch(ShellTest):
             ev = self.events()
             self.assertIn('engine sing-box run -c', ev)
             before = ev[:ev.index('engine sing-box run -c')]
-            self.assertFull(before[before.rindex('nft -f'):])
+            # the last transaction on the kill switch's table before the engine starts (the DNS redirect, a table of
+            # its own, is loaded after it)
+            self.assertFull([c for c in before.split('nft -f\n')[1:] if 'table inet mu300_vpn {' in c][-1])
 
     def test_a_corrupt_or_rejected_engine_fails_closed(self):
         for shell in self.each_shell():
@@ -550,9 +582,21 @@ class KillSwitch(ShellTest):
             for _ in range(3):
                 self.assertEqual(self.run_vpn(shell, self.conf_ks()).returncode, 0)
             self.assertClosed()
-            self.assertEqual(len(self.rulesets()), 3)
-            for x in self.rulesets():
-                self.assertFull(x)
+            # each run: the full kill switch, the resolve window in which the bootstrap resolver is asked whether it
+            # answers on this uplink (bootstrap_pick), and the full kill switch again - three transactions, the table
+            # never deleted (assertClosed), nothing open for a download and nothing forwarded in between
+            rs = self.rulesets()
+            self.assertEqual(len(rs), 9)
+            for i, x in enumerate(rs):
+                if i % 3 == 1:
+                    self.assertIn('ip daddr @dns4 meta l4proto { tcp, udp } th dport 53 accept', x)
+                    out, rest = x.split('chain output {')[1].split('chain input {')
+                    self.assertIn('oifname "sipa_eth*" counter drop', out)
+                    self.assertIn('oifname "sipa_eth*" counter drop', rest.split('chain forward {')[1])
+                else:
+                    self.assertFull(x)
+            adds = [l for l in self.events().splitlines() if l.startswith('nft add element')]
+            self.assertTrue(adds and all(' dns4 ' in a or ' dns6 ' in a for a in adds), adds)
 
     def test_xray_never_runs_without_the_kill_switch(self):
         for shell in self.each_shell():

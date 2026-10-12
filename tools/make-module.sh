@@ -4,7 +4,7 @@
 #   OUTDIR/mu300-linux-vpn-core.tar.gz     the vpn extra: mu300-vpn, its library, services, hooks - no engine
 #   OUTDIR/mu300-linux-vpn-xray.tar.gz     vpn-xray: Xray-core and hev-socks5-tunnel (tools/fetch-xray.sh)
 #   OUTDIR/mu300-linux-vpn-singbox.tar.gz  vpn-singbox: sing-box (tools/fetch-sing-box.sh)
-#   OUTDIR/mu300-linux-vpn-mihomo.tar.gz   vpn-mihomo: mihomo (tools/fetch-mihomo.sh)
+#   OUTDIR/mu300-linux-vpn-mihomo.tar.gz   vpn-mihomo: mihomo and the geodata its rules read (tools/fetch-mihomo.sh)
 #   OUTDIR/mu300-linux-vpn-dae.tar.gz      vpn-dae: dae and its geodata (tools/fetch-dae.sh)
 #   OUTDIR/mu300-linux-vpn.tar.gz          the vpn extra as v1.0.0 had it: the core with xray, hev-socks5-tunnel and
 #                                          sing-box in it. The compatibility bundle: the mu300-extra and mu300-update
@@ -34,20 +34,22 @@ tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
 ver() { sed -n "s/^$2=//p" "$TOP/tools/$1"; }
 XRAY_VER=$(ver fetch-xray.sh XRAY_VER); HEV_VER=$(ver fetch-xray.sh HEV_VER)
 SB_VER=$(ver fetch-sing-box.sh VER); MIHOMO_VER=$(ver fetch-mihomo.sh VER); DAE_VER=$(ver fetch-dae.sh VER)
+GEOIP_VER=$(ver fetch-mihomo.sh GEOIP_VER); GEOSITE_VER=$(ver fetch-mihomo.sh GEOSITE_VER)
 fake() { printf '#!/bin/sh\necho "%s (fake engine for tests)"\n' "$2" > "$1"; chmod 755 "$1"; }
 FAKE=${MU300_VPN_FAKE_ENGINES:-}
 
 # the engines, once: $tmp/eng/{xray,singbox,mihomo,dae}
 e=$tmp/eng
-mkdir -p "$e/xray/bin" "$e/singbox/bin" "$e/mihomo/bin" "$e/dae/bin" "$e/dae/share/dae"
+mkdir -p "$e/xray/bin" "$e/singbox/bin" "$e/mihomo/bin" "$e/mihomo/share/mihomo" "$e/dae/bin" "$e/dae/share/dae"
 if [ "$FAKE" = 1 ]; then
     fake "$e/xray/bin/xray" xray; fake "$e/xray/bin/hev-socks5-tunnel" hev-socks5-tunnel
     fake "$e/singbox/bin/sing-box" sing-box; fake "$e/mihomo/bin/mihomo" mihomo; fake "$e/dae/bin/dae" dae
     echo fake > "$e/dae/share/dae/geoip.dat"; echo fake > "$e/dae/share/dae/geosite.dat"
+    echo fake > "$e/mihomo/share/mihomo/Country.mmdb"; echo fake > "$e/mihomo/share/mihomo/GeoSite.dat"
 else
     sh "$TOP/tools/fetch-xray.sh" "$e/xray/bin" >&2
     sh "$TOP/tools/fetch-sing-box.sh" "$e/singbox/bin/sing-box" >&2
-    sh "$TOP/tools/fetch-mihomo.sh" "$e/mihomo/bin" >&2
+    sh "$TOP/tools/fetch-mihomo.sh" "$e/mihomo" >&2
     sh "$TOP/tools/fetch-dae.sh" "$e/dae" >&2
 fi
 
@@ -88,7 +90,7 @@ engine() { # engine NAME SRC COMPONENTS...
 }
 engine vpn-xray "$e/xray" "xray $XRAY_VER" "hev-socks5-tunnel $HEV_VER"
 engine vpn-singbox "$e/singbox" "sing-box $SB_VER"
-engine vpn-mihomo "$e/mihomo" "mihomo $MIHOMO_VER"
+engine vpn-mihomo "$e/mihomo" "mihomo $MIHOMO_VER" "geoip $GEOIP_VER" "geosite $GEOSITE_VER"
 engine vpn-dae "$e/dae" "dae $DAE_VER"
 
 # python's tarfile, not tar: the same root-owned archive from macOS (bsdtar) and Linux (GNU tar), sorted, with fixed
