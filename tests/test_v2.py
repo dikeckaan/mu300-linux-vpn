@@ -545,26 +545,32 @@ class Dae(Base):
 
 
     def start(self, shell, dae, tc='exit 0'):
-        """drv_start with stub programs: dae (the engine), ip and tc; (the result, seconds waited in the start)"""
+        """drv_start with stub programs: dae (the engine), ip and tc; (the result, the rounds of the start's wait in
+        which it looked for dae's tcx link - it asks ip for the dummy's index each time)"""
         d = self.put('vpn-dae', 'dae')
         (d / 'dae').write_text('#!/bin/sh\n' + dae + '\n')
         self.stub('ip', 'echo "$*" >> "$STUBLOG/ip.log"\n'
                         'case "$*" in\n'
-                        '  "-o link show mu300dae") echo "98: mu300dae: <BROADCAST,NOARP,UP,LOWER_UP> mtu 1500" ;;\n'
+                        # (with $STUBLOG/await: not before the stub dae has written its files, so that the round
+                        # in which they are seen does not depend on which of the two is quicker)
+                        '  "-o link show mu300dae")\n'
+                        '    n=0; while [ -e "$STUBLOG/await" ] && [ ! -e "$STUBLOG/dae.ready" ] && [ $n -lt 100 ]; do\n'
+                        '        /bin/sleep 0.1; n=$((n + 1)); done\n'
+                        '    echo "98: mu300dae: <BROADCAST,NOARP,UP,LOWER_UP> mtu 1500" ;;\n'
                         '  "link show mu300dae") exit 0 ;;\n'
                         '  "link show"*|"rule del"*|"-6 rule del"*) exit 1 ;;\n'
                         'esac; exit 0')
         self.stub('tc', tc)
-        # the waits are counted, not waited
-        self.stub('sleep', 'echo "$1" >> "$STUBLOG/slept"; exit 0')
-        for f in ('slept', 'slept.start', 'ip.log'):
+        # the waits are not waited (where the shell runs the stub: busybox has a sleep of its own)
+        self.stub('sleep', 'exit 0')
+        for f in ('ip.start', 'ip.log', 'dae.ready'):
             (self.tmp / f).unlink(missing_ok=True)
         shutil.rmtree(self.tmp / 'proc', ignore_errors=True)
         r = self.lib(shell, 'load_driver dae; mkdir -p "$DAE_DIR"; drv_start && echo STARTED; '
-                            'cp "$STUBLOG/slept" "$STUBLOG/slept.start" 2>/dev/null || :; '
+                            'cp "$STUBLOG/ip.log" "$STUBLOG/ip.start" 2>/dev/null || :; '
                             'drv_alive && echo ALIVE; drv_stop; echo "stopped=$?"',
                      MU300_PROC=self.tmp / 'proc', **self.kernel('7.2.10', True))
-        return r, len(self.log('slept.start').split())
+        return r, self.log('ip.start').splitlines().count('-o link show mu300dae')
 
     # what dae's open files look like in /proc/PID/fdinfo once it has bound its programs with tcx (Linux 6.6 on): a
     # link on the LAN bridge (31), then the dummy's (98); written by the stub dae for its own pid, then it stays
@@ -573,6 +579,7 @@ class Dae(Base):
            'attach_type:\\t46 (ingress)\\n" > "$d/9"\n'
            'printf "pos:\\t0\\nflags:\\t02000000\\nlink_type:\\ttcx\\nlink_id:\\t8\\nprog_tag:\\t0a1c\\nifindex:\\t%s\\n'
            'attach_type:\\t47 (egress)\\n" "$IX" > "$d/10"\n'
+           ': > "$STUBLOG/dae.ready"\n'
            'exec /bin/sleep 30')
 
     def test_a_dae_that_binds_with_tcx_is_up(self):
@@ -581,25 +588,27 @@ class Dae(Base):
         sign there."""
         for shell in self.each_shell():
             self.fresh()
-            r, waited = self.start(shell, 'IX=98\n' + self.TCX)
+            (self.tmp / 'await').write_text('')
+            r, rounds = self.start(shell, 'IX=98\n' + self.TCX)
+            (self.tmp / 'await').unlink()
             self.assertIn('STARTED', r.stdout, r.stderr)
             self.assertIn('ALIVE', r.stdout)
             self.assertIn('dae up on mu300dae', r.stdout)
             self.assertNotIn('did not attach', r.stderr)
-            # (the stub writes its files a moment after it starts: one wait at most, not the 40 s that ended in a stop)
-            self.assertLessEqual(waited, 2, r.stdout)
+            # seen in the first round it is there, not after the 40 s that ended in a stop
+            self.assertEqual(rounds, 1, r.stdout)
             # an older kernel: the tc filter on the dummy's egress, at once
-            r, waited = self.start(shell, 'exec /bin/sleep 30',
+            r, rounds = self.start(shell, 'exec /bin/sleep 30',
                                    tc='case "$*" in "filter show dev mu300dae egress") echo "filter protocol all pref 2 bpf chain 0" ;; esac')
             self.assertIn('STARTED', r.stdout, r.stderr)
-            self.assertEqual(waited, 0)
+            self.assertEqual(rounds, 0)
             # a tcx link on another interface only (the LAN's) is not the dummy's: neither sign, but alive - up
             # after 10 s, and not stopped
-            r, waited = self.start(shell, 'IX=31\n' + self.TCX)
+            r, rounds = self.start(shell, 'IX=31\n' + self.TCX)
             self.assertIn('STARTED', r.stdout, r.stderr)
-            self.assertEqual(waited, 9)
+            self.assertEqual(rounds, 10)
             # one that cannot load its programs exits: not up, and nothing of it is left
-            r, waited = self.start(shell, 'echo "FATAL load" >&2; exit 1')
+            r, rounds = self.start(shell, 'echo "FATAL load" >&2; exit 1')
             self.assertNotIn('STARTED', r.stdout)
             self.assertIn('dae exited during start', r.stderr)
             self.assertIn('link del mu300dae', self.log('ip.log').splitlines())
