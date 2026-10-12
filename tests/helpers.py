@@ -73,6 +73,10 @@ class ShellTest(unittest.TestCase):
         e['PATH'] = f'{self.stubs}{os.pathsep}{e.get("PATH", "")}'
         e['STUBLOG'] = str(self.tmp)
         e['LC_ALL'] = 'C.UTF-8' if os.name != 'nt' else e.get('LC_ALL', '')
+        # mu300-vpn run asks the bootstrap resolver whether it answers (bootstrap_pick) before sing-box, mihomo or dae
+        # start: in the tests a command answers in the resolver's place (yes, unless a test says otherwise), so that no
+        # test sends a DNS query from the machine it runs on
+        e['MU300_DNS_PROBE'] = 'true'
         e.update({k: str(v) for k, v in extra.items()})
         return e
 

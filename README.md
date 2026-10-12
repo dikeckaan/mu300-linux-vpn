@@ -104,13 +104,15 @@ echo 'https://panel.example/sub/TOKEN' | sudo mu300-vpn subscription add Work - 
 sudo mu300-vpn subscription refresh --all
 mu300-vpn latency --all                                       # TCP connect time to every profile's server
 sudo mu300-vpn killswitch off                                 # = settings set KILL_SWITCH 0, and a restart
-mu300-vpn logs xray -n 50
+mu300-vpn logs xray -n 50                                     # the lines of the runs on that engine
 ```
 
 (On OpenWrt, without `sudo`.) The type is sniffed from the link's scheme or the file's content; `profile add TYPE
 NAME SRC` says it outright. A profile is checked with its engine when it is imported and again at every start
-(`mu300-vpn check [ID]` does it by hand). `profile show ID` tells name, type, source, date and the server's host and
-port; `profile edit ID SRC` replaces its config, `profile set ID KEY VALUE` sets a per-type option
+(`mu300-vpn check [ID]` does it by hand, `profile check ID` is the same; a mihomo profile is also tested by mihomo
+itself where it is installed). `profile use ID` on a running VPN switches only to a profile that can run here - its
+config checks, its engine is installed - and leaves the VPN as it is otherwise. `profile show ID` tells name, type,
+source, date and the server's host and port; `profile edit ID SRC` replaces its config, `profile set ID KEY VALUE` sets a per-type option
 (`TLS_PIN_SHA256`, `MIHOMO_STACK`, `OVPN_USER`...), `profile remove ID` removes it (not the active one while the VPN
 is on), and `profile export ID` prints the raw config back - the one command that prints a secret. Everything
 lives under `/etc/mu300/vpn` (profiles and settings, 0600, kept across updates; each system - Ubuntu, OpenWrt - has
@@ -127,7 +129,7 @@ VPN that is on uses a new value from its next `mu300-vpn restart`):
 | `TAILSCALE` | 0, 1 | 1 | Tailscale's own traffic through the tunnel (below) |
 | `IPV6` | 0, 1, auto | auto | IPv6 through the tunnel when it has an IPv6 address (auto: WireGuard's own; 1: also ask sing-box/mihomo for one); otherwise IPv6 on the uplinks is rejected while the tunnel is up, so programs fall back to IPv4 at once and nothing leaks beside it |
 | `REMOTE_DNS` | an address | 1.1.1.1 | DNS for the device and its clients, through the tunnel |
-| `BOOTSTRAP_DNS` | an address | 1.1.1.1 | for the server's own name, outside the tunnel (sing-box, mihomo) |
+| `BOOTSTRAP_DNS` | an address | 1.1.1.1 | for the server's own name, outside the tunnel (sing-box, mihomo, dae). When it does not answer on the uplink (a carrier that lets DNS through to its own resolvers only), the uplink's own resolver is used for that run, and the log says so |
 | `LAN_CIDRS` | CIDRs, comma-separated | empty | more networks that stay local (the device's own LAN always does) |
 | `XRAY` `HEV` `SING_BOX` `MIHOMO` `DAE` `OPENVPN` | a path | empty | another binary for that engine |
 
@@ -142,7 +144,7 @@ VPN that is on uses a new value from its next `mu300-vpn restart`):
 |---|---|---|---|
 | [Xray-core](https://github.com/XTLS/Xray-core) 26.3.27 + [hev-socks5-tunnel](https://github.com/heiher/hev-socks5-tunnel) 2.17.1 | VLESS, VMess, Trojan, Shadowsocks links, Xray JSON | `vpn-xray` (`mu300-linux-vpn-xray.tar.gz`) | MPL-2.0, MIT |
 | [sing-box](https://github.com/SagerNet/sing-box) 1.14.1 | VLESS links behind the kill switch (when installed), sing-box JSON | `vpn-singbox` (`mu300-linux-vpn-singbox.tar.gz`) | GPL-3.0-or-later |
-| [mihomo](https://github.com/MetaCubeX/mihomo) 1.19.32 | Clash/mihomo YAML | `vpn-mihomo` (`mu300-linux-vpn-mihomo.tar.gz`) | GPL-3.0 |
+| [mihomo](https://github.com/MetaCubeX/mihomo) 1.19.32 + geodata (`Country.mmdb`, `GeoSite.dat`: what GEOIP and GEOSITE rules read, there before the tunnel is) | Clash/mihomo YAML | `vpn-mihomo` (`mu300-linux-vpn-mihomo.tar.gz`) | GPL-3.0; CC-BY-SA-4.0, GPL-3.0 |
 | [dae](https://github.com/daeuniverse/dae) 2.1.1 + v2fly geodata | dae configs, VLESS/VMess/Trojan/SS/Hysteria2/TUIC links and link subscriptions, as an eBPF transparent proxy; **kernels with BTF only** (mainline, not the 5.4 vendor kernel) | `vpn-dae` (`mu300-linux-vpn-dae.tar.gz`) | AGPL-3.0 |
 | WireGuard | `.conf` | the kernel's, with `wireguard-tools` (in the images; the 5.4 vendor kernel has no WireGuard, mainline does) | GPL-2.0 |
 | OpenVPN | `.ovpn` | the system's package: `apk add openvpn-openssl` (OpenWrt), `apt-get install openvpn` (Ubuntu) | GPL-2.0 |
@@ -156,7 +158,14 @@ Xray through the resolve window, except a link that asks for allowInsecure), bec
 name and fetches its certificate (Xray 26 has no `allowInsecure`: the certificate is fetched once, pinned in the
 profile, and fetched again when the server renews it) before the tunnel exists, and the kill switch would drop both.
 Other types resolve their server's name through a short **resolve window** (only the device's DNS, only for
-seconds), so they all work behind the kill switch.
+seconds), so they all work behind the kill switch. sing-box, mihomo and dae look the name up themselves, at
+`BOOTSTRAP_DNS`; whether that resolver answers on this uplink is asked first (through the same window), and the
+uplink's own resolver takes its place when it does not ([FINDINGS 26i](docs/FINDINGS.md)).
+
+A mihomo profile's `GEOIP` and `GEOSITE` rules read the geodata the `vpn-mihomo` extra carries (copied to
+`/etc/mu300/vpn/cache/mihomo` when a config first needs it; the file's `geo-auto-update: true` has mihomo update it
+from then on); `IP-ASN` rules need `ASN.mmdb`, which is not carried: put it there. A file's `geodata-mode` is not
+used. mihomo logs at `warning` unless the file sets a `log-level`.
 
 ## Security model
 
@@ -246,4 +255,8 @@ The design: [docs/superpowers/specs](docs/superpowers/specs), and the measuremen
   [hev-socks5-tunnel](https://github.com/heiher/hev-socks5-tunnel) (MIT) and
   [mihomo](https://github.com/MetaCubeX/mihomo) (GPL-3.0). They are their projects' release builds, downloaded,
   pinned and checked by hash, not changed; their source is at those links.
+* The geodata in the `vpn-mihomo` extra: `Country.mmdb` from [Loyalsoldier/geoip](https://github.com/Loyalsoldier/geoip)
+  (CC-BY-SA-4.0; it includes GeoLite2 data created by MaxMind, available from https://www.maxmind.com) and
+  `GeoSite.dat` from [Loyalsoldier/v2ray-rules-dat](https://github.com/Loyalsoldier/v2ray-rules-dat) (GPL-3.0), dated
+  releases pinned by hash, not changed.
 * A hobby project, at your own risk, as [mu300-linux](https://github.com/dikeckaan/mu300-linux) is.

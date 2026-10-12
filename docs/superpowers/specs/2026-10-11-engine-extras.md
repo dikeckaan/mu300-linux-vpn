@@ -23,7 +23,7 @@ Audience: the people who run the module, and the LuCI app that is built on the C
 | `mu300-linux-vpn-core.tar.gz` | `vpn` | the core alone: `bin/mu300-vpn`, `lib/vpn`, services, hooks, `install.sh` | mu300-extra / mu300-update from mu300-linux with engine extras (PR `vpn-engine-extras`) |
 | `mu300-linux-vpn-xray.tar.gz` | `vpn-xray` | `bin/xray`, `bin/hev-socks5-tunnel` | |
 | `mu300-linux-vpn-singbox.tar.gz` | `vpn-singbox` | `bin/sing-box` | |
-| `mu300-linux-vpn-mihomo.tar.gz` | `vpn-mihomo` | `bin/mihomo` (unchanged name and layout) | |
+| `mu300-linux-vpn-mihomo.tar.gz` | `vpn-mihomo` | `bin/mihomo` (unchanged name and layout); since the release after v2.0.0 also `share/mihomo/Country.mmdb` and `share/mihomo/GeoSite.dat` (FINDINGS 26j) | |
 | `mu300-linux-vpn-dae.tar.gz` | `vpn-dae` | `bin/dae`, `share/dae/geoip.dat`, `share/dae/geosite.dat` | |
 | `VERSIONS` | - | one TSV line per tarball: `extra  version  bytes  components` (`components`: `name ver,name ver`) | `mu300-vpn engines --json --check` |
 | `SHA256SUMS` | - | every file above | everybody |
@@ -117,7 +117,7 @@ which need root and print the raw config.
 | `mu300-vpn killswitch [on\|off] [--json]` | without an argument prints it; sets `KILL_SWITCH` and restarts a running VPN |
 | `mu300-vpn enabled` | `0` or `1`, nothing else (unchanged) |
 | `mu300-vpn version [--json]` | the module's version and the engines' components |
-| `mu300-vpn logs [ENGINE] [-n N]` | the service's log (journalctl / logread), the last N lines (default 100), filtered to one engine's lines |
+| `mu300-vpn logs [ENGINE] [-n N]` | the service's log (journalctl / logread), the last N lines (default 100), filtered to one engine's lines: those of the runs that said `engine: ENGINE` (FINDINGS 26l) |
 
 `status --json`:
 ```json

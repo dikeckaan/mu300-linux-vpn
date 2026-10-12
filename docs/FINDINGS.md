@@ -156,3 +156,143 @@ leave by rule 9000. A dead dae leaves the dummy as a dead end: closed. `dae vali
 the driver writes (checked in a container); `node()` without a parameter is refused by it ("empty parameter list"),
 so the node lookups go to the bootstrap resolver with `node(name_regex: '.')`. Whether dae's node and subscription
 lookups really leave marked is the device test that remains.
+
+### 26i. An engine that looks its server up itself, on an uplink where only the carrier's resolver answers
+Reported as "a problem in the VPN part, mihomo and the like"; measured on the U30 Air (OpenWrt, kernel 7.2.10, module
+v2.0.0, a SIM on which nothing but the VPN server and the carrier's own DNS answers without the tunnel). The working
+profile is a VLESS link on Xray. The same server as a mihomo YAML, and as a link on sing-box, came up - TUN there,
+routing there, `status` "running" - and carried nothing: `exit IP: unreachable`, and for every connection one line,
+
+    [TCP] dial PROXY ... error: <server>:443 connect error: dns resolve failed: couldn't find ip        (mihomo)
+    connection: open connection to ... using outbound/vless[proxy]: lookup <server>: context deadline exceeded   (sing-box)
+
+sing-box, mihomo and dae resolve their server's name themselves, on their own marked sockets, at `BOOTSTRAP_DNS`
+(1.1.1.1 unless set). On this bearer `nslookup example.com 1.1.1.1` times out, and 8.8.8.8 too; the two resolvers the
+bearer handed out answer at once. Xray never noticed: its driver (and WireGuard's and OpenVPN's) asks the system
+resolver, which is the carrier's. Setting `BOOTSTRAP_DNS` to the carrier's resolver made all three work - the
+workaround, and nothing a user finds.
+
+Now `mu300-vpn run` asks before it writes such an engine's config (`bootstrap_pick`, for a driver that says
+`DRV_BOOTSTRAP=1`): `BOOTSTRAP_DNS` first, then the uplink's own resolvers (`fetch_resolvers`: what the bearer or the
+Wi-Fi client's DHCP gave), and the first that answers is the engine's bootstrap resolver for that run; the setting is
+not changed, and `BOOTSTRAP_DNS` still comes first for the networks whose own resolver lies about the server's name.
+The question is one lookup with a 3 s limit: busybox's or BIND's `nslookup`; without it (Ubuntu's image) one query
+through bash's `/dev/udp` - and `read -n 1` there, not 2: a read of a datagram socket takes the whole datagram, a
+second byte never comes. Behind the kill switch the questions go through the resolve window, opened for these
+addresses too (so a start on these engines is now three nft transactions, as on the others: kill switch, window,
+kill switch); the engine's own lookups stay marked and need none. Nothing answers and there is no default route: the
+run ends and the service manager repeats it, as it does for Xray when its lookup fails (at boot the service starts
+before the bearer). Nothing answers on an uplink that is up: on with `BOOTSTRAP_DNS` as set - a server given by its
+address needs no resolver. sing-box with `UPSTREAM_HTTP_PROXY` is not asked for: its lookup goes through that proxy.
+
+Measured after, with the device's settings untouched (`BOOTSTRAP_DNS='1.1.1.1'`): the log says `BOOTSTRAP_DNS 1.1.1.1
+does not answer on this uplink: the servers' names are looked up at the uplink's resolver ... instead`, and mihomo
+(a plain YAML and one with rule providers and GEOSITE/GEOIP rules), sing-box (the link) and dae each give the server's
+exit address on the device and to a LAN client (a Mac on the USB link: DNS through the router and to 8.8.8.8 and
+9.9.9.9 itself, HTTP, HTTPS, 1 MB down), with the kill switch off and on. Not measured: the bash path (the device
+runs OpenWrt), the start before the bearer (no reboot), an uplink change while the engine runs (it keeps the resolver
+of its start, as Xray keeps the address of its).
+
+### 26j. mihomo: geodata it could only fetch without the tunnel, an IPv6 address nobody asked for, every connection in the log
+Three more on the same device, each seen once the server was found.
+
+**Geodata.** A Clash file with `GEOSITE,...` or `GEOIP,...` rules - most subscriptions - needs `GeoSite.dat` and an
+mmdb. mihomo downloads what its home lacks while it reads the config (also for `-t`), from GitHub, on its marked
+socket: outside the tunnel. Here that is `net/http: TLS handshake timeout` after 10 s, `mihomo -t` fails, and the
+profile never starts: `mihomo rejects the rebuilt config`. Worse, `check` had passed (it did not ask mihomo) and
+`use` had switched to it, so the working tunnel was gone and the device offline until someone switched back over the
+LAN. In mihomo's home `Country.mmdb` (also read as `geoip.metadb` or `geoip.db`, names compared without case) and
+`GeoSite.dat` are enough for both rule kinds; `-t` then takes 0.6 s and nothing is fetched. So the `vpn-mihomo`
+extra carries the two (`share/mihomo`; the tarball goes from 20.7 to 28.1 MB; Loyalsoldier's dated releases, pinned
+by hash in `tools/fetch-mihomo.sh` - mihomo's own source, MetaCubeX/meta-rules-dat, has only a rolling `latest` whose
+commits are orphans), and the driver copies them into the home when the rebuilt config names geoip or geosite and
+the home has none. They stay as copied unless the file says `geo-auto-update: true` (kept from the file now, with
+`geo-update-interval`, as `geox-url` already was; mihomo's downloads go through the tunnel once it runs - by its
+design, not measured here) or they are deleted from the home. `geodata-mode` is no longer kept from the file: with it GEOIP rules read `GeoIP.dat`, a third file of 17 MB for the same countries. `IP-ASN` rules need
+`ASN.mmdb` (9 MB), which is not carried; the refusal says so. And a profile is now tested by mihomo when it is
+imported, edited or checked (where mihomo is installed), and `use` on a running VPN asks what `on` asks - the config
+checks, the engine is installed, the kernel can run it - before it gives up the old tunnel: with the v2.0.0 extra
+(no geodata) the same switch now answers `profile ... does not check: the VPN stays on profile legacy`, exit address
+unchanged, and so does a switch to a profile whose engine was removed (it used to start a download the uplink could
+never finish). mihomo's own message is still not repeated (it quotes the rule or the proxy); only where it points
+is: `(at rules[1], as mihomo counts)`.
+
+**IPv6.** mihomo gives its TUN `fdfe:dcba:9876::1/126` by default (and takes its IPv4 address from the fake-IP
+range, 198.18.0.1/30, whatever `inet4-address` says). The core takes a tunnel with a global-scope IPv6 address for one
+that carries IPv6 (26g): it routed IPv6 into mihomo and left the IPv6 guard off (`status --json`: `"tunnel": true,
+"guard": false`). The server has no IPv6, so `wget https://www.google.com` on the device (uclient-fetch prefers
+IPv6) ended in `SSL error: The connection indicated an EOF` while `wget -4` worked. `inet6-address: []` in the tun
+section gives the TUN no IPv6 address (`[TUN] Tun adapter listening at: mh-mu300([198.18.0.1/30],[])`); the driver
+writes it unless the `IPV6` setting is 1, as the setting's table says. After: guard on, the same wget works; with
+`IPV6=1` the address and the IPv6 route are there as before.
+
+**The log.** mihomo's default level, info, writes `[TCP] a --> b match ... using PROXY[...]` for every connection of
+every client into the system log, which pushes the service's own lines out of its ring within minutes and keeps a
+list of where the LAN went. The driver writes `log-level: warning` when the file names none.
+
+### 26k. dae never came up: tcx, and a start that waited for a tc filter
+dae had not been run on a device (26h says so). On 7.2.10 the service logged, every 40 s,
+
+    dae did not attach to mu300dae within 40 s
+    mu300-vpn: line 380: can't open /run/mu300-vpn/dae/lan: no such file
+
+and started it again. dae itself was fine: by hand, with the routing the core would add, its log reaches `Bind to
+LAN: br-lan`, `Bind to WAN: mu300dae`, `Total startup time: 995ms`, and the device and a LAN client leave through
+its node. The driver waited for `tc filter show dev mu300dae egress` to list a bpf filter. From Linux 6.6 on dae
+attaches with tcx, which tc does not list (`tc filter show` is empty on the dummy, the bridge and dae0 while it
+works), there is no bpftool on the device, and its listener is in a namespace of its own (`daens`, behind a netkit
+pair), so the tproxy port is not in `/proc/net/tcp` either. Both mainline kernels this project ships are past 6.6: the
+wait could not end well on any device. What does show is in `/proc/<dae>/fdinfo`: one of its open files is a BPF link
+with `link_type: tcx` and the dummy's `ifindex` (six tcx links in all: the dummy, the bridge, dae0 and its peer). The
+start is now "a tc filter (older kernels), or that tcx link, or dae alive for 10 s"; a dae that cannot load its
+programs exits, which the loop sees, and until they are bound what the core routes into the dummy ends there. The
+second line was `dae_cleanup` reading a file a failed start never wrote.
+
+Measured after (node: a Shadowsocks server on the USB link, since dae refuses the working profile's link: it asks
+for `allowInsecure`, the server's certificate has expired, and dae cannot pin one): `dae up on mu300dae and br-lan`
+one second after `dae config OK`, the node's exit address on the device and on the LAN client, with the kill switch
+off and on - which answers 26h's open question: dae's own connections leave marked, the kill switch lets them out
+and nothing else. A link subscription with `--type dae` gave one profile with its nodes.
+
+### 26l. The panel's view of an engine: logs that hid its errors, latency that was always "unreachable", a check that did not exist
+* `logs ENGINE` took the lines that name the engine. An engine's own lines do not: they are logged under the
+  service's name like everything else. For mihomo that left the two lines this script writes and none of the `dial
+  ... error` lines of 26i; for sing-box the pattern was also `sing`, which is in "using" - every mihomo connection
+  line - and for dae it took the kernel's lines about `dae0`. `run` now prints `engine: NAME (profile ID)` first, and
+  the lines of that process id are the engine's; lines of runs from before are matched by name as they were.
+  sing-box runs with `--disable-color` (its `ERROR` came as `\u001b[31mERROR\u001b[0m` in the panel), and `logs`
+  strips the colour codes of older lines.
+* `latency` without curl (OpenWrt) fetched `http://server:port/` with `wget -q` and read the error text. OpenWrt's
+  wget is uclient-fetch, whose `-q` prints nothing, so every server that does not answer plain HTTP with 200 was
+  `unreachable` - all of them, the running profile's included. Without `-q` it says `HTTP error 400` or `Connection
+  reset prematurely` for a server that answered and `Connection timed out` / `Failed to send request` for one that
+  did not. That still calls a silent server dead (a Shadowsocks server answers nothing to a stranger; this carrier
+  drops plain HTTP to the VPN server's port 443). busybox's `nc HOST PORT </dev/null` connects and ends: the connect
+  and nothing else, 90 ms to the running Xray profile's server. But in a tunnel the engine's own TCP answers the
+  connect on the device whatever is at the far end (10 ms for every server through dae), so nc is used for a
+  connection whose route is not the tunnel (no VPN, the running Xray profile's server, a server on the LAN) and the
+  fetch for the rest. curl, where there is one (Ubuntu), still times the connect in both cases, as before: through a
+  tunnel that number says little. In `latency --all --json` a profile with no server (mihomo) carried the host and
+  port of the profile before it.
+* `profile check ID`, which the spec's table lists and the control panel calls, did not exist: the panel's check
+  always answered with the usage text. It is `check ID` now.
+* Seen and left as it is: with the kill switch off, a run that finds its engine missing waits in `mu300-extra
+  install` (on this uplink until its downloads time out, minutes); an engine installed by hand meanwhile is picked up
+  only after that, and a service stopped meanwhile leaves that download running. `mu300-vpn restart` gets past both,
+  and `use` no longer leads there.
+
+### 26m. A raw sing-box config that says nothing about DNS left the device without names
+A sing-box JSON with outbounds and `route.final` and no `dns` section or hijack rule (some panels export just that)
+imported, checked and connected on the U30 Air: the exit address was there, a LAN client with its own DNS (8.8.8.8)
+worked - and after the resolver's cache had run out, the device itself and every client that asks the router had no
+names: `nslookup example.com 127.0.0.1` "connection timed out; no servers could be reached". dnsmasq forwards to the
+resolver the bearer handed out; sing-box's auto_route sends that into the tunnel like everything else; and from the
+far end of the tunnel the carrier's resolver does not answer (through the same tunnel 1.1.1.1 does). For every other
+driver the core redirects the device's own port-53 traffic to `REMOTE_DNS` (`mu300_vpn_dns`, in routes_up); for
+sing-box, which routes by itself, it did not - 26f says "the core only adds the Tailscale rules and the DNS nat", and
+only the first was true. A link's config never showed it: it answers every DNS packet itself (`hijack-dns`).
+
+`run` now loads the redirect for sing-box too (`dns_nat_up`, before the engine starts; the next start and `off` take
+it down with the rest). Measured: the same raw profile resolves names it had never asked for, on the device and
+for the LAN client through the router; the link profile is unchanged (its hijack takes the redirected packets as it
+took the others).

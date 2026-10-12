@@ -10,6 +10,10 @@ DRV_KEYS=UPSTREAM_HTTP_PROXY
 DRV_ROUTES=self
 DRV_FOREGROUND=1
 TUN=sbtun
+# sing-box looks the server's name up at BOOTSTRAP_DNS itself: the core tries first that it answers on this uplink
+# (bootstrap_pick). Not with UPSTREAM_HTTP_PROXY: the lookup then goes through that proxy, where the device cannot try.
+DRV_BOOTSTRAP=1
+[ -z "${UPSTREAM_HTTP_PROXY:-}" ] || DRV_BOOTSTRAP=
 
 drv_engines() { printf '%s\n' "$BIN"; }
 drv_engines_ok() { [ -x "$BIN" ]; }
@@ -24,7 +28,8 @@ drv_check() {
     ( link_need; parse_uri )
 }
 drv_gen() { if singbox_raw; then gen_singbox_json; else gen_singbox; fi; }
-drv_start() { exec "$BIN" run -c "$RUN/config.json"; }
+# (--disable-color: its log goes to the system log and the control panel, where the colour codes are noise)
+drv_start() { exec "$BIN" run -c "$RUN/config.json" --disable-color; }
 drv_alive() { ip link show "$TUN" >/dev/null 2>&1; }
 # exec'd: nothing of its own is left to stop here, and it removes its TUN when it exits
 drv_stop() { :; }

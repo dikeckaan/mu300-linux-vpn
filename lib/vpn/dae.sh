@@ -26,6 +26,9 @@ DRV_KEYS='DAE_LAN DAE_POLICY'
 DRV_ROUTES=core
 TUN=mu300dae
 DAEPID=; DRV_GONE=
+# dae looks its nodes' names up at BOOTSTRAP_DNS itself: the core tries first which resolver answers on this uplink
+# (bootstrap_pick)
+DRV_BOOTSTRAP=1
 DAE_SCHEMES='vless vmess trojan ss hysteria2 hy2 tuic'
 DAE_ADDR=198.18.9.1/30
 
@@ -342,6 +345,19 @@ dae_bpffs() {
     grep -q ' /sys/fs/bpf bpf ' /proc/mounts 2>/dev/null && return 0
     mkdir -p /sys/fs/bpf 2>/dev/null; mount -t bpf bpf /sys/fs/bpf 2>/dev/null || true
 }
+# dae_tcx: dae holds a tcx link on the dummy - one of its open files is a BPF link of that kind on $TUN's index
+# (/proc/PID/fdinfo: "link_type: tcx", "ifindex: N"). (MU300_PROC: tests/)
+DAE_PROC=${MU300_PROC:-/proc}
+dae_tcx() {
+    _ix=$(ip -o link show "$TUN" 2>/dev/null | sed -n 's/^\([0-9][0-9]*\):.*/\1/p' | head -n 1)
+    [ -n "$_ix" ] && [ -n "$DAEPID" ] || return 1
+    for _f in "$DAE_PROC/$DAEPID"/fdinfo/*; do
+        [ -r "$_f" ] || continue
+        if grep -q '^link_type:[[:space:]]*tcx' "$_f" 2>/dev/null &&
+           grep -q "^ifindex:[[:space:]]*$_ix\$" "$_f" 2>/dev/null; then return 0; fi
+    done
+    return 1
+}
 # the core runs this without set -e: every failing step returns 1 itself (and undoes what it made)
 drv_start() {
     DAEPID=; DRV_PIDS=
@@ -353,18 +369,21 @@ drv_start() {
     dae_bpffs
     DAE_LOCATION_ASSET=$(dae_assets) "$(dae_bin)" run --disable-timestamp -c "$DAE_DIR/config.dae" < /dev/null &
     DAEPID=$!; DRV_PIDS=$DAEPID
-    # up when its program sits on the dummy's egress (tc), or after 8 s alive where there is no tc to ask
+    # Up when dae has bound its program to the dummy's egress. On kernels before 6.6 that is a tc filter, which tc
+    # lists. From 6.6 on dae attaches with tcx, which tc does not list (nor does anything else on the device: there is
+    # no bpftool), and waiting for a tc filter there stopped a dae that worked, every 40 s, for ever (FINDINGS 26k):
+    # there the sign is the tcx link dae itself holds on the dummy (dae_tcx). Neither after 10 s, and dae alive: on
+    # (an attachment this does not know to look for). A dae that cannot load its programs exits, which the loop
+    # sees; and until they are bound, what the core routes into the dummy ends there - closed, never past the tunnel.
     _n=0
     while :; do
         if ! kill -0 "$DAEPID" 2>/dev/null; then
             wait "$DAEPID" 2>/dev/null || true
             echo "dae exited during start" >&2; DAEPID=; DRV_PIDS=; dae_cleanup; return 1
         fi
-        if command -v tc >/dev/null 2>&1; then
-            tc filter show dev "$TUN" egress 2>/dev/null | grep -q bpf && break
-        elif [ "$_n" -ge 8 ]; then break; fi
-        _n=$((_n + 1))
-        [ "$_n" -lt 40 ] || { echo "dae did not attach to $TUN within 40 s" >&2; drv_stop; return 1; }
+        if command -v tc >/dev/null 2>&1 && tc filter show dev "$TUN" egress 2>/dev/null | grep -q bpf; then break; fi
+        if dae_tcx; then break; fi
+        _n=$((_n + 1)); [ "$_n" -lt 10 ] || break
         sleep 1
     done
     echo "dae up on $TUN and $(cat "$DAE_DIR/lan" 2>/dev/null || echo 'no LAN interface') (dae $DAEPID)"
@@ -376,8 +395,8 @@ drv_alive() {
 # dae_cleanup: what a dae that did not exit cleanly can leave - its programs on the LAN interfaces (the LAN's packets
 # would go to a tproxy port nobody listens on), the dummy, the runtime config (it holds the credentials)
 dae_cleanup() {
-    if command -v tc >/dev/null 2>&1; then
-        for _i in $(tr ',' ' ' < "$DAE_DIR/lan" 2>/dev/null); do
+    if command -v tc >/dev/null 2>&1 && [ -r "$DAE_DIR/lan" ]; then
+        for _i in $(tr ',' ' ' < "$DAE_DIR/lan"); do
             case $_i in *[!A-Za-z0-9_.-]*) continue ;; esac
             for _d in ingress egress; do
                 tc filter show dev "$_i" "$_d" 2>/dev/null | grep -q 'tproxy' && tc filter del dev "$_i" "$_d" 2>/dev/null

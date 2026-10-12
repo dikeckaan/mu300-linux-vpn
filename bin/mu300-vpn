@@ -19,7 +19,7 @@
 #   mu300-vpn status    profile, kill switch, engine, tunnel, exit IP
 #   mu300-vpn enabled   ENABLE from vpn.conf (0 or 1), nothing else and no network (mu300-power asks it before it
 #                       starts again a VPN it stopped while the modem was off)
-#   mu300-vpn profile list|show|add|import|edit|set|remove|use|export   the profiles (export: the one command
+#   mu300-vpn profile list|show|add|import|edit|set|remove|use|check|export   the profiles (export: the one command
 #                       that prints a profile's credentials; add, import and edit read the link or the config
 #                       from stdin when it is given as -, which keeps it out of the process list)
 #   mu300-vpn settings [get [KEY] | set KEY VALUE]
@@ -425,7 +425,8 @@ engines_ok() { case "$ENGINE" in xray) [ -x "$XRAY" ] && [ -x "$HEV" ] ;; *) [ -
 # The core calls drv_start as "drv_start || exit 1", and a function called that way runs without set -e: a step that
 # fails does not end it. Every step of a driver's drv_start whose failure would leave half a tunnel must therefore
 # return non-zero itself (cmd || return 1), or the core would route into a tunnel that is not there.
-DRIVER=; DRV_EXTRA=vpn; DRV_PKG=; DRV_ROUTES=core; DRV_FOREGROUND=0; DRV_PIDS=; DRV_GONE=; DRV_KEYS=
+# DRV_BOOTSTRAP=1: the engine looks its servers' names up itself, at BOOTSTRAP_DNS (see bootstrap_pick)
+DRIVER=; DRV_EXTRA=vpn; DRV_PKG=; DRV_ROUTES=core; DRV_FOREGROUND=0; DRV_PIDS=; DRV_GONE=; DRV_KEYS=; DRV_BOOTSTRAP=
 drv_engines() { case $ENGINE in xray) printf '%s\n' "$XRAY" "$HEV" ;; *) printf '%s\n' "$BIN" ;; esac; }
 drv_engines_ok() { engines_ok; }
 drv_status() { :; }
@@ -449,7 +450,7 @@ load_driver() {
     [ -r "$LIB/$1.sh" ] || { echo "$1: no driver for this profile type ($LIB/$1.sh)" >&2; return 1; }
     _drv=$1
     # what a driver does not set is the default; drv_status, drv_poll, drv_runnable and drv_set are optional
-    DRV_ROUTES=core; DRV_FOREGROUND=0; TUN=; DRV_PIDS=; DRV_EXTRA=; DRV_PKG=; DRV_GONE=; DRV_KEYS=
+    DRV_ROUTES=core; DRV_FOREGROUND=0; TUN=; DRV_PIDS=; DRV_EXTRA=; DRV_PKG=; DRV_GONE=; DRV_KEYS=; DRV_BOOTSTRAP=
     drv_status() { :; }
     drv_poll() { :; }
     drv_runnable() { :; }
@@ -938,6 +939,98 @@ vpn_resolve() {
     printf '%s\n' "$_ip"
 }
 
+# ---- the bootstrap resolver -----------------------------------------------------------------------------------
+# sing-box, mihomo and dae look their servers' names up themselves, on their own marked sockets, at BOOTSTRAP_DNS
+# (1.1.1.1 unless set). On some uplinks nothing answers there: a carrier that lets DNS through to its own resolvers
+# only (the U30 Air's SIM, FINDINGS 26i: the engine came up, never found its server, and the device had a tunnel and
+# no internet). So before such an engine's config is written, the resolver is asked from this device, and after it
+# the uplink's own (what the bearer or the Wi-Fi client's DHCP handed out: fetch_resolvers); the first that answers
+# is BOOTSTRAP_DNS for this run. Xray, WireGuard and OpenVPN have always asked the uplink's resolver (vpn_resolve),
+# so no one learns a name they did not learn before, and BOOTSTRAP_DNS still goes first, for the networks whose own
+# resolver lies about the server's name.
+#
+# dns_answers ADDR: a DNS server at ADDR answers this device within 3 s - any answer: the question is only whether
+# the uplink lets DNS to it through. 0 yes, 1 no, 2 nothing here to ask with (then nothing is changed). busybox's and
+# BIND's nslookup say "timed out" / "no servers could be reached" when nothing came back; without nslookup (Ubuntu's
+# image) bash's /dev/udp sends one query (the root's NS, id "mu") and waits for the first byte of a reply (one byte:
+# a read of a datagram socket takes the whole datagram, so a second byte would never come).
+# (MU300_DNS_PROBE: tests/, a command that answers in its place; MU300_DNS_PORT, MU300_NO_NSLOOKUP: tests/)
+DNS_PORT=${MU300_DNS_PORT:-53}
+dns_answers() {
+    if [ -n "${MU300_DNS_PROBE:-}" ]; then "$MU300_DNS_PROBE" "$1"; return; fi
+    if [ -z "${MU300_NO_NSLOOKUP:-}" ] && command -v nslookup >/dev/null 2>&1; then
+        _o=$(nslookup -timeout=3 -retry=1 -port="$DNS_PORT" example.com "$1" 2>&1 </dev/null) && return 0
+        case $_o in ''|*"timed out"*|*"no servers"*|*nreachable*|*refused*|*"not permitted"*) return 1 ;; esac
+        return 0
+    fi
+    command -v bash >/dev/null 2>&1 || return 2
+    LC_ALL=C bash -c 'exec 3<>"/dev/udp/$1/$2" || exit 1
+        printf "mu\001\000\000\001\000\000\000\000\000\000\000\000\002\000\001" >&3 || exit 1
+        IFS= read -r -t 3 -n 1 -u 3 _r; [ "$_r" = m ]' mu300-dns "$1" "$DNS_PORT" 2>/dev/null
+}
+# uplink_up: there is a default route outside the tunnel's table (a bearer, the Wi-Fi client, USB)
+uplink_up() { [ -n "$(ip -4 route show default 2>/dev/null)" ] || [ -n "$(ip -6 route show default 2>/dev/null)" ]; }
+# bootstrap_candidates: BOOTSTRAP_DNS, then the uplink's resolvers, each once, addresses only
+bootstrap_candidates() {
+    { printf '%s\n' "$BOOTSTRAP_DNS"; fetch_resolvers; } | while IFS= read -r _a; do
+        if ip4_ok "$_a" || ip6_ok "$_a"; then printf '%s\n' "$_a"; fi
+    done | awk '!seen[$0]++'
+}
+# bootstrap_allow ADDRS: the device's own DNS to these addresses through the open resolve window, for 30 s
+bootstrap_allow() {
+    _d4=; _d6=
+    for _a in $1; do
+        case $_a in *:*) _d6="$_d6${_d6:+, }$_a timeout 30s" ;; *) _d4="$_d4${_d4:+, }$_a timeout 30s" ;; esac
+    done
+    [ -z "$_d4" ] || nft add element inet mu300_vpn dns4 "{ $_d4 }" 2>/dev/null || true
+    [ -z "$_d6" ] || nft add element inet mu300_vpn dns6 "{ $_d6 }" 2>/dev/null || true
+}
+# bootstrap_pick: BOOTSTRAP_DNS set, for this run, to the first candidate that answers (the setting stays as it is:
+# the next start asks again). Only for a driver that says DRV_BOOTSTRAP=1, only in run, and after the previous run's
+# routing is gone: the questions go out over the uplink. Behind the kill switch they go through the resolve window,
+# opened for these addresses too (the window the other drivers' lookups use; the engine's own lookups need none, they
+# are marked). Three rounds, 2 s apart (a bearer that has just come up). When nothing answers: without an uplink the
+# run ends here (1) and the service manager starts it again, as it does for the drivers whose own lookup fails; with
+# one, the run goes on with BOOTSTRAP_DNS as it is - a server given by its address needs no resolver at all.
+bootstrap_pick() {
+    [ -n "$DRV_BOOTSTRAP" ] || return 0
+    _bc=$(bootstrap_candidates)
+    [ -n "$_bc" ] || return 0
+    _bw=
+    if [ "$ENABLE" = 1 ] && [ "$KILL_SWITCH" = 1 ]; then
+        resolve_window || { resolve_close; echo "could not open the resolve window" >&2; return 1; }
+        _bw=1
+    fi
+    _bn=0; _bp=
+    while :; do
+        if [ -n "$_bw" ]; then bootstrap_allow "$_bc"; fi
+        for _a in $_bc; do
+            _rc=0; dns_answers "$_a" || _rc=$?
+            if [ "$_rc" = 0 ]; then _bp=$_a; break 2; fi
+            # nothing to ask with: as it was before this existed
+            if [ "$_rc" = 2 ]; then _bp=$BOOTSTRAP_DNS; break 2; fi
+        done
+        _bn=$((_bn + 1)); [ "$_bn" -lt 3 ] || break
+        sleep 2
+    done
+    if [ -n "$_bw" ]; then resolve_close || return 1; fi
+    if [ -z "$_bp" ]; then
+        if ! uplink_up; then
+            echo "no uplink yet (no default route, and no DNS server answers): not started, the service tries again" >&2
+            return 1
+        fi
+        echo "no DNS server answers on the uplink (BOOTSTRAP_DNS $BOOTSTRAP_DNS, the uplink's own resolvers): going" \
+            "on with $BOOTSTRAP_DNS; a server given by its name will not be found" >&2
+        return 0
+    fi
+    if [ "$_bp" != "$BOOTSTRAP_DNS" ]; then
+        echo "BOOTSTRAP_DNS $BOOTSTRAP_DNS does not answer on this uplink: the servers' names are looked up at the" \
+            "uplink's resolver $_bp instead" >&2
+    fi
+    BOOTSTRAP_DNS=$_bp
+    return 0
+}
+
 # ---- the tunnel's routing -------------------------------------------------------------------------------------
 # What sing-box's auto_route does itself, for every driver that leaves it to the core (DRV_ROUTES=core): rule 9000
 # keeps the engine's own marked connections off the tunnel, 9001 the LAN, 9002 the servers' addresses
@@ -968,10 +1061,16 @@ routes_up() {
         ip -6 rule add pref 9010 lookup "$TABLE"
     fi
     tailscale_up
-    # the device's own lookups: dnsmasq forwards to whatever the bearer handed out, and the carrier's resolver
-    # does not answer from the far end of the tunnel. Send them to the tunnel's DNS ($RUN/dns, from the driver) or
-    # REMOTE_DNS instead, which the routing above then carries through the tunnel. Clients that use their own DNS
-    # are already going through it. An IPv4 table: the first IPv4 address of the two.
+    dns_nat_up
+}
+# dns_nat_up: the device's own lookups. dnsmasq forwards to whatever the bearer handed out, and the carrier's resolver
+# does not answer from the far end of the tunnel. Send them to the tunnel's DNS ($RUN/dns, from the driver) or
+# REMOTE_DNS instead, which the tunnel's routing then carries through it. Clients that use their own DNS are
+# already going through it. An IPv4 table: the first IPv4 address of the two. For every driver, sing-box too (it
+# routes by itself, DRV_ROUTES=self, and a link's config answers every DNS packet itself - but a raw config need not:
+# one with outbounds and nothing about DNS left the device, and every client that asks the router, without names,
+# FINDINGS 26m). The engine's own lookups are marked and stay as they are.
+dns_nat_up() {
     _dns=
     if [ -r "$RUN/dns" ]; then
         while IFS= read -r _a || [ -n "$_a" ]; do ip4_ok "$_a" && { _dns=$_a; break; }; done < "$RUN/dns"
@@ -1485,7 +1584,7 @@ profile_line() {
 profile_usage() {
     echo "usage: mu300-vpn profile list [--json] | show ID [--json [--reveal]] | add TYPE NAME FILE|URI|- |" \
         "import FILE|URI|- [NAME] | import --url URL|- [NAME] | edit ID FILE|URI|- | set ID KEY VALUE | remove ID |" \
-        "use ID | export ID   (-: from stdin)" >&2
+        "use ID | check ID | export ID   (-: from stdin)" >&2
     exit 2
 }
 profile_cmd() {
@@ -1569,6 +1668,21 @@ profile_cmd() {
             kv_var _type "$PROFILES/$1/meta" TYPE
             # a type this version cannot run never becomes the active one
             load_driver "$_type" || exit 1
+            # While the VPN is on, the switch restarts the service on the new profile, and the old tunnel is gone
+            # before the new one is tried. A profile that cannot run here (its engine not installed, a kernel dae
+            # cannot use, a config that does not check) would leave the device without a tunnel - and where only
+            # the tunnel gets out, without the connection its engine would have to be downloaded over. So what
+            # "on" asks of the active profile is asked of this one first (can_run), and the VPN stays as it is when
+            # it fails. (A subshell: the profile is loaded as the next start will load it, and nothing of that
+            # stays here.)
+            if [ "$ENABLE" = 1 ] && [ "$1" != "$ACTIVE" ]; then
+                ( _was=${ACTIVE:-none}
+                  profile_load "$1"; ACTIVE=$1
+                  if [ -z "${ENGINE:-}" ]; then [ "$KILL_SWITCH" = 1 ] && ENGINE=sing-box || ENGINE=xray; fi
+                  _engine=$ENGINE; DRIVER=; pick_engines
+                  can_run "$1" "the VPN stays on profile $_was" ) || exit 1
+                load_driver "$_type" || exit 1
+            fi
             set_active "$1" || { echo "could not make profile $1 the active one" >&2; exit 1; }
             echo "profile $1 is the active one"
             # The service's next run replaces the kill switch in one transaction like any restart, so it stays up
@@ -1582,6 +1696,11 @@ profile_cmd() {
                 if [ -r "$PROFILES/$1/$_f" ]; then cat "$PROFILES/$1/$_f"; return 0; fi
             done
             echo "profile $1 has no config" >&2; exit 1 ;;
+        # profile check ID: mu300-vpn check ID, under the name the spec's table and the control panel use
+        check)
+            [ $# -eq 1 ] || profile_usage
+            profile_arg "$1"
+            main check "$1" ;;
         *) profile_usage ;;
     esac
 }
@@ -1620,17 +1739,24 @@ settings_cmd() {
     esac
 }
 
+# can_run WHO THEN: the loaded profile (WHO, for the messages) can run here - its driver loads, its config checks,
+# its engine is installed and runs on this system. Else 1 and why, ending in THEN (what happens instead). Asked
+# before the VPN is turned on, and before a running VPN is switched to another profile.
+can_run() {
+    load_driver "$PTYPE" || return 1
+    ( drv_check ) || { echo "profile $1 does not check: $2" >&2; return 1; }
+    drv_engines_ok || { echo "the engines of profile $1 are not installed: run mu300-vpn engines install $(type_engine "$PTYPE") ($2)" >&2; return 1; }
+    drv_runnable || { echo "profile $1 cannot run on this system: $2" >&2; return 1; }
+    # a VLESS xray profile behind the kill switch needs sing-box (vless_on_sing_box), which run would refuse later
+    _m=$( (vless_on_sing_box) 2>&1 >/dev/null ) || { printf '%s\n' "$_m" >&2; return 1; }
+    return 0
+}
 # on: the active profile checked, its engines there, then ENABLE=1 and the service enabled and (re)started
 vpn_on() {
     if [ -n "$STORE" ]; then _have=$ACTIVE; else _have=$PURI; fi
     [ -n "$_have" ] || { echo "no active profile: mu300-vpn profile use ID" >&2; exit 1; }
     _who=${ACTIVE:-vpn.conf}
-    load_driver "$PTYPE" || exit 1
-    ( drv_check ) || { echo "profile $_who does not check: the VPN is not turned on" >&2; exit 1; }
-    drv_engines_ok || { echo "the engines of profile $_who are not installed: run mu300-vpn engines install $(type_engine "$PTYPE")" >&2; exit 1; }
-    drv_runnable || { echo "profile $_who cannot run on this system: the VPN is not turned on" >&2; exit 1; }
-    # a VLESS xray profile behind the kill switch needs sing-box (vless_on_sing_box), which run would refuse later
-    _m=$( (vless_on_sing_box) 2>&1 >/dev/null ) || { printf '%s\n' "$_m" >&2; exit 1; }
+    can_run "$_who" "the VPN is not turned on" || exit 1
     set_enable 1 || { echo "could not write ENABLE=1 to $CONF" >&2; exit 1; }
     svc enable
     svc restart
@@ -1819,7 +1945,29 @@ killswitch_cmd() {
     esac
 }
 
-# logs [ENGINE] [-n N]: the service's log, the last N lines, only the lines that name ENGINE when one is given
+# logs_engine ENGINE: of the log on stdin, the lines of the runs on that engine. The engines' own lines do not name
+# them - mihomo's "[TCP] dial ... error", sing-box's "ERROR ... outbound/vless" are logged under the service's name
+# like everything else - so picking the lines that say "mihomo" showed the two that this script wrote and none of
+# the errors, and "sing" (for sing-box) matched every line with "using" in it (FINDINGS 26l). Every run says which
+# engine it is ("engine: NAME", the first thing run prints) under its own process id, which the system log puts on
+# each line of that run: those are the lines. A line of a run that did not say (a module before this one) is taken
+# when it names the engine, as before; a line that is not the service's, when it is logged under the engine's name.
+logs_engine() {
+    awk -v e="$1" '
+    { p = ""
+      if (match($0, /mu300-vpn\[[0-9]+\]/)) p = substr($0, RSTART, RLENGTH)
+      if (p != "" && match($0, /mu300-vpn\[[0-9]+\]: engine: [a-z-]+/)) {
+          s = substr($0, RSTART, RLENGTH); sub(/.*engine: /, "", s); run[p] = s
+      }
+      if (p != "" && (p in run)) { if (run[p] == e) print; next }
+      l = tolower($0)
+      # (a line that is not one of the service: only when it is logged under the name of the engine, "xray[123]:")
+      if (p == "") { if (index(l, e "[") || (e == "xray" && index(l, "hev-socks5-tunnel["))) print; next }
+      if (index(l, e) || (e == "xray" && index(l, "hev-socks5"))) print
+    }'
+}
+# logs [ENGINE] [-n N]: the service's log, the last N lines; with ENGINE, only the lines of the runs on that engine.
+# Without the colour codes an engine writes (sing-box before --disable-color, a raw config's own log settings).
 logs_cmd() {
     _n=100; _e=
     while [ $# -gt 0 ]; do
@@ -1836,19 +1984,34 @@ logs_cmd() {
         journalctl -u mu300-vpn --no-pager -o short -n "$_ln" 2>/dev/null
     elif command -v logread >/dev/null 2>&1; then
         # procd logs the service's output (the engines' too) under the command's name
-        logread 2>/dev/null | grep -E 'mu300-vpn|xray|sing-box|mihomo|dae|openvpn|hev-socks5'
+        # (an engine's name as a tag: "dae" alone is also in the kernel's lines about dae's link, dae0)
+        logread 2>/dev/null | grep -E 'mu300-vpn|(xray|sing-box|mihomo|dae|openvpn|hev-socks5-tunnel)\['
     else
         echo "no journalctl or logread here" >&2; exit 1
-    fi | { if [ -n "$_e" ]; then grep -i -e "$_e" -e "${_e%-*}"; else cat; fi; } | tail -n "$_n"
+    fi | { if [ -n "$_e" ]; then logs_engine "$_e"; else cat; fi; } | tail -n "$_n" |
+        sed "s/$(printf '\033')\[[0-9;]*m//g"
     return 0
 }
 
 # ---- latency ---------------------------------------------------------------------------------------------------
 # now_ms: milliseconds of uptime (date's %N is not in every busybox)
 now_ms() { awk '{printf "%d\n", $1 * 1000}' /proc/uptime 2>/dev/null || echo 0; }
+# tunnel_up: the service's tunnel is there
+tunnel_up() { [ -r "$RUN/iface" ] && ip link show "$(cat "$RUN/iface")" >/dev/null 2>&1; }
+# through_tunnel HOST: a connection from this device to HOST would go into the service's tunnel - one is up, and the
+# route to HOST's address is its interface (an address that cannot be had counts as through it). Not through it: the
+# running Xray profile's own server (rule 9002), a server on the LAN.
+through_tunnel() {
+    tunnel_up || return 1
+    _ti=$(cat "$RUN/iface")
+    case $1 in *:*) _ta=$1 ;; *) _ta=$(resolve4 "$1") || _ta= ;; esac
+    [ -n "$_ta" ] || return 0
+    ip route get "$_ta" 2>/dev/null | grep -q " dev $_ti\( \|\$\)"
+}
 # tcp_ms HOST PORT: the time a TCP connect takes, in ms (stdout), or an error word (stdout) and 1. curl measures the
-# connect itself; without it, a wget to the port times the connect plus the server's first answer (it speaks HTTP to
-# whatever is there, and only "refused", "timed out" or "unreachable" count as failures).
+# connect itself, and so does busybox's nc for a connection outside the tunnel; else a wget to the port times the
+# connect plus the server's first answer (it speaks HTTP to whatever is there, and only "refused", "timed out" or
+# "unreachable" count as failures).
 tcp_ms() {
     case $1 in *:*) _h="[$1]" ;; *) _h=$1 ;; esac
     # (MU300_NO_CURL: tests/, the OpenWrt path on a machine that has curl)
@@ -1860,18 +2023,42 @@ tcp_ms() {
         awk -v t="$_t" 'BEGIN {printf "%d\n", t * 1000 + 0.5}'
         return 0
     fi
+    # busybox's nc (OpenWrt, which has no curl): "nc HOST PORT" with nothing to send connects and ends - the connect and
+    # nothing else, so a server that says nothing to a stranger (Shadowsocks) counts too. It has no timeout of its
+    # own: ended after 5 s here. Only for a connection that does not go into the tunnel: in one, the connect is
+    # answered by the engine on the device (its TUN's own TCP), whatever is or is not at the far end - there the
+    # fetch below, which waits for the server's first answer, is the one that says something. (MU300_NO_NC: tests/)
+    if [ -z "${MU300_NO_NC:-}" ] && ! through_tunnel "$1" && nc --help 2>&1 | grep -q BusyBox; then
+        _s=$(now_ms)
+        nc "$1" "$2" </dev/null >/dev/null 2>&1 &
+        _p=$!
+        ( sleep 5; kill "$_p" 2>/dev/null ) >/dev/null 2>&1 &
+        _w=$!
+        _r=0; wait "$_p" 2>/dev/null || _r=$?
+        kill "$_w" 2>/dev/null || true
+        _e=$(now_ms)
+        [ "$_r" = 0 ] || { echo unreachable; return 1; }
+        echo $((_e - _s))
+        return 0
+    fi
     # one tool, one try: a failure counts as a connect only when the tool says the server answered something (an HTTP
     # error, a reply that is not HTTP, a reset after the connect); anything else - a timeout above all, whatever its
-    # wording - is unreachable, and so is anything that took the whole timeout
-    if command -v wget >/dev/null 2>&1; then _tool=wget; else _tool=uclient-fetch; fi
+    # wording - is unreachable, and so is anything that took the whole timeout.
+    # OpenWrt's own fetcher first (its wget is a link to it), and without -q: uclient-fetch -q says nothing at all, so
+    # "the server answered with an HTTP error" and "nothing connected" looked the same, and every server that does
+    # not speak plain HTTP on its port - every VPN server - was unreachable (FINDINGS 26l). Its words: "HTTP error
+    # 400" and "Connection reset prematurely" for a server that answered; "Connection timed out", "Connection
+    # failed" and "Failed to send request" for one that did not.
+    if command -v uclient-fetch >/dev/null 2>&1; then _tool=uclient-fetch; _q=; else _tool=wget; _q=-q; fi
     _s=$(now_ms)
-    _o=$("$_tool" -q -O /dev/null -T 5 "http://$_h:$2/" 2>&1 </dev/null) && _r=0 || _r=1
+    _o=$("$_tool" $_q -O /dev/null -T 5 "http://$_h:$2/" 2>&1 </dev/null) && _r=0 || _r=1
     _e=$(now_ms)
     _ms=$((_e - _s))
     [ "$_ms" -lt 4900 ] || { echo unreachable; return 1; }
     if [ "$_r" = 1 ]; then
         case $_o in
             *"server returned error"*|*"error getting response"*|*"HTTP/"*|*[Bb]ad\ header*|*"onnection reset"*|*"Invalid"*) ;;
+            *"HTTP error"*|*"reset prematurely"*) ;;
             *) echo unreachable; return 1 ;;
         esac
     fi
@@ -1881,7 +2068,8 @@ tcp_ms() {
 latency_one() {
     _d=$PROFILES/$1
     kv_var _t "$_d/meta" TYPE
-    _srv=$(profile_server "$_d"); _ms=; _err=
+    # (host and port start empty: in latency --all they are not the previous profile's when this one names no server)
+    _srv=$(profile_server "$_d"); _ms=; _err=; _host=; _port=
     case $_srv in
         -) _err="no server" ;;
         \[*) _host=${_srv#\[}; _host=${_host%%\]*}; _port=${_srv##*:} ;;
@@ -1898,7 +2086,7 @@ latency_one() {
             _ms=$(tcp_ms "$_host" "$_port") || { _err=$_ms; _ms=; }
         fi
     fi
-    _via=direct; { [ -r "$RUN/iface" ] && ip link show "$(cat "$RUN/iface")" >/dev/null 2>&1; } && _via=tunnel
+    _via=direct; ! tunnel_up || _via=tunnel
     jq -n --arg id "$1" --arg h "${_host:-}" --arg p "${_port:-}" --arg ms "$_ms" --arg via "$_via" --arg err "$_err" \
         '{id: $id, host: (if $h == "" then null else $h end), port: ($p | tonumber? // null),
           ms: ($ms | tonumber? // null), via: $via, error: (if $err == "" then null else $err end)}'
@@ -2247,12 +2435,19 @@ case "${1:-status}" in
         rm -f "$RUN/server-ip" "$RUN/dns" "$RUN/iface" "$RUN/since"
         # the engine this run uses (a VLESS xray profile behind the kill switch runs on sing-box): engine remove asks it
         { mkdir -p "$RUN" && chmod 700 "$RUN" && type_engine "${DRIVER:-$PTYPE}" > "$RUN/engine"; } || true
+        # ... and says so, first: the log's lines of this run are this engine's (logs ENGINE, see logs_engine)
+        echo "engine: $(type_engine "${DRIVER:-$PTYPE}") (profile ${ACTIVE:-vpn.conf})"
+        # the resolver the engine finds its server at (sing-box, mihomo, dae): one that answers on this uplink
+        bootstrap_pick || exit 1
         if [ "$DRV_FOREGROUND" = 1 ]; then drv_gen >/dev/null; else drv_gen; fi
         ensure_firewall_zone
         [ "$DRV_FOREGROUND" = 1 ] || run_tunnel
         # sing-box builds its routes itself; the Tailscale rules are inert until it has (see tailscale_up), and
         # after it exits they are again: table $TABLE is empty then. mu300-vpn off and the next start clear them.
+        # The device's own DNS goes to REMOTE_DNS as for every driver (dns_nat_up; the next start, and off, take it
+        # away with the rest: routes_down).
         tailscale_up
+        dns_nat_up
         ipv6_guard
         echo "$TUN" > "$RUN/iface"; date +%s > "$RUN/since"
         drv_start ;;

@@ -400,7 +400,8 @@ Per system, at every start of `mu300-vpn` (any command), idempotent, and only wh
     config; a DNS server's `domain_resolver` must name one of its DNS servers (or `mu300-bootstrap`).
 * **mihomo YAML (Task 7 follows this).** Clash files carry many harmless keys, so unknown top-level keys are removed,
   not refused. Kept: `proxies`, `proxy-groups`, `proxy-providers`, `rules`, `rule-providers`, `sub-rules`, `hosts`,
-  `mode`, `log-level`, `ipv6`, `geodata-mode`, `geodata-loader`, `geox-url`, `profile`, `sniffer`. Written by the
+  `mode`, `log-level`, `ipv6`, `geodata-loader`, `geox-url`, `geo-auto-update`, `geo-update-interval`, `profile`, `sniffer` (`geodata-mode` was
+  on this list until FINDINGS 26j: with it GEOIP rules read a third geodata file the extra does not carry). Written by the
   driver, whatever the file had: `tun` (ours), `dns` (ours), `routing-mark: 720`, `allow-lan: false`,
   `bind-address: '127.0.0.1'`. No controller or API of any kind is written: `external-controller`,
   `external-controller-tls`/`-unix`/`-pipe`/`-cors`, `external-ui*`, `external-doh-server`, `tls` and `secret` are

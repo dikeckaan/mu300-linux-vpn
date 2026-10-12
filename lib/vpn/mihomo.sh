@@ -19,14 +19,22 @@ DRV_PKG=
 DRV_KEYS=MIHOMO_STACK
 TUN=mh-mu300
 MHPID=; DRV_GONE=
+# mihomo looks its servers' names up at BOOTSTRAP_DNS itself: the core tries first which resolver answers on this
+# uplink (bootstrap_pick)
+DRV_BOOTSTRAP=1
 
 # mihomo reads SAFE_PATHS (directories a provider's path or external-ui may name outside its home) and
 # SKIP_SAFE_PATH_CHECK from its environment: neither is ever passed on, so everything it reads or writes stays in
 # its home directory
 unset SAFE_PATHS SKIP_SAFE_PATH_CHECK
 
-# the top-level keys of the file that survive, as the spec's Security section lists them; every other one is removed
-MIHOMO_KEYS='proxies proxy-groups proxy-providers rules rule-providers sub-rules hosts mode log-level ipv6 geodata-mode geodata-loader geox-url profile sniffer'
+# the top-level keys of the file that survive, as the spec's Security section lists them; every other one is removed.
+# (geodata-mode is not among them: with it, GEOIP rules read GeoIP.dat, a third file of 17 MB that the extra does not
+# carry and mihomo could only download before the tunnel is up - see mihomo_geodata. Without it they read the
+# Country.mmdb the extra has, and match the same countries. geo-auto-update and geo-update-interval are: geox-url
+# says where the geodata comes from, and these two whether mihomo ever fetches it again - a switch and a number of
+# hours.)
+MIHOMO_KEYS='proxies proxy-groups proxy-providers rules rule-providers sub-rules hosts mode log-level ipv6 geodata-loader geox-url geo-auto-update geo-update-interval profile sniffer'
 # the top-level keys this driver writes, and the only ones besides the kept list that the written file may have:
 # external-controller (and -tls, -unix, -pipe, -cors), external-ui*, external-doh-server, secret and tls are not
 # among them, so no control API of the file's or of a setting's ever reaches mihomo
@@ -39,6 +47,73 @@ mihomo_bin() { if [ -n "${_mihomo:-}" ]; then printf '%s\n' "$_mihomo"; else eng
 MH_HOME=$VPN_DIR/cache/mihomo
 mihomo_home() {
     { mkdir -p "$MH_HOME" && chmod 700 "$MH_HOME"; } || { echo "cannot create $MH_HOME" >&2; return 1; }
+}
+# The geodata GEOIP and GEOSITE rules read. mihomo downloads what its home lacks while it reads the config - before
+# the tunnel exists, over the uplink, from GitHub - and refuses the config when it cannot. Where only the tunnel gets
+# out, a subscription with such rules (most have them) never started, and switching to it took the connection down
+# (FINDINGS 26j). So the extra carries the two files (share/mihomo, next to bin: Country.mmdb and GeoSite.dat, pinned
+# by tools/fetch-mihomo.sh), and they are copied into the home when the config names geoip or geosite and the home
+# has none. They stay as they are unless the file asks mihomo to update them (geo-auto-update, geox-url: its
+# downloads go through the tunnel once it runs; not measured on a device), or they are deleted from the home. A home that
+# has one under any of the names mihomo looks for (it compares without regard to case) is left alone. IP-ASN rules
+# need a third file, ASN.mmdb, which is not carried: mihomo_why says so when mihomo refuses such a config.
+mihomo_share() { _b=$(mihomo_bin); _b=${_b%/*}; printf '%s\n' "${_b%/*}/share/mihomo"; }
+# mihomo_has NAME...: the home has a file of one of these names (lowercase), whatever its case
+mihomo_has() {
+    for _g in "$MH_HOME"/*; do
+        [ -f "$_g" ] || continue
+        _gl=$(printf '%s' "${_g##*/}" | tr 'A-Z' 'a-z')
+        for _w; do [ "$_gl" != "$_w" ] || return 0; done
+    done
+    return 1
+}
+# mihomo_seed NAME: the extra's file copied into the home (through a name mihomo does not look for, so it never
+# reads half a file)
+mihomo_seed() {
+    _sf=$(mihomo_share)/$1
+    [ -r "$_sf" ] || return 0
+    if ( umask 077; cp "$_sf" "$MH_HOME/.seed.$$" ) 2>/dev/null && mv "$MH_HOME/.seed.$$" "$MH_HOME/$1"; then return 0; fi
+    rm -f "$MH_HOME/.seed.$$"
+    echo "could not copy $1 into $MH_HOME" >&2
+}
+# mihomo_geodata FILE: what the rebuilt config FILE needs of the geodata, there before mihomo reads it
+mihomo_geodata() {
+    if grep -qi 'geoip' "$1" && ! mihomo_has country.mmdb geoip.metadb geoip.db; then mihomo_seed Country.mmdb; fi
+    if grep -qi 'geosite' "$1" && ! mihomo_has geosite.dat; then mihomo_seed GeoSite.dat; fi
+    return 0
+}
+# mihomo_why FILE: after mihomo refused FILE - a hint when its rules need geodata the home does not have (mihomo's
+# own words are not repeated: they can quote the config)
+mihomo_why() {
+    _mw=
+    if grep -qi 'geosite' "$1" && ! mihomo_has geosite.dat; then _mw="$_mw GeoSite.dat"; fi
+    if grep -qi 'geoip' "$1" && ! mihomo_has country.mmdb geoip.metadb geoip.db; then _mw="$_mw Country.mmdb"; fi
+    if grep -qi 'ip-asn' "$1" && ! mihomo_has asn.mmdb geolite2-asn.mmdb; then _mw="$_mw ASN.mmdb"; fi
+    [ -n "$_mw" ] || return 0
+    # (short: the control panel shows the first 300 bytes of a message)
+    echo "its rules need geodata missing from $MH_HOME (${_mw# }); mihomo can only download it without the tunnel." \
+        "The vpn-mihomo extra after v2.0.0 carries GeoSite.dat and Country.mmdb (mu300-vpn engine install mihomo)," \
+        "not ASN.mmdb" >&2
+}
+# mihomo_test FILE [HOW]: mihomo's own check of a rebuilt config (-t), with the geodata it needs in place first. Its
+# output is not shown: its errors quote the config (a rule's text, a proxy's fields). Only where its message points
+# is passed on, as mihomo counts - "rules[2]", "proxy 0", "yaml: line 12" - which is never a value. HOW: the file
+# stays (root's, 0600), and the message names the command that says the rest.
+mihomo_test() {
+    mihomo_home || return 1
+    mihomo_geodata "$1"
+    _mo=$("$(mihomo_bin)" -t -d "$MH_HOME" -f "$1" 2>&1) && { _mo=; return 0; }
+    _mp=$(printf '%s\n' "$_mo" | sed -n -e 's/.*\(rules\[[0-9][0-9]*\]\).*/\1/p' -e 's/.*[ "]\(proxy [0-9][0-9]*\):.*/\1/p' \
+        -e 's/.*\(yaml: line [0-9][0-9]*\).*/\1/p' | head -n 1)
+    _mo=
+    if [ -n "${2:-}" ]; then
+        echo "mihomo rejects the rebuilt config${_mp:+ (at $_mp)}: $(mihomo_bin) -t -d $MH_HOME -f $1 says why" >&2
+    else
+        echo "mihomo rejects the config as this driver rebuilds it${_mp:+ (at $_mp, as mihomo counts)}; its own message" \
+            "is not shown, it can quote the config" >&2
+    fi
+    mihomo_why "$1"
+    return 1
 }
 
 # ---- reading a Clash/mihomo YAML -------------------------------------------------------------------------------
@@ -283,8 +358,16 @@ mihomo_read() {
 # are the only ones, see mihomo_written_ok). The TUN is the only inbound (no port of any kind, no controller or
 # API, and allow-lan off with the bind address on loopback should one ever be written); auto-route and
 # auto-detect-interface are off (the core routes, the kernel picks the uplink); DNS: the server names through
-# BOOTSTRAP_DNS over mihomo's own marked sockets, everything else through REMOTE_DNS behind the rules.
+# BOOTSTRAP_DNS over mihomo's own marked sockets (the one the core found to answer on this uplink, bootstrap_pick),
+# everything else through REMOTE_DNS behind the rules.
+# LOGLEVEL: written when the file names none - mihomo's own default, info, writes a line for every connection of
+# every client into the system log, which pushes the service's own messages out of it within minutes.
+# The TUN gets no IPv6 address unless the IPV6 setting is 1: mihomo gives it one by default (fdfe:dcba:9876::1/126),
+# the core then took the tunnel for one that carries IPv6, routed IPv6 into it and left the IPv6 guard off - and a
+# server without IPv6 leaves every program that prefers it without an answer (FINDINGS 26j).
+# mihomo_ours STACK [LOGLEVEL]
 mihomo_ours() {
+    [ -z "${2:-}" ] || printf 'log-level: %s\n' "$2"
     cat <<EOF
 routing-mark: $((MARK))
 allow-lan: false
@@ -299,6 +382,9 @@ tun:
   dns-hijack: []
   mtu: 1400
   inet4-address: [198.18.8.1/30]
+EOF
+    [ "$IPV6" = 1 ] || echo '  inet6-address: []'
+    cat <<EOF
 dns:
   enable: true
   ipv6: false
@@ -344,7 +430,12 @@ mihomo_rebuild() {
     case $_stack in gvisor|system|mixed) ;; *) _stack=gvisor ;; esac
     { ip4_ok "$REMOTE_DNS" || ip6_ok "$REMOTE_DNS"; } && { ip4_ok "$BOOTSTRAP_DNS" || ip6_ok "$BOOTSTRAP_DNS"; } ||
         { echo "REMOTE_DNS and BOOTSTRAP_DNS must be IP addresses" >&2; return 1; }
-    if ! ( umask 077; { mihomo_read gen "$_src" && mihomo_ours "$_stack"; } > "$_out.r" ); then
+    if ! ( umask 077; mihomo_read gen "$_src" > "$_out.r" ); then
+        rm -f "$_out.r"; echo "cannot write $_out" >&2; return 1
+    fi
+    # the log level is the file's when it names one (a kept key), else warning (see mihomo_ours)
+    _ll=warning; ! grep -q "^log-level[[:space:]]*:" "$_out.r" || _ll=
+    if ! ( umask 077; mihomo_ours "$_stack" "$_ll" >> "$_out.r" ); then
         rm -f "$_out.r"; echo "cannot write $_out" >&2; return 1
     fi
     if ! mihomo_written_ok "$_out.r"; then
@@ -358,12 +449,15 @@ mihomo_rebuild() {
 drv_engines() { mihomo_bin; }
 drv_engines_ok() { [ -x "$(mihomo_bin)" ]; }
 
-# the rebuild runs, into a file of the profile's own (0700) directory that is removed again; mihomo itself checks
-# the rebuilt file in drv_gen
+# the rebuild runs, into a file of the profile's own (0700) directory that is removed again, and where mihomo is
+# installed it checks that file too (as drv_gen does at every start): a config mihomo refuses - a rule naming a
+# geosite list that does not exist, a proxy it cannot read - is refused when it is imported, and before a running VPN
+# is switched to it, not when the old tunnel is already gone
 drv_check() {
     [ -n "${PDIR:-}" ] && [ -r "$PDIR/config.yaml" ] || { echo "the profile has no config.yaml" >&2; return 1; }
     _chk=$PDIR/.check.$$
     mihomo_rebuild "$PDIR/config.yaml" "$_chk" || { rm -f "$_chk"; return 1; }
+    if drv_engines_ok && ! mihomo_test "$_chk"; then rm -f "$_chk"; return 1; fi
     rm -f "$_chk"; return 0
 }
 
@@ -374,11 +468,8 @@ drv_gen() {
     mihomo_rebuild "$PDIR/config.yaml" "$RUN/mihomo.yaml" || exit 1
     # no address to keep off the tunnel: mihomo marks its own sockets, and looks the servers up over them
     : > "$RUN/server-ip"
-    mihomo_home || exit 1
-    # mihomo checks the rebuilt file, the one it will run; the profile's own file is never given to it. Its output
-    # is not shown (its YAML errors quote values); the file is root's, 0600, so the command can be run by hand.
-    "$(mihomo_bin)" -t -d "$MH_HOME" -f "$RUN/mihomo.yaml" >/dev/null 2>&1 ||
-        { echo "mihomo rejects the rebuilt config: $(mihomo_bin) -t -d $MH_HOME -f $RUN/mihomo.yaml says why" >&2; exit 1; }
+    # mihomo checks the rebuilt file, the one it will run; the profile's own file is never given to it
+    mihomo_test "$RUN/mihomo.yaml" keep || exit 1
     echo "mihomo config OK ($RUN/mihomo.yaml)"
 }
 
