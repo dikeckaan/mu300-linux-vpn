@@ -14,6 +14,8 @@ TUN=sbtun
 # (bootstrap_pick). Not with UPSTREAM_HTTP_PROXY: the lookup then goes through that proxy, where the device cannot try.
 DRV_BOOTSTRAP=1
 [ -z "${UPSTREAM_HTTP_PROXY:-}" ] || DRV_BOOTSTRAP=
+# with IPV6=auto the tunnel is asked whether IPv6 works through it (drv_v6ask)
+DRV_V6ASK=1
 
 drv_engines() { printf '%s\n' "$BIN"; }
 drv_engines_ok() { [ -x "$BIN" ]; }
@@ -33,6 +35,37 @@ drv_start() { exec "$BIN" run -c "$RUN/config.json" --disable-color; }
 drv_alive() { ip link show "$TUN" >/dev/null 2>&1; }
 # exec'd: nothing of its own is left to stop here, and it removes its TUN when it exits
 drv_stop() { :; }
+# The question IPV6=auto asks (the core's ipv6_ask), for an engine that routes by its config and is exec'd: sing-box
+# is started once more before the real start, with the config it would get for IPv6 but no routing of its own
+# (auto_route off: nothing of a client reaches this tunnel, and nothing but the core's question is routed into it)
+# and nothing in the log (the real start reports what is wrong with a config or a server). It is stopped again, and
+# the config that is then written has the IPv6 address, or not, by the answer. A start takes that much longer: the
+# engine twice, and up to V6_TIME seconds for a server that says nothing.
+drv_v6ask() {
+    SB_ASK=1
+    # (drv_gen ends the run on a config that does not check, as it would a moment later)
+    drv_gen >/dev/null
+    SB_ASK=
+    "$BIN" run -c "$RUN/config.json" --disable-color >/dev/null 2>&1 < /dev/null &
+    _sp=$!
+    _n=0
+    until ip link show "$TUN" >/dev/null 2>&1; do
+        kill -0 "$_sp" 2>/dev/null || break
+        _n=$((_n + 1)); [ "$_n" -lt 10 ] || break
+        sleep 1
+    done
+    _up=
+    if ip link show "$TUN" >/dev/null 2>&1 && kill -0 "$_sp" 2>/dev/null; then _up=1; ipv6_ask || true; fi
+    kill "$_sp" 2>/dev/null || true
+    _n=0
+    while kill -0 "$_sp" 2>/dev/null && [ "$_n" -lt 5 ]; do sleep 1; _n=$((_n + 1)); done
+    if kill -0 "$_sp" 2>/dev/null; then kill -9 "$_sp" 2>/dev/null || true; fi
+    wait "$_sp" 2>/dev/null || true
+    # its TUN goes with it; the real start makes its own
+    _n=0
+    while [ -n "$_up" ] && ip link show "$TUN" >/dev/null 2>&1 && [ "$_n" -lt 5 ]; do sleep 1; _n=$((_n + 1)); done
+    return 0
+}
 drv_import() {
     if is_json "$1"; then json_import "$1" "$SING_BOX_JSON_TEST" 'a sing-box config (no outbound with a type)'
     else link_import "$1"; fi
@@ -66,10 +99,14 @@ outbound_json() {
 }
 
 # The TUN's addresses: IPv6 through the tunnel only when the server side has it. Otherwise programs prefer the
-# (dead) IPv6 route and every connection to a dual-stack host fails first.
+# (dead) IPv6 route and every connection to a dual-stack host fails first. IPV6=1 says it has; with auto the tunnel
+# is asked (drv_v6ask: the address is there for the question, and after a yes).
 singbox_addrs() {
-    if [ "$IPV6" = 1 ]; then printf '"172.19.0.1/30","fdfe:dcba:9876::1/126"'; else printf '"172.19.0.1/30"'; fi
+    if v6_tun; then printf '"172.19.0.1/30","fdfe:dcba:9876::1/126"'; else printf '"172.19.0.1/30"'; fi
 }
+# auto_route: sing-box routes for itself, except while it is only asked about IPv6 (drv_v6ask); and what it logs
+singbox_auto_route() { if [ -n "${SB_ASK:-}" ]; then echo false; else echo true; fi; }
+singbox_log_level() { if [ -n "${SB_ASK:-}" ]; then echo panic; else echo warn; fi; }
 
 gen_singbox() {
     link_need
@@ -77,7 +114,7 @@ gen_singbox() {
     mkdir -p "$RUN"; chmod 700 "$RUN"
     excl=$(json_list "$LAN_CIDRS")
     {
-    printf '{"log":{"level":"warn","timestamp":false},\n'
+    printf '{"log":{"level":"%s","timestamp":false},\n' "$(singbox_log_level)"
     printf '"dns":{"servers":[{"type":"tcp","tag":"remote","server":%s,"detour":"proxy"},' "$(json_str "$REMOTE_DNS")"
     # the VPN server name is looked up via BOOTSTRAP_DNS (directly, or over TCP through UPSTREAM_HTTP_PROXY)
     if [ -n "$UPSTREAM_HTTP_PROXY" ]; then
@@ -87,7 +124,7 @@ gen_singbox() {
     fi
     # IPv6 through the tunnel only when the server side has it: otherwise programs prefer the (dead) IPv6 route and
     # every connection to a dual-stack host fails first, so DNS answers only A records and the TUN gets no IPv6 address
-    if [ "$IPV6" = 1 ]; then strategy=prefer_ipv4; else strategy=ipv4_only; fi
+    if v6_tun; then strategy=prefer_ipv4; else strategy=ipv4_only; fi
     addrs=$(singbox_addrs)
     printf '"final":"remote","strategy":"%s"},\n' "$strategy"
     # "stack":"gvisor", not the default system stack. On this device's 5.4 vendor kernel the system stack
@@ -98,7 +135,7 @@ gen_singbox() {
     # "inbound/tun[tun-in]: enable offload: set udp offload: TUNSETOFFLOAD: invalid argument" - the kernel does
     # not have what that stack expects. gvisor carries its own TCP/IP and does not care.
     printf '"inbounds":[{"type":"tun","tag":"tun-in","stack":"gvisor","interface_name":"%s","address":[%s],"mtu":1400,' "$TUN" "$addrs"
-    printf '"auto_route":true,"strict_route":true,"route_exclude_address":%s}],\n' "$excl"
+    printf '"auto_route":%s,"strict_route":true,"route_exclude_address":%s}],\n' "$(singbox_auto_route)" "$excl"
     printf '"outbounds":['; outbound_json
     [ -n "$UPSTREAM_HTTP_PROXY" ] && printf ',{"type":"http","tag":"upstream","server":%s,"server_port":%s}' "$(json_str "${UPSTREAM_HTTP_PROXY%:*}")" "${UPSTREAM_HTTP_PROXY##*:}"
     printf ',{"type":"direct","tag":"direct"}],\n'
@@ -213,9 +250,9 @@ SING_BOX_JSON_REBUILD='
   ) as $p
 | if ($p | length) > 0 then {"refuse": ($p | unique)}
   else {"config": ($b
-    | .log = {"level": "warn", "timestamp": false}
+    | .log = {"level": $loglevel, "timestamp": false}
     | .inbounds = [{"type": "tun", "tag": "tun-in", "stack": "gvisor", "interface_name": $tun, "address": $addrs,
-                    "mtu": 1400, "auto_route": true, "strict_route": true, "route_exclude_address": $excl}]
+                    "mtu": 1400, "auto_route": $autoroute, "strict_route": true, "route_exclude_address": $excl}]
     | .route = (.route // {})
     | ([$eps[] | .tag]) as $eptags
     | if ($eptags | length) > 0
@@ -229,6 +266,7 @@ singbox_raw() { [ -n "${PDIR:-}" ] && [ -r "$PDIR/config.json" ]; }
 singbox_json_rebuild() {
     json_rebuild "$PDIR/config.json" "$1" "the profile's sing-box config" "$SING_BOX_JSON_REBUILD" \
         --arg tun "$TUN" --argjson addrs "[$(singbox_addrs)]" --argjson excl "$(json_list "$LAN_CIDRS")" \
+        --argjson autoroute "$(singbox_auto_route)" --arg loglevel "$(singbox_log_level)" \
         --argjson mark "$((MARK))" --arg boot "$BOOTSTRAP_DNS" --arg keep "$SING_BOX_JSON_KEYS" \
         --arg drop "$SING_BOX_JSON_DROPPED" --arg rkeep "$SING_BOX_ROUTE_KEYS" --arg rdrop "$SING_BOX_ROUTE_DROPPED" \
         --arg deny "$JSON_DENY" --arg types "$SING_BOX_JSON_TYPES" --arg known "$SING_BOX_JSON_KNOWN" \

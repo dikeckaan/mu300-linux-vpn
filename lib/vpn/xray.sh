@@ -6,6 +6,8 @@ DRV_KEYS='TLS_PIN_SHA256 UPSTREAM_HTTP_PROXY'
 DRV_PKG=
 TUN=xtun
 XPID=; HPID=; DRV_GONE=
+# with IPV6=auto the core asks, once the tunnel is up, whether IPv6 works through it (ipv6_ask)
+DRV_V6ASK=1
 
 # ---- xray engine ----------------------------------------------------------------------------------------------
 # Xray speaks the link's protocol; hev-socks5-tunnel owns the TUN and hands every TCP/UDP flow to Xray's
@@ -71,14 +73,20 @@ save_pin() {
     else printf '# fetched by mu300-vpn: the VPN server certificate, standing in for allowInsecure (Xray 26)\nTLS_PIN_SHA256=%s\n' "$1" >> "$CONF"; fi
 }
 
-# hev-socks5-tunnel's config: it owns the TUN and hands every flow to Xray's SOCKS inbound on loopback
+# hev-socks5-tunnel's config: it owns the TUN and hands every flow to Xray's SOCKS inbound on loopback. The TUN gets
+# an IPv6 address when the core says so (v6_tun: IPV6=1, and with auto for the question whether IPv6 works through
+# the tunnel); the core routes IPv6 into a tunnel that has one, after the answer.
 xray_hev_yml() {
-    cat > "$RUN/hev.yml" <<YML
+    {
+    cat <<YML
 tunnel:
   name: $TUN
   mtu: 8500
   multi-queue: false
   ipv4: 198.18.0.1
+YML
+    if v6_tun; then echo "  ipv6: 'fdfe:dcba:9875::1'"; fi
+    cat <<YML
 socks5:
   port: $SOCKS_PORT
   address: 127.0.0.1
@@ -86,6 +94,7 @@ socks5:
 misc:
   log-level: warn
 YML
+    } > "$RUN/hev.yml"
 }
 
 gen_xray() {

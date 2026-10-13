@@ -77,6 +77,10 @@ class ShellTest(unittest.TestCase):
         # start: in the tests a command answers in the resolver's place (yes, unless a test says otherwise), so that no
         # test sends a DNS query from the machine it runs on
         e['MU300_DNS_PROBE'] = 'true'
+        # ... and with IPV6=auto asks through a proxy engine's tunnel whether IPv6 works (ipv6_ask): here a command
+        # answers in the far end's place too (no, unless a test says otherwise: the tunnel is IPv4, as it was before
+        # the question existed), so that no test fetches anything from the machine it runs on
+        e['MU300_V6_PROBE'] = 'false'
         e.update({k: str(v) for k, v in extra.items()})
         return e
 

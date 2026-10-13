@@ -130,8 +130,9 @@ port_ok() { case $1 in ''|*[!0-9]*|??????*) return 1 ;; esac; [ "$1" -ge 1 ] && 
 setting_valid() {
     case $1 in
         KILL_SWITCH|TAILSCALE) case $2 in 0|1) return 0 ;; esac; return 1 ;;
-        # IPv6 through the tunnel: 0 never, 1 ask the engine for an IPv6 tunnel address, auto (the default) only
-        # where the profile's own config has one (WireGuard); see ipv6_guard_up for the rest
+        # IPv6 through the tunnel: 0 never, 1 always (the engine is asked for an IPv6 tunnel address), auto (the
+        # default) where it works: a WireGuard or OpenVPN profile's own IPv6 address, and for the proxy engines what
+        # an IPv6 fetch through the tunnel says at every start (ipv6_ask); see ipv6_guard for the rest
         IPV6) case $2 in 0|1|auto) return 0 ;; esac; return 1 ;;
         REMOTE_DNS|BOOTSTRAP_DNS) ip4_ok "$2" || ip6_ok "$2" ;;
         LAN_CIDRS)
@@ -426,11 +427,17 @@ engines_ok() { case "$ENGINE" in xray) [ -x "$XRAY" ] && [ -x "$HEV" ] ;; *) [ -
 # fails does not end it. Every step of a driver's drv_start whose failure would leave half a tunnel must therefore
 # return non-zero itself (cmd || return 1), or the core would route into a tunnel that is not there.
 # DRV_BOOTSTRAP=1: the engine looks its servers' names up itself, at BOOTSTRAP_DNS (see bootstrap_pick)
+# DRV_V6ASK=1: the engine's tunnel takes IPv6 whatever its server can do with it (a proxy behind a TUN), so with
+# IPV6=auto the core asks through the tunnel before it routes IPv6 into it (see ipv6_ask). Such a driver gives its
+# TUN an IPv6 address when v6_tun says so. One that is exec'd (sing-box) also defines drv_v6ask: the engine up on
+# $TUN without any routing of its own, ipv6_ask, and the engine stopped again.
 DRIVER=; DRV_EXTRA=vpn; DRV_PKG=; DRV_ROUTES=core; DRV_FOREGROUND=0; DRV_PIDS=; DRV_GONE=; DRV_KEYS=; DRV_BOOTSTRAP=
+DRV_V6ASK=
 drv_engines() { case $ENGINE in xray) printf '%s\n' "$XRAY" "$HEV" ;; *) printf '%s\n' "$BIN" ;; esac; }
 drv_engines_ok() { engines_ok; }
 drv_status() { :; }
 drv_poll() { :; }
+drv_v6ask() { :; }
 # drv_runnable: this system can run the engine (dae: BTF and 5.17), else a reason on stderr and 1 (optional)
 drv_runnable() { :; }
 # profile set KEY VALUE for a key in DRV_KEYS, with PDIR the profile: into its meta, or removed when empty. A driver
@@ -449,10 +456,13 @@ load_driver() {
     esac
     [ -r "$LIB/$1.sh" ] || { echo "$1: no driver for this profile type ($LIB/$1.sh)" >&2; return 1; }
     _drv=$1
-    # what a driver does not set is the default; drv_status, drv_poll, drv_runnable and drv_set are optional
+    # what a driver does not set is the default; drv_status, drv_poll, drv_v6ask, drv_runnable and drv_set are
+    # optional
     DRV_ROUTES=core; DRV_FOREGROUND=0; TUN=; DRV_PIDS=; DRV_EXTRA=; DRV_PKG=; DRV_GONE=; DRV_KEYS=; DRV_BOOTSTRAP=
+    DRV_V6ASK=
     drv_status() { :; }
     drv_poll() { :; }
+    drv_v6ask() { :; }
     drv_runnable() { :; }
     drv_set() { drv_set_default "$@"; }
     # The previous driver's functions go first: a driver that lacks one must fail here, not run another type's.
@@ -1040,28 +1050,43 @@ routes_up() {
     for _c in $(printf '%s' "$LAN_CIDRS" | tr ',' ' '); do
         case $_c in *:*) ;; *) ip rule add pref 9001 to "$_c" lookup main ;; esac
     done
-    _s6=
     if [ -r "$RUN/server-ip" ]; then
         while IFS= read -r _a || [ -n "$_a" ]; do
-            if ip4_ok "$_a"; then ip rule add pref 9002 to "$_a" lookup main
-            elif ip6_ok "$_a"; then _s6="$_s6 $_a"; fi
+            if ip4_ok "$_a"; then ip rule add pref 9002 to "$_a" lookup main; fi
         done < "$RUN/server-ip"
     fi
     ip route replace default dev "$TUN" table "$TABLE"
     ip rule add pref 9010 lookup "$TABLE"
-    # IPv6 the same way, but only when the tunnel has a global IPv6 address of its own: otherwise programs would
-    # prefer a dead IPv6 route (see IPV6 in gen_singbox), and the IPv6 guard rejects IPv6 on the uplinks instead
-    if [ "$IPV6" != 0 ] && ip -6 addr show dev "$TUN" scope global 2>/dev/null | grep -q inet6; then
-        ip -6 rule add pref 9000 fwmark "$MARK" lookup main
-        for _c in $(printf '%s' "$LAN_CIDRS" | tr ',' ' '); do
-            case $_c in *:*) ip -6 rule add pref 9001 to "$_c" lookup main ;; esac
-        done
-        for _a in $_s6; do ip -6 rule add pref 9002 to "$_a" lookup main; done
-        ip -6 route replace default dev "$TUN" table "$TABLE"
-        ip -6 rule add pref 9010 lookup "$TABLE"
-    fi
+    # IPv6 the same way, but only when the tunnel carries it (a global IPv6 address of its own; with IPV6=auto on a
+    # proxy engine not before the tunnel was asked, see ipv6_ask): otherwise programs would prefer a dead IPv6 route
+    # (see IPV6 in gen_singbox), and the IPv6 guard rejects IPv6 on the uplinks instead
+    if tunnel_carries_v6; then routes6_up; fi
     tailscale_up
     dns_nat_up
+}
+# routes6_up: rules 9000-9010 for IPv6 (the servers' IPv6 addresses from $RUN/server-ip, as routes_up reads them)
+routes6_up() {
+    ip -6 rule add pref 9000 fwmark "$MARK" lookup main
+    # What main has a route to that is not its default stays in main: the LAN's own prefix, and the addresses of the
+    # clients a relayed prefix was handed to (odhcpd keeps a host route for each). LAN_CIDRS names IPv4 networks, and
+    # an IPv6 prefix that comes from the carrier cannot be written into a setting. Without this rule the tunnel's
+    # answers to a LAN client went back into the tunnel, and so did the device's own to it (a ping of the router's
+    # IPv6 address from the LAN got no answer; LuCI, ssh and DNS over IPv6 the same): a client had no IPv6 through a
+    # tunnel that carried it. sing-box's auto_route has the same rule. (The bearer's own /64 is such a route too:
+    # what is sent to an address in it that is no LAN client's leaves on the bearer, where the guard or the kill
+    # switch rejects it when either is up.)
+    ip -6 rule add pref 9001 lookup main suppress_prefixlength 0 ||
+        echo "this ip cannot add a suppress_prefixlength rule: IPv6 between the tunnel and the LAN's clients will not work" >&2
+    for _c in $(printf '%s' "$LAN_CIDRS" | tr ',' ' '); do
+        case $_c in *:*) ip -6 rule add pref 9001 to "$_c" lookup main ;; esac
+    done
+    if [ -r "$RUN/server-ip" ]; then
+        while IFS= read -r _a || [ -n "$_a" ]; do
+            if ip6_ok "$_a"; then ip -6 rule add pref 9002 to "$_a" lookup main; fi
+        done < "$RUN/server-ip"
+    fi
+    ip -6 route replace default dev "$TUN" table "$TABLE"
+    ip -6 rule add pref 9010 lookup "$TABLE"
 }
 # dns_nat_up: the device's own lookups. dnsmasq forwards to whatever the bearer handed out, and the carrier's resolver
 # does not answer from the far end of the tunnel. Send them to the tunnel's DNS ($RUN/dns, from the driver) or
@@ -1107,12 +1132,14 @@ routes_down() {
 # IPv6 policy routing then has nothing to loop on.
 routes6_down() {
     _r6=$(ip -6 rule show 2>/dev/null) || _r6=
-    for pref in 9000 9001 9002 9010; do
+    # (9003, 9004 and table $V6_TABLE: what a run that was killed while it asked the tunnel left, see ipv6_ask)
+    for pref in 9000 9001 9002 9003 9004 9010; do
         for _x in $(printf '%s\n' "$_r6" | awk -v p="$pref:" '$1 == p {print "x"}'); do
             ip -6 rule del pref "$pref" 2>/dev/null || true
         done
     done
     ip -6 route flush table "$TABLE" 2>/dev/null || true
+    ip -6 route flush table "$V6_TABLE" 2>/dev/null || true
 }
 
 # Tailscale through the tunnel. tailscaled marks its own sockets (WireGuard to peers, DERP, the control server)
@@ -1204,14 +1231,21 @@ run_tunnel() {
         trap - EXIT INT TERM HUP
         drv_stop
         if [ "$DRV_ROUTES" = core ]; then routes_down; else tailscale_down; fi
-        rm -f "$RUN/iface" "$RUN/since"
+        rm -f "$RUN/iface" "$RUN/since" "$RUN/ipv6"
     }
     trap 'tunnel_down; exit 0' INT TERM HUP
     trap tunnel_down EXIT
     drv_start || exit 1
     if [ "$DRV_ROUTES" = core ]; then routes_up; else tailscale_up; fi
-    ipv6_guard
     echo "$TUN" > "$RUN/iface"; date +%s > "$RUN/since"
+    # IPv4 is in the tunnel by now: clients do not wait for the question about IPv6. Until it is answered (and
+    # after a no) their IPv6 is rejected, by the guard that went up before the old routing was taken away (run).
+    if v6_asks; then
+        if ipv6_ask; then routes6_up
+        # the address the engine was given for the question goes: nothing takes this tunnel for one with IPv6
+        else ip -6 addr flush dev "$TUN" scope global 2>/dev/null || true; fi
+    else v6_record; fi
+    ipv6_guard
     while drv_alive; do
         sleep 2
         drv_poll || exit 1
@@ -1263,11 +1297,24 @@ NFT
 }
 ipv6_guard_on() { ipv6_guard_ruleset | nft -f -; }
 ipv6_guard_off() { nft delete table inet mu300_vpn_v6 2>/dev/null || true; }
-# tunnel_carries_v6: the tunnel that is up has a global IPv6 address (and IPV6 is not 0), so routes_up sends IPv6
-# into it. A driver that routes itself (sing-box) gets one exactly when IPV6=1 (singbox_addrs).
+# tunnel_v6_addr: the tunnel has a global IPv6 address of its own
+tunnel_v6_addr() { ip -6 addr show dev "$TUN" scope global 2>/dev/null | grep -q inet6; }
+# v6_asks: this run asks the tunnel whether IPv6 works through it (IPV6=auto on a driver that says DRV_V6ASK=1)
+v6_asks() { [ "$IPV6" = auto ] && [ -n "$DRV_V6ASK" ]; }
+# v6_tun: the engine's TUN gets an IPv6 address - IPV6=1, and with auto on a driver that asks: for the question
+# (V6_ASKING, set by run: it needs a tunnel that takes IPv6) and after a yes. For the drivers, which write the
+# address into their engine's config; a config written outside run (mu300-vpn gen) is the IPv4 one.
+v6_tun() {
+    case $IPV6 in 1) return 0 ;; 0) return 1 ;; esac
+    v6_asks && { [ "$V6_ON" = 1 ] || [ -n "$V6_ASKING" ]; }
+}
+# tunnel_carries_v6: IPv6 goes into the tunnel that is up. IPV6=0: never. A run that asked: what the answer was
+# (V6_ON, from ipv6_ask; not before it). Else a tunnel with a global IPv6 address, which routes_up sends IPv6 into;
+# a driver that routes itself (sing-box) gets one exactly when IPV6=1 (singbox_addrs).
 tunnel_carries_v6() {
     [ "$IPV6" != 0 ] || return 1
-    if [ "$DRV_ROUTES" = core ]; then ip -6 addr show dev "$TUN" scope global 2>/dev/null | grep -q inet6
+    if v6_asks; then [ "$V6_ON" = 1 ]
+    elif [ "$DRV_ROUTES" = core ]; then tunnel_v6_addr
     else [ "$IPV6" = 1 ]; fi
 }
 # ipv6_guard: the guard as the running tunnel needs it - off when it carries IPv6, on otherwise. It stays when the
@@ -1275,10 +1322,143 @@ tunnel_carries_v6() {
 # kill switch on there is nothing to add: the kill switch rejects the same IPv6 itself, and IPv6 routed into a tunnel
 # that carries it never meets either (a guard left from a run without the kill switch is as harmless, and off
 # removes it).
+# A run that asks the tunnel (v6_asks) keeps the guard whatever the answer: it went up before the previous run's
+# routing was taken away and never comes down while the VPN is on, so there is no moment between "rejected" and "in
+# the tunnel" in which IPv6 could leave on an uplink - sing-box adds its IPv6 routes some time after it is exec'd,
+# and nothing of ours runs then to take a guard down at the right moment. IPv6 that is routed into the tunnel does
+# not meet the guard (it rejects on the uplinks only, and lets the engine's own marked sockets out).
 ipv6_guard() {
     [ "$KILL_SWITCH" != 1 ] || return 0
-    if tunnel_carries_v6; then ipv6_guard_off
+    if tunnel_carries_v6 && ! v6_asks; then ipv6_guard_off
     else ipv6_guard_on || echo "could not reject IPv6 beside the tunnel (nft)" >&2; fi
+}
+
+# ---- IPv6 through a proxy engine's tunnel: asked, not guessed (IPV6=auto) -----------------------------------------
+# A WireGuard or OpenVPN profile says itself whether it has IPv6 (an address of its own). A proxy does not: its TUN
+# takes every IPv6 packet, and whether the server can deliver it is the server's business. Routing IPv6 into a
+# tunnel that cannot carry it leaves every program that prefers IPv6 waiting for a timeout before it falls back
+# (FINDINGS 26j), which is why auto used to leave these engines on IPv4. Now every start asks: the engine comes up
+# with an IPv6 address on its TUN and nothing but the question routed to it - the device's own packets (iif lo) to
+# the addresses in V6_HOSTS, through a table of their own - an HTTP request goes to each of them through the
+# tunnel, and the first reply that begins like one is a yes: only then is IPv6 routed into the tunnel (routes6_up;
+# sing-box: its config gets the IPv6 address and it routes itself). The request needs the far end: the engine's own
+# TCP answers a connect on the device whatever the server can do (FINDINGS 26l), and DNS to an IPv6 resolver is
+# answered by sing-box's and dae's DNS hijack. No answer within V6_TIME seconds, or nothing here to ask with: no,
+# and everything is as it was before this existed - IPv4 in the tunnel, IPv6 rejected on the uplinks.
+#
+# Nothing leaks while it asks: clients' IPv6, and the device's own to any other address, has no route into the
+# tunnel yet and is rejected on the uplinks by the guard or the kill switch (run puts the guard up first). The
+# question itself leaves the device only inside the tunnel; the engine's own sockets are marked, and rule 9003
+# keeps them out of the question's table (an engine whose rules send such an address "direct" would loop).
+#
+# V6_HOSTS: two public resolvers' anycast addresses whose operators also answer plain HTTP on port 80 there
+# (Cloudflare with a redirect, OpenDNS with a 404; Google's and Quad9's resolvers say nothing on port 80), asked at
+# once, so that one of them being away or blocked at the exit does not turn IPv6 off. Addresses, not names: a name
+# would need a resolver that works before the tunnel's routing is there. (MU300_V6_HOSTS, MU300_V6_PORT,
+# MU300_V6_TIME: tests/; MU300_V6_PROBE: tests/, a command that answers in an address's place)
+V6_HOSTS=${MU300_V6_HOSTS:-2606:4700:4700::1111 2620:119:35::35}
+V6_PORT=${MU300_V6_PORT:-80}
+V6_TIME=${MU300_V6_TIME:-5}
+case $V6_TIME in ''|*[!0-9]*|0) V6_TIME=5 ;; esac
+V6_TABLE=2023
+# V6_ON: this run's answer (1 yes, 0 no, empty: not asked yet); V6_WHY: the reason, as the log and status give it;
+# V6_ASKING: the engine's config is being written for the question
+V6_ON=; V6_WHY=; V6_ASKING=
+# v6_fetch ADDR FILE: the start of what an HTTP server at ADDR answers, into FILE; FILE.end when it is over (a
+# server that closed without a word is over at once). Never longer than V6_TIME seconds. busybox's nc has no
+# timeout and ends when its input does: the sleep holds that open.
+v6_fetch() {
+    if [ -z "${MU300_NO_CURL:-}" ] && command -v curl >/dev/null 2>&1; then
+        curl -s -m "$V6_TIME" -I "http://[$1]:$V6_PORT/" > "$2" 2>/dev/null </dev/null || true
+    else
+        { printf 'HEAD / HTTP/1.0\r\n\r\n'; sleep "$V6_TIME"; } 2>/dev/null |
+            { nc "$1" "$V6_PORT" > "$2" 2>/dev/null || true; : > "$2.end"; }
+    fi
+    : > "$2.end"
+}
+# v6_probe: one of V6_HOSTS answered within V6_TIME seconds (V6_BY: which). 1: none did; 2: nothing here to ask with.
+v6_probe() {
+    V6_BY=
+    if [ -n "${MU300_V6_PROBE:-}" ]; then
+        for _h in $V6_HOSTS; do
+            if "$MU300_V6_PROBE" "$_h"; then V6_BY=$_h; return 0; fi
+        done
+        return 1
+    fi
+    { [ -z "${MU300_NO_CURL:-}" ] && command -v curl >/dev/null 2>&1; } || command -v nc >/dev/null 2>&1 || return 2
+    _vd=$RUN/.v6ask
+    rm -rf "$_vd"; mkdir -p "$_vd" || return 2
+    _vp=; _n=0
+    for _h in $V6_HOSTS; do
+        _n=$((_n + 1))
+        ( trap - EXIT INT TERM HUP; v6_fetch "$_h" "$_vd/$_n" ) >/dev/null 2>&1 &
+        _vp="$_vp $!"
+    done
+    _t=0
+    while :; do
+        _n=0; _left=
+        for _h in $V6_HOSTS; do
+            _n=$((_n + 1))
+            case $(head -c 5 "$_vd/$_n" 2>/dev/null) in HTTP/) V6_BY=$_h; break 2 ;; esac
+            [ -e "$_vd/$_n.end" ] || _left=1
+        done
+        [ -n "$_left" ] && [ "$_t" -lt "$V6_TIME" ] || break
+        sleep 1; _t=$((_t + 1))
+    done
+    for _p in $_vp; do kill_tree "$_p"; done
+    wait $_vp 2>/dev/null || true
+    rm -rf "$_vd"
+    [ -n "$V6_BY" ]
+}
+# v6_note YES|NO SOURCE REASON: what status reports about the tunnel that is up ($RUN/ipv6: one line, tab-separated).
+# SOURCE: probe (the tunnel was asked), setting (IPV6=0 or 1), config (the profile's own IPv6 address, or none).
+v6_note() { ( umask 077; printf '%s\t%s\t%s\n' "$1" "$2" "$3" > "$RUN/ipv6" ) 2>/dev/null || true; }
+# v6_record: the same for a run that does not ask
+v6_record() {
+    if [ "$IPV6" = 0 ]; then v6_note no setting "IPV6=0"
+    elif [ "$IPV6" = 1 ]; then
+        if tunnel_carries_v6; then v6_note yes setting "IPV6=1"
+        else v6_note no setting "IPV6=1, but this engine's tunnel has no IPv6 address"; fi
+    elif tunnel_carries_v6; then v6_note yes config "the profile's own IPv6 address"
+    else v6_note no config "the profile has no IPv6 address, and this engine's tunnel is not asked"; fi
+}
+# v6_ask_down: the question's rules and its table
+v6_ask_down() {
+    _r6=$(ip -6 rule show 2>/dev/null) || _r6=
+    for pref in 9003 9004; do
+        for _x in $(printf '%s\n' "$_r6" | awk -v p="$pref:" '$1 == p {print "x"}'); do
+            ip -6 rule del pref "$pref" 2>/dev/null || true
+        done
+    done
+    ip -6 route flush table "$V6_TABLE" 2>/dev/null || true
+}
+# ipv6_ask: the question, for an engine that is up on $TUN with no IPv6 routed into it. Sets V6_ON and V6_WHY, writes
+# $RUN/ipv6 and the one line of the log; 0 for a yes. The caller routes (routes6_up, or sing-box's own config).
+ipv6_ask() {
+    V6_ON=0; _rc=1
+    if ! tunnel_v6_addr; then
+        V6_WHY="the engine gave $TUN no IPv6 address to ask through"
+    elif ! { ip -6 route replace default dev "$TUN" table "$V6_TABLE" &&
+             ip -6 rule add pref 9003 fwmark "$MARK" lookup main; } 2>/dev/null; then
+        V6_WHY="the question could not be routed into $TUN (ip -6)"
+    else
+        for _h in $V6_HOSTS; do ip -6 rule add pref 9004 iif lo to "$_h" lookup "$V6_TABLE" 2>/dev/null || true; done
+        _rc=0; v6_probe || _rc=$?
+        case $_rc in
+            0) V6_ON=1; V6_WHY="$V6_BY answered through the tunnel" ;;
+            2) V6_WHY="nothing here to ask with, neither curl nor nc" ;;
+            *) V6_WHY="nothing answered over IPv6 through the tunnel, asked for ${V6_TIME}s at most: $V6_HOSTS" ;;
+        esac
+    fi
+    v6_ask_down
+    if [ "$V6_ON" = 1 ]; then
+        v6_note yes probe "$V6_WHY"
+        echo "IPv6: through the tunnel - $V6_WHY (IPV6=auto asks at every start)"
+        return 0
+    fi
+    v6_note no probe "$V6_WHY"
+    echo "IPv6: not through the tunnel, rejected on the uplinks - $V6_WHY (IPV6=auto asks at every start)"
+    return 1
 }
 
 # Everything unmarked that would leave on an uplink is dropped, for the device and its clients (IPv6 rejected, see
@@ -1406,7 +1586,7 @@ routing_cleanup() {
     ip route flush table "$TABLE" 2>/dev/null || true
     routes6_down
     nft delete table ip mu300_vpn_dns 2>/dev/null || true
-    rm -f "$RUN/iface" "$RUN/since" "$RUN/engine"
+    rm -f "$RUN/iface" "$RUN/since" "$RUN/engine" "$RUN/ipv6"
     [ "$n" -gt 0 ] && echo "removed $n stale routing rule(s) left by a VPN engine"
     return 0
 }
@@ -1779,6 +1959,9 @@ vpn_status() {
     _if=${_if:-$TUN}
     if [ -n "$_if" ] && ip link show "$_if" >/dev/null 2>&1; then
         echo "tunnel: $(ip -br addr show "$_if" 2>/dev/null | tr -s ' ')"
+        v6_status "$_if"
+        if [ -n "$V6S_ON" ]; then echo "IPv6: through the tunnel ($V6S_BY: $V6S_WHY)"
+        else echo "IPv6: not through the tunnel ($V6S_BY: $V6S_WHY)"; fi
         drv_status 2>/dev/null || true
         printf 'exit IP: '; (wget -qO- -T 8 http://api.ipify.org 2>/dev/null || curl -s -m 8 http://api.ipify.org 2>/dev/null || echo unreachable); echo
     else
@@ -1863,6 +2046,31 @@ profiles_json() {
     done | jq -s .
 }
 
+# v6_status IFACE: whether the tunnel that is up on IFACE carries IPv6 (V6S_ON: 1 or empty), who said so (V6S_BY:
+# probe - the tunnel was asked, IPV6=auto on a proxy engine; setting - IPV6=0 or 1; config - the profile's own IPv6
+# address) and in what words (V6S_WHY), as the run that brought it up wrote them ($RUN/ipv6). Without that file (a
+# tunnel a module before this one brought up): from the setting and the tunnel's addresses, as status always did.
+v6_status() {
+    V6S_ON=; V6S_BY=; V6S_WHY=
+    _l=$(head -n1 "$RUN/ipv6" 2>/dev/null | head -c 400) || _l=
+    _t=$(printf '\t')
+    case $_l in
+        yes"$_t"*|no"$_t"*)
+            case $_l in yes*) V6S_ON=1 ;; esac
+            _l=${_l#*"$_t"}; V6S_BY=${_l%%"$_t"*}; V6S_WHY=${_l#*"$_t"}
+            case $V6S_BY in probe|setting|config) return 0 ;; esac
+            V6S_ON=; V6S_BY=; V6S_WHY= ;;
+    esac
+    [ "$IPV6" = 0 ] || ! ip -6 addr show dev "$1" scope global 2>/dev/null | grep -q inet6 || V6S_ON=1
+    [ "$DRV_ROUTES" = core ] || [ "$IPV6" != 1 ] || V6S_ON=1
+    case $IPV6 in
+        auto) V6S_BY=config
+              if [ -n "$V6S_ON" ]; then V6S_WHY="the profile's own IPv6 address"
+              else V6S_WHY="the tunnel has no IPv6 address"; fi ;;
+        *) V6S_BY=setting; V6S_WHY="IPV6=$IPV6" ;;
+    esac
+}
+
 # status_json [exit-ip]
 status_json() {
     _ksa=; nft list table inet mu300_vpn >/dev/null 2>&1 && _ksa=1
@@ -1875,14 +2083,13 @@ status_json() {
         else _use=; [ -z "$_x" ] || _miss=$_x; fi
     fi
     _if=$(cat "$RUN/iface" 2>/dev/null) || _if=
-    _up=; _addrs=; _v6t=; _since=
+    _up=; _addrs=; _v6t=; _since=; V6S_BY=; V6S_WHY=
     if [ -n "$_if" ] && ip link show "$_if" >/dev/null 2>&1; then
         _up=1
         # since: when the tunnel came up - written by run next to iface ($RUN/since: OpenWrt's busybox has no stat)
         _since=$(head -c 16 "$RUN/since" 2>/dev/null | tr -cd 0-9) || _since=
         _addrs=$(ip -o addr show dev "$_if" 2>/dev/null | awk '{print $4}')
-        [ "$IPV6" = 0 ] || ! ip -6 addr show dev "$_if" scope global 2>/dev/null | grep -q inet6 || _v6t=1
-        [ "$DRV_ROUTES" = core ] || [ "$IPV6" != 1 ] || _v6t=1
+        v6_status "$_if"; _v6t=$V6S_ON
     fi
     _ip=
     if [ -n "${1:-}" ] && [ -n "$_up" ]; then
@@ -1892,11 +2099,13 @@ status_json() {
     jq -n --arg ver "$(module_version)" --arg en "$ENABLE" --arg ks "$KILL_SWITCH" --arg ksa "$_ksa" \
         --arg v6 "$IPV6" --arg v6t "$_v6t" --arg v6g "$_v6g" --arg id "$ACTIVE" --arg pn "$_pn" --arg pt "$PTYPE" \
         --arg eng "$_eng" --arg x "$_x" --arg inst "$_inst" --arg use "$_use" --arg why "$_why" --arg if "$_if" \
-        --arg up "$_up" --arg addrs "$_addrs" --arg ip "$_ip" --arg miss "$_miss" --arg since "${_since:-}" '
+        --arg up "$_up" --arg addrs "$_addrs" --arg ip "$_ip" --arg miss "$_miss" --arg since "${_since:-}" \
+        --arg v6by "$V6S_BY" --arg v6why "$V6S_WHY" '
         {version: $ver, enabled: ($en == "1"), running: ($up == "1"),
          since: (if $up == "1" then ($since | tonumber? // null) else null end),
          kill_switch: {setting: ($ks == "1"), active: ($ksa == "1")},
-         ipv6: {setting: $v6, tunnel: ($v6t == "1"), guard: ($v6g == "1")},
+         ipv6: {setting: $v6, tunnel: ($v6t == "1"), guard: ($v6g == "1"),
+                source: (if $v6by == "" then null else $v6by end), reason: (if $v6why == "" then null else $v6why end)},
          profile: (if $id == "" and $pt == "" then null
                    else {id: (if $id == "" then null else $id end), name: (if $id == "" then "vpn.conf" else $pn end),
                          type: $pt, engine: (if $eng == "" then null else $eng end)} end),
@@ -2431,14 +2640,34 @@ case "${1:-status}" in
         # Leftover routing of a run that was killed goes first, as it always did for xray: the drivers look the
         # servers up over the bearer, not into a tunnel with nothing at the other end. Then what this run's driver
         # writes, and nothing a previous profile left.
+        # A run that asks the tunnel about IPv6 puts the guard up before the old routing goes: the previous run
+        # may have carried IPv6 without one, and from here until the answer IPv6 is rejected, not on the uplink.
+        # (Behind the kill switch there is nothing to add: it rejects the same.)
+        if v6_asks && [ "$KILL_SWITCH" != 1 ]; then
+            ipv6_guard_on || echo "could not reject IPv6 beside the tunnel (nft)" >&2
+        fi
         routes_down
-        rm -f "$RUN/server-ip" "$RUN/dns" "$RUN/iface" "$RUN/since"
+        rm -f "$RUN/server-ip" "$RUN/dns" "$RUN/iface" "$RUN/since" "$RUN/ipv6"
         # the engine this run uses (a VLESS xray profile behind the kill switch runs on sing-box): engine remove asks it
         { mkdir -p "$RUN" && chmod 700 "$RUN" && type_engine "${DRIVER:-$PTYPE}" > "$RUN/engine"; } || true
+        # (status, until the question about IPv6 is answered: the TUN has an IPv6 address by then, and carries none)
+        if v6_asks; then v6_note no probe "the tunnel is being asked"; fi
         # ... and says so, first: the log's lines of this run are this engine's (logs ENGINE, see logs_engine)
         echo "engine: $(type_engine "${DRIVER:-$PTYPE}") (profile ${ACTIVE:-vpn.conf})"
         # the resolver the engine finds its server at (sing-box, mihomo, dae): one that answers on this uplink
         bootstrap_pick || exit 1
+        # IPV6=auto on a proxy engine: its tunnel is asked whether IPv6 works through it (ipv6_ask). An engine
+        # that is exec'd is asked now, before the config it will run is written: it routes by what that says. The
+        # others get a TUN that takes IPv6 and are asked once they are up (run_tunnel).
+        if v6_asks; then
+            V6_ASKING=1
+            if [ "$DRV_FOREGROUND" = 1 ]; then
+                drv_v6ask
+                V6_ASKING=
+                # (a driver that did not get as far as the question)
+                [ -n "$V6_ON" ] || { V6_ON=0; v6_note no probe "the engine did not come up for the question"; }
+            fi
+        fi
         if [ "$DRV_FOREGROUND" = 1 ]; then drv_gen >/dev/null; else drv_gen; fi
         ensure_firewall_zone
         [ "$DRV_FOREGROUND" = 1 ] || run_tunnel
@@ -2448,6 +2677,7 @@ case "${1:-status}" in
         # away with the rest: routes_down).
         tailscale_up
         dns_nat_up
+        v6_asks || v6_record
         ipv6_guard
         echo "$TUN" > "$RUN/iface"; date +%s > "$RUN/since"
         drv_start ;;

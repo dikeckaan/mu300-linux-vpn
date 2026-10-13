@@ -355,7 +355,8 @@ class KillSwitch(ShellTest):
                          'udp dport 53 dnat to 9.9.9.9', 'tcp dport 53 dnat to 9.9.9.9'):
                 self.assertIn(want, nat[0])
             ev = self.events()
-            self.assertLess(ev.index('table ip mu300_vpn_dns {'), ev.index('engine sing-box run -c'))
+            # (the last run: with IPV6=auto sing-box is run once before, to be asked about IPv6, see drv_v6ask)
+            self.assertLess(ev.index('table ip mu300_vpn_dns {'), ev.rindex('engine sing-box run -c'))
             self.assertClosed(r.stderr)
             self.assertEqual(self.run_vpn(shell, self.conf_ks()).returncode, 0)
             ev = self.events()

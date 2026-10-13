@@ -127,7 +127,7 @@ VPN that is on uses a new value from its next `mu300-vpn restart`):
 |---|---|---|---|
 | `KILL_SWITCH` | 0, 1 | 1 | nothing but the tunnel leaves the device, also while the tunnel is down |
 | `TAILSCALE` | 0, 1 | 1 | Tailscale's own traffic through the tunnel (below) |
-| `IPV6` | 0, 1, auto | auto | IPv6 through the tunnel when it has an IPv6 address (auto: WireGuard's own; 1: also ask sing-box/mihomo for one); otherwise IPv6 on the uplinks is rejected while the tunnel is up, so programs fall back to IPv4 at once and nothing leaks beside it |
+| `IPV6` | 0, 1, auto | auto | IPv6 through the tunnel. `auto`: where it works - a WireGuard or OpenVPN profile's own IPv6 address, and for xray, sing-box and mihomo what the tunnel says when it is asked: every start fetches from two IPv6-only addresses through it (a few seconds at most), and the log and `status` say what came of it; dae stays on IPv4. `1`: always, whether or not the server can deliver it (xray, sing-box and mihomo get an IPv6 tunnel address). `0`: never. Whenever the tunnel does not carry IPv6, IPv6 on the uplinks is rejected while it is up, so programs fall back to IPv4 at once and nothing leaks beside it |
 | `REMOTE_DNS` | an address | 1.1.1.1 | DNS for the device and its clients, through the tunnel |
 | `BOOTSTRAP_DNS` | an address | 1.1.1.1 | for the server's own name, outside the tunnel (sing-box, mihomo, dae). When it does not answer on the uplink (a carrier that lets DNS through to its own resolvers only), the uplink's own resolver is used for that run, and the log says so |
 | `LAN_CIDRS` | CIDRs, comma-separated | empty | more networks that stay local (the device's own LAN always does) |

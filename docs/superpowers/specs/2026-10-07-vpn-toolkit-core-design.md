@@ -66,7 +66,7 @@ Everything under `/etc/mu300`, which updates keep. Each system (Ubuntu, OpenWrt,
 |---|---|---|---|
 | KILL_SWITCH | 0, 1 | 1 | anything but 0 is 1 (as today) |
 | TAILSCALE | 0, 1 | 1 | anything but 0 is 1 |
-| IPV6 | 0, 1 | 0 | |
+| IPV6 | 0, 1, auto | auto | (auto since module v2: the engine-extras spec, section 7) |
 | REMOTE_DNS | IPv4/IPv6 address | 1.1.1.1 | DNS for the device and clients, through the tunnel |
 | BOOTSTRAP_DNS | IPv4/IPv6 address | 1.1.1.1 | for server names, outside the tunnel (sing-box, mihomo) |
 | LAN_CIDRS | comma list of CIDRs | empty | the device's own LAN is always added (as today) |

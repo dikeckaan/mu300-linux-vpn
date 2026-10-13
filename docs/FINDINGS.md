@@ -296,3 +296,103 @@ only the first was true. A link's config never showed it: it answers every DNS p
 it down with the rest). Measured: the same raw profile resolves names it had never asked for, on the device and
 for the LAN client through the router; the link profile is unchanged (its hijack takes the redirected packets as it
 took the others).
+
+### 26n. IPV6=auto on the proxy engines: the tunnel is asked, at every start
+Asked for in mu300-linux issue 202: with `IPV6=auto` a sing-box tunnel stayed IPv4 whatever its server could do.
+That was the documented meaning (26g, 26j): a WireGuard config says itself whether it has IPv6, a proxy does not -
+its TUN takes every IPv6 packet, the engine answers the TCP connect on the device, and whether anything comes back
+is the server's business. A tunnel that takes IPv6 it cannot deliver leaves every dual-stack program waiting (26j),
+so auto left Xray, sing-box, mihomo and dae on IPv4, and `IPV6=1` was the user's word that the server can.
+
+Now a start asks (`ipv6_ask` in the core, for a driver that says `DRV_V6ASK=1`: xray, sing-box, mihomo):
+
+* The engine comes up with an IPv6 address on its TUN (hev-socks5-tunnel: `ipv6: 'fdfe:dcba:9875::1'`; mihomo: its
+  default, by not writing `inet6-address: []`; sing-box: the second `address`) and **no IPv6 routed into it** except
+  the question: `ip -6 rule` 9003 keeps the engine's own marked sockets in main, 9004 sends the device's own packets
+  (`iif lo`) to two addresses into table 2023, whose only route is the TUN.
+* The question is `HEAD / HTTP/1.0` on port 80 of both addresses at once (curl where there is one; else busybox's
+  nc, which has no timeout and ends with its input: `{ printf ...; sleep 5; } | nc ADDR 80`), and a yes is a reply
+  that begins `HTTP/` within 5 s. Not a connect: that is answered by the engine's own TCP whatever the far end can
+  do (26l) - `uclient-fetch` through the working profile's tunnel, whose exit has no IPv6, says "Connecting to ...",
+  then "Connection reset prematurely" after 2-3 s. Not DNS to an IPv6 resolver: sing-box's `hijack-dns` and dae
+  answer that themselves. Addresses, not names: at that moment nothing resolves names through the tunnel yet.
+  The two: `2606:4700:4700::1111` (Cloudflare: a 301) and `2620:119:35::35` (OpenDNS: over IPv4 its twin
+  208.67.222.222 answers a 404). Google's and Quad9's resolvers say nothing on port 80 (8.8.8.8 and 9.9.9.9, from
+  here). Two operators, so that one of them blocked at an exit does not turn IPv6 off; a wrong no costs IPv6, never
+  a leak.
+* Yes: the core adds the IPv6 rules 9000-9010 (`routes6_up`). No, or nothing to ask with: the question's rules go,
+  the address is taken off the TUN again (`ip -6 addr flush dev TUN scope global`), and everything is as v2.0.1 left
+  it. IPv4 is routed before the question, so clients do not wait for it.
+* sing-box is exec'd and routes by its config (`auto_route`), and its DNS strategy (`ipv4_only` or `prefer_ipv4`)
+  is in that config too: it is asked **before** the config it will run is written - started once with the IPv6
+  config but `auto_route: false` and log level `panic` (`drv_v6ask`), asked, stopped - and the config that is then
+  written is exactly v2.0.1's for IPV6=1 after a yes and for auto after a no.
+* One line of the log, and the same in `status` (`IPv6: ... (probe: ...)`) and `status --json` (`ipv6.tunnel`,
+  `ipv6.source`: `probe`, `setting` or `config`, and `ipv6.reason`), from `$RUN/ipv6`, which every run writes:
+
+      IPv6: through the tunnel - 2606:4700:4700::1111 answered through the tunnel (IPV6=auto asks at every start)
+      IPv6: not through the tunnel, rejected on the uplinks - nothing answered over IPv6 through the tunnel, asked for 5s at most: 2606:4700:4700::1111 2620:119:35::35 (IPV6=auto asks at every start)
+
+**Nothing beside the tunnel, at any moment.** A run that asks puts the IPv6 guard up before it takes the previous
+run's routing away (`run`, before `routes_down`; behind the kill switch there is nothing to add, it rejects the
+same), and never takes it down, whatever the answer: sing-box adds its IPv6 routes some time after it is exec'd, and
+nothing of ours runs then to take a guard down at the right moment. So after a yes `status --json` says `"tunnel":
+true, "guard": true`: IPv6 that is routed into the tunnel does not meet the guard (it rejects on the uplinks only,
+and lets the engine's marked sockets out), and what the routing does not send into the tunnel is rejected, not
+carried by the carrier. Behind the kill switch the question adds no nft transaction at all. `IPV6=1`, and a
+WireGuard or OpenVPN config with its own IPv6, keep the guard as they had it (off while the tunnel carries IPv6).
+
+**The LAN's side, found on the way.** With IPv6 routed into the tunnel by the core (xray and mihomo now; mihomo with
+`IPV6=1` and WireGuard before), a LAN client's IPv6 never worked: rule 9010 sent *everything* into the tunnel,
+including the tunnel's answers to the client and the device's own (a ping of the router's IPv6 address from the LAN
+got no answer; `ip -6 route get <client>`: `dev xtun table 2022`). `LAN_CIDRS` names IPv4 networks, and a prefix
+that comes from the carrier (the images relay the bearer's /64 to the LAN: `dhcp.lan.ra='relay'`) cannot be a
+setting. `routes6_up` now has, at 9001, `lookup main suppress_prefixlength 0`: what main has a route to that is not
+its default stays there - the LAN's prefix, and the host routes odhcpd keeps for the clients of a relayed prefix.
+sing-box's auto_route has the same rule. (The bearer's own /64 is such a route too: a packet to an address in it
+that is no LAN client's leaves on the bearer when neither guard nor kill switch is up - that is with `IPV6=1`, or a
+WireGuard or OpenVPN config's IPv6, and the kill switch off.)
+
+**`IPV6=1` on Xray** did nothing before: hev-socks5-tunnel was never given an IPv6 address, so the core never
+routed IPv6 into it. It gets one now, as the setting's description always said.
+
+**Measured** on the U30 Air (OpenWrt, kernel 7.2.10; the bearer has no IPv6 at all, the LAN has its ULA prefix). The
+LAN client was a network namespace on the device, bridged into br-lan with an address of that prefix and the router
+as its gateway: the Mac on the USB link gets no IPv6 address there, the carrier gives none to relay.
+
+* **No, on the working profile's server** (its exit has no IPv6). Xray: `tunnel up` at :51, the line above at :54;
+  no IPv6 rule, no global address left on xtun, guard on, exit address unchanged - the state v2.0.1 leaves. The
+  same link on sing-box: the line 3 s after the bootstrap resolver was found, which is what the question adds to
+  that start (the engine started and stopped once more, and the question); the config it then runs is v2.0.1's.
+* **No, on a throwaway server on the USB link** (VLESS and Shadowsocks, on the Mac, which has no IPv6 route: it
+  dials the asked addresses and gets "no route to host"). xray and mihomo with the kill switch off, sing-box with
+  it on: the line after 1-2 s, the same state; an IPv6 fetch fails at once on the device, and after 1 s on the LAN
+  client (sing-box: 8 s, see below); the client's IPv4 is not touched.
+* **Yes, on the same server made to deliver** every IPv6 destination to an HTTP server on its own `::1` (a route
+  rule of the server; the device knows nothing of it). xray, sing-box and mihomo with the kill switch off, sing-box
+  and mihomo also with it on: the line after 1-2 s (sing-box 2-3 s, its second start included); then
+  `uclient-fetch 'http://[2001:db8::80]/'` answers on the device and on the LAN client within a second, the client's
+  IPv4 works as before, the client pings the router's IPv6 address, and `status --json` says `"tunnel": true,
+  "guard": true, "source": "probe"`.
+* `IPV6=1` on the working profile (xray): IPv6 routed in, guard off, an IPv6 fetch ends after 2 s with nothing -
+  what the setting asks for. `IPV6=0`: nothing routed, guard on, `"source": "setting"`.
+
+**Not measured.** An exit with real IPv6: neither the working profile's server nor the Mac has any, so the yes was
+measured against a server that hands every IPv6 destination to a local HTTP server - the device's side of it (the
+TUN, the routing, the question, the guard, a LAN client) is the real thing, the IPv6 internet behind the server is
+not. For the same reason the two addresses were never fetched over IPv6 from here: Cloudflare's is known to
+answer, OpenDNS's is taken from its IPv4 twin. A leak on a bearer that has IPv6 (this one has none; the unit tests
+hold the order of the nft and ip calls). curl's path of the question on a device (Ubuntu's images; the unit tests
+run both paths against a server on `::1`). A relayed carrier prefix on the LAN. Xray behind the kill switch (a
+VLESS link runs on sing-box there).
+
+**Left as it is.** dae: its "tunnel" is a dummy interface without an IPv6 address, the core has never routed IPv6
+into it with any setting, and its LAN side catches the LAN's packets itself: not asked, IPv4 as before. OpenVPN and
+WireGuard: their config's own address decides, as before. A server that gains or loses IPv6 while the tunnel is up
+is noticed at the next start. An engine whose rules send the asked addresses `DIRECT` is asked about the uplink,
+which is where its clients' IPv6 would go, too. mihomo, with an IPv6 address on its TUN, puts a default route into
+table 2022 and an `oif mh-mu300` rule itself (with `IPV6=1` in v2.0.1 as well): after a no both are still there and
+reach nothing. And sing-box without an IPv6 address adds `ip -6 rule 9000: from all unreachable` (strict_route), in
+v2.0.1 as now: the device's own IPv6 fails at once, but a LAN client's waits 8 s for nothing and the router's own
+IPv6 address does not answer the LAN while that tunnel is up - the guard's "rejected at once" does not hold for
+forwarded IPv6 on sing-box.
