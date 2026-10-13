@@ -123,7 +123,8 @@ which need root and print the raw config.
 ```json
 {"version": "v2.0.0", "enabled": true, "running": true, "since": 1760180000,
  "kill_switch": {"setting": true, "active": true},
- "ipv6": {"setting": "auto", "tunnel": false, "guard": true},
+ "ipv6": {"setting": "auto", "tunnel": false, "guard": true, "source": "probe",
+          "reason": "nothing answered over IPv6 through the tunnel, asked for 5s at most: ..."},
  "profile": {"id": "office", "name": "Office", "type": "xray", "engine": "sing-box"},
  "engine": {"name": "sing-box", "extra": "vpn-singbox", "installed": true, "usable": true, "reason": null},
  "tunnel": {"iface": "sbtun", "up": true, "addresses": ["172.19.0.1/30"]},
@@ -283,16 +284,30 @@ global IPv6 address on `sipa_eth0`, nothing routes over it, and programs that pr
 country where the carrier's IPv6 works, the device's and the LAN's IPv6 would leave beside an IPv4-only tunnel: a
 leak. The rule:
 
-* `IPV6` setting: `0` (never through the tunnel), `1` (ask the engine for an IPv6 tunnel address: sing-box, mihomo,
-  WireGuard), `auto` (default: WireGuard uses the IPv6 addresses of its config, the others stay IPv4).
-* The tunnel **carries IPv6** when it has a global IPv6 address (and IPV6 is not 0): the core routes IPv6 into it
-  (rules 9000-9010 for IPv6, as before).
+* `IPV6` setting: `0` (never through the tunnel), `1` (ask the engine for an IPv6 tunnel address: xray, sing-box,
+  mihomo, WireGuard), `auto` (default: WireGuard and OpenVPN use the IPv6 addresses of their config; xray, sing-box
+  and mihomo are asked, next item; dae stays IPv4).
+* `auto` on a proxy engine (a driver with `DRV_V6ASK=1`; added in v2.0.2, FINDINGS 26n): every start **asks the
+  tunnel**. The engine comes up with an IPv6 address on its TUN and no IPv6 routed into it but the question: the
+  device's own packets to two public addresses that answer plain HTTP (`V6_HOSTS`), through table 2023 (rules 9003
+  and 9004, removed again). An HTTP reply from one of them within 5 s: IPv6 is routed into the tunnel (the core's
+  rules; sing-box, which is exec'd and routes by its config, is run once for the question with `auto_route` off,
+  stopped, and started with the IPv6 address in its config). Anything else: the tunnel is IPv4 as before, the
+  address is taken off the TUN again. One line of the log says which and why; `status` and `status --json`
+  (`ipv6.tunnel`, `ipv6.source`: `probe`, `setting` or `config`, `ipv6.reason`) repeat it. A run that asks puts the
+  guard (below) up before it takes the previous run's routing away and never takes it down, whatever the answer:
+  IPv6 is rejected on the uplinks or in the tunnel, at no moment neither.
+* The tunnel **carries IPv6** when it has a global IPv6 address (and IPV6 is not 0; a run that asked: after a yes):
+  the core routes IPv6 into it (rules 9000-9010 for IPv6, as before, and at 9001 `lookup main
+  suppress_prefixlength 0`, so that the LAN's own prefix and its clients' addresses stay local).
 * Otherwise, while the tunnel is up, the **IPv6 guard** (`table inet mu300_vpn_v6`, separate from the kill switch,
   installed whatever KILL_SWITCH says): on the uplinks (`sipa_eth*` and the Wi-Fi client), IPv6 in the output and
   forward hooks is rejected - TCP with a reset, everything else with ICMPv6 admin-prohibited - except the engine's
   marked sockets (an IPv6 server), ICMPv6 neighbour/router solicitation and advertisement, and DHCPv6 (UDP 546/547)
   from the device. LAN clients keep whatever IPv6 address the router gives them (the router's RA/odhcpd config is not
   touched), and their IPv6 is rejected at once, so they fall back to IPv4.
+* (`status --json`'s `ipv6.guard` is whether that table is loaded: true beside a tunnel that carries IPv6 because it
+  was asked, false beside one that carries it by the setting or its config.)
 * The guard goes when the tunnel goes down; with the kill switch on, the kill switch's own IPv6 rejects take over.
   `off` removes both. VPN off: nothing changes.
 

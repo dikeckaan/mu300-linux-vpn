@@ -22,6 +22,8 @@ MHPID=; DRV_GONE=
 # mihomo looks its servers' names up at BOOTSTRAP_DNS itself: the core tries first which resolver answers on this
 # uplink (bootstrap_pick)
 DRV_BOOTSTRAP=1
+# with IPV6=auto the core asks, once the tunnel is up, whether IPv6 works through it (ipv6_ask)
+DRV_V6ASK=1
 
 # mihomo reads SAFE_PATHS (directories a provider's path or external-ui may name outside its home) and
 # SKIP_SAFE_PATH_CHECK from its environment: neither is ever passed on, so everything it reads or writes stays in
@@ -362,9 +364,10 @@ mihomo_read() {
 # everything else through REMOTE_DNS behind the rules.
 # LOGLEVEL: written when the file names none - mihomo's own default, info, writes a line for every connection of
 # every client into the system log, which pushes the service's own messages out of it within minutes.
-# The TUN gets no IPv6 address unless the IPV6 setting is 1: mihomo gives it one by default (fdfe:dcba:9876::1/126),
-# the core then took the tunnel for one that carries IPv6, routed IPv6 into it and left the IPv6 guard off - and a
-# server without IPv6 leaves every program that prefers it without an answer (FINDINGS 26j).
+# The TUN gets no IPv6 address unless the core says so (v6_tun: IPV6=1, and with auto for the question whether IPv6
+# works through the tunnel - after a no the core takes the address away again): mihomo gives it one by default
+# (fdfe:dcba:9876::1/126), the core then took the tunnel for one that carries IPv6, routed IPv6 into it and left the
+# IPv6 guard off - and a server without IPv6 leaves every program that prefers it without an answer (FINDINGS 26j).
 # mihomo_ours STACK [LOGLEVEL]
 mihomo_ours() {
     [ -z "${2:-}" ] || printf 'log-level: %s\n' "$2"
@@ -383,7 +386,7 @@ tun:
   mtu: 1400
   inet4-address: [198.18.8.1/30]
 EOF
-    [ "$IPV6" = 1 ] || echo '  inet6-address: []'
+    v6_tun || echo '  inet6-address: []'
     cat <<EOF
 dns:
   enable: true
