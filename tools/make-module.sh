@@ -26,7 +26,9 @@ OUT=${1:?usage: tools/make-module.sh OUTDIR [TAG]}
 TAG=${2:-v0.0.0-dev}
 case $TAG in v[0-9]*) ;; *) echo "TAG is vMAJOR.MINOR.PATCH" >&2; exit 2 ;; esac
 # the first mu300-linux release whose mu300-extra installs this module (and that has no mu300-vpn of its own); the
-# engine extras need the same, and an mu300-extra that knows their names (mu300-vpn falls back to the bundle)
+# engine extras need the same, and an mu300-extra that knows their names (mu300-vpn falls back to the bundle). A
+# three-field mu300-linux tag: mu300-linux v2026.10.27 and older compare it as text, the releases after them by the
+# rule of their four-field tags (vYYYY.MM.DD.N newer than every vYYYY.MM.DD; mu300-linux docs/FINDINGS.md 125)
 REQUIRES='mu300-linux v2026.10.16'
 TOP=$(cd "$(dirname "$0")/.." && pwd)
 mkdir -p "$OUT"
