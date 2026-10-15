@@ -238,6 +238,12 @@ What mu300-extra accepts as the module: plain files and directories only, names 
 start with a dot, at most four levels deep; `VERSION` one line of `[A-Za-z0-9._-]`; `requires` the line
 `mu300-linux vYYYY.MM.DD`; `bin/mu300-vpn` and both hooks present (`tests/test_module.py` checks the built ones).
 
+mu300-linux release names: up to v2026.10.27 they were `vYYYY.MM.DD` (the "day" was a counter); the releases after
+it are `vYYYY.MM.DD.N`, the real day of the release and its number that day, and every one of them is newer than
+every three-field name (mu300-linux docs/FINDINGS.md 125). `requires` stays `mu300-linux v2026.10.16`, which every
+mu300-linux compares right. Should it ever name a four-field release, keep in mind that the `mu300-update` of
+v2026.10.27 and older compares `requires` as text: it would take `mu300-linux v2026.10.20.1` as met by v2026.10.27.
+
 ## For developers
 
 ```sh
