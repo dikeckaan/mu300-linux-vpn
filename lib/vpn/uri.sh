@@ -185,6 +185,83 @@ parse_uri() {
     parse_link "$VLESS_URI" || exit 1
 }
 
+# sb_vless: the VLESS link parse_link took apart, as sing-box can run it - or a refusal (stderr, 1) that says why it
+# cannot. Every variant a link can name was run against an Xray server (tools/vless-matrix.sh, docs/FINDINGS.md 26o):
+# what sing-box writes differently from Xray is translated here, and what it cannot write at all is refused, because
+# such a tunnel comes up and then every connection through it ends at once (the server drops what it cannot read).
+# Sets, for outbound_json: SB_FLOW (xtls-rprx-vision-udp443 is Xray's name for vision that lets UDP/443 through,
+# which sing-box's vision does anyway), SB_FP (the uTLS fingerprint: Xray's default chrome for REALITY, which sing-box
+# cannot do without one; Xray's randomizednoalpn, which sing-box does not have, is chrome, not sing-box's randomized,
+# whose hello Xray's TLS server turned away now and then), SB_ALPN (h3 never: VLESS here is TCP; h2 not on
+# WebSocket or HTTPUpgrade, where a server that accepts h2 takes the upgrade request for an HTTP/2 preface and closes),
+# SB_PATH and SB_ED (the WebSocket path without the ed=N that asks Xray for early data, and N: sing-box sends it in
+# the Sec-WebSocket-Protocol header, as Xray does; a path with ?ed= left in is not the server's path).
+# The message never repeats the link or its keys.
+SB_FINGERPRINTS='chrome firefox edge safari 360 qq ios android random randomized'
+# path_ed PATH: ED_PATH, the WebSocket or HTTPUpgrade PATH without an ed=N in its query (anywhere in it), and ED, the
+# N (empty without one); a value that is not a number of at most 5 digits is not early data and stays in the path
+path_ed() {
+    ED_PATH=$1; ED=
+    case $1 in *\?*) ;; *) return 0 ;; esac
+    _q=${1#*\?}; ED_PATH=${1%%\?*}; _keep=
+    _ifs=$IFS; IFS='&'; _glob=; case $- in *f*) ;; *) _glob=1; set -f ;; esac
+    for _kv in $_q; do
+        case $_kv in
+            ed=*[!0-9]*|ed=|ed=??????*) _keep=${_keep:+$_keep&}$_kv ;;
+            ed=*) ED=${_kv#ed=} ;;
+            *) _keep=${_keep:+$_keep&}$_kv ;;
+        esac
+    done
+    IFS=$_ifs; [ -z "$_glob" ] || set +f
+    [ -z "$_keep" ] || ED_PATH="$ED_PATH?$_keep"
+    return 0
+}
+sb_vless() {
+    _sbno() { echo "sing-box cannot run this link: $1" >&2; return 1; }
+    SB_FLOW=$FLOW; SB_FP=$FP; SB_PATH=$WSPATH; SB_ED=
+    _e=$(urldecode "$(param encryption)")
+    case ${_e:-none} in
+        none) ;;
+        *) _sbno "it asks for VLESS Encryption (encryption=${_e%%.*}...), which sing-box does not have; the server refuses a client without it" ; return 1 ;;
+    esac
+    case $TYPE in
+        tcp|raw)
+            case $(param headerType) in
+                ''|none) ;;
+                http) _sbno "its TCP transport has an HTTP header (headerType=http), which sing-box cannot send"; return 1 ;;
+                *) _sbno "its TCP transport has a header sing-box does not know (headerType)"; return 1 ;;
+            esac ;;
+        ws|httpupgrade)
+            # ?ed=N: early data, not part of the path. Xray takes it off the path on both ends, for both transports;
+            # sing-box has early data for WebSocket only, and an HTTPUpgrade server waits for none
+            path_ed "$WSPATH"; SB_PATH=$ED_PATH; SB_ED=$ED ;;
+        grpc) ;;
+        xhttp|splithttp) _sbno "sing-box has no XHTTP transport (type=$TYPE); Xray runs it"; return 1 ;;
+        h2|http) _sbno "its transport is HTTP/2 (type=$TYPE), which Xray removed in 25.x and mu300-vpn does not write for either engine; ask the server for an xhttp or ws link"; return 1 ;;
+        *) _sbno "sing-box has no '$TYPE' transport that speaks to Xray's"; return 1 ;;
+    esac
+    case $FLOW in
+        ''|xtls-rprx-vision) ;;
+        xtls-rprx-vision-udp443) SB_FLOW=xtls-rprx-vision ;;
+        *) _sbno "sing-box does not know its flow ($FLOW)"; return 1 ;;
+    esac
+    case $SECURITY in
+        tls|reality)
+            case $SB_FP in randomizednoalpn) SB_FP=chrome ;; esac
+            [ -n "$SB_FP" ] || [ "$SECURITY" != reality ] || SB_FP=chrome
+            if [ -n "$SB_FP" ]; then
+                case " $SB_FINGERPRINTS " in *" $SB_FP "*) ;; *)
+                    _sbno "sing-box does not know its TLS fingerprint (fp=$FP; it knows: $SB_FINGERPRINTS)"; return 1 ;; esac
+            fi
+            [ "$SECURITY" != reality ] || [ -n "$PBK" ] || { _sbno "a REALITY link without its public key (pbk)"; return 1; } ;;
+        none|'') ;;
+        *) _sbno "sing-box does not know its security ($SECURITY)"; return 1 ;;
+    esac
+    _drop=h3; case $TYPE in ws|httpupgrade) _drop='h3 h2' ;; esac
+    SB_ALPN=$(printf '%s' "$ALPN" | awk -F, -v drop=" $_drop " '{n = 0; for (i = 1; i <= NF; i++) if ($i != "" && index(drop, " " $i " ") == 0) printf "%s%s", (n++ ? "," : ""), $i}')
+    return 0
+}
+
 # link_need: VLESS_URI set to the link the drivers work from - the active profile's (PURI), or vpn.conf's where the
 # store is not used; the run ends when there is none. Only the profile's id is named, never the link.
 link_need() {

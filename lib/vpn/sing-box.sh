@@ -27,7 +27,9 @@ drv_check() {
         singbox_json_rebuild "$PDIR/.check.$$" || return 1
         rm -f "$PDIR/.check.$$"; return 0
     fi
-    ( link_need; parse_uri )
+    # (and is one sing-box can run: sb_vless says why not, at import and at check, rather than a tunnel that comes up
+    # and carries nothing)
+    ( link_need; parse_uri; sb_vless )
 }
 drv_gen() { if singbox_raw; then gen_singbox_json; else gen_singbox; fi; }
 # (--disable-color: its log goes to the system log and the control panel, where the colour codes are noise)
@@ -72,28 +74,29 @@ drv_import() {
 }
 drv_set() { link_opt_set "$1" "$2"; }
 
+# the sing-box outbound of the VLESS link parse_uri took apart, as sb_vless translates it (it ends the run on a link
+# sing-box cannot run)
 outbound_json() {
+    sb_vless || exit 1
     printf '{"type":"vless","tag":"proxy","server":%s,"server_port":%s,"uuid":%s' "$(json_str "$HOST")" "$PORT" "$(json_str "$UUID")"
-    [ -n "$FLOW" ] && printf ',"flow":%s' "$(json_str "$FLOW")"
+    [ -n "$SB_FLOW" ] && printf ',"flow":%s' "$(json_str "$SB_FLOW")"
     printf ',"packet_encoding":"xudp","domain_resolver":"bootstrap"'
     [ -n "$UPSTREAM_HTTP_PROXY" ] && printf ',"detour":"upstream"'
     case "$SECURITY" in
         tls|reality)
             printf ',"tls":{"enabled":true,"server_name":%s' "$(json_str "${SNI:-$HOST}")"
             case "$INSECURE" in 1|true) printf ',"insecure":true' ;; esac
-            # h3 (QUIC) does not apply to VLESS over TCP
-            ALPN=$(printf '%s' "$ALPN" | awk -F, '{n = 0; for (i = 1; i <= NF; i++) if ($i != "h3") printf "%s%s", (n++ ? "," : ""), $i}')
-            [ -n "$ALPN" ] && printf ',"alpn":%s' "$(json_list "$ALPN")"
-            [ -n "$FP" ] && printf ',"utls":{"enabled":true,"fingerprint":%s}' "$(json_str "$FP")"
+            [ -n "$SB_ALPN" ] && printf ',"alpn":%s' "$(json_list "$SB_ALPN")"
+            [ -n "$SB_FP" ] && printf ',"utls":{"enabled":true,"fingerprint":%s}' "$(json_str "$SB_FP")"
             [ "$SECURITY" = reality ] && printf ',"reality":{"enabled":true,"public_key":%s,"short_id":%s}' "$(json_str "$PBK")" "$(json_str "$SID")"
             printf '}' ;;
     esac
     case "$TYPE" in
-        ws) printf ',"transport":{"type":"ws","path":%s' "$(json_str "${WSPATH:-/}")"; [ -n "$WSHOST" ] && printf ',"headers":{"Host":%s}' "$(json_str "$WSHOST")"; printf '}' ;;
+        ws) printf ',"transport":{"type":"ws","path":%s' "$(json_str "${SB_PATH:-/}")"; [ -n "$WSHOST" ] && printf ',"headers":{"Host":%s}' "$(json_str "$WSHOST")"
+            [ -n "$SB_ED" ] && printf ',"max_early_data":%d,"early_data_header_name":"Sec-WebSocket-Protocol"' "$SB_ED"
+            printf '}' ;;
         grpc) printf ',"transport":{"type":"grpc","service_name":%s}' "$(json_str "$SVC")" ;;
-        httpupgrade) printf ',"transport":{"type":"httpupgrade","path":%s' "$(json_str "${WSPATH:-/}")"; [ -n "$WSHOST" ] && printf ',"host":%s' "$(json_str "$WSHOST")"; printf '}' ;;
-        tcp|raw) ;;
-        *) echo "transport type '$TYPE' is not supported by this helper" >&2; exit 1 ;;
+        httpupgrade) printf ',"transport":{"type":"httpupgrade","path":%s' "$(json_str "${SB_PATH:-/}")"; [ -n "$WSHOST" ] && printf ',"host":%s' "$(json_str "$WSHOST")"; printf '}' ;;
     esac
     printf '}'
 }
@@ -111,6 +114,7 @@ singbox_log_level() { if [ -n "${SB_ASK:-}" ]; then echo panic; else echo warn; 
 gen_singbox() {
     link_need
     parse_uri
+    sb_vless || exit 1
     mkdir -p "$RUN"; chmod 700 "$RUN"
     excl=$(json_list "$LAN_CIDRS")
     {

@@ -14,16 +14,42 @@ DRV_V6ASK=1
 # SOCKS port on loopback. Neither installs routes, so the core does (routes_up, DRV_ROUTES=core), with the same rule
 # prefs and table as sing-box's auto_route - which is what lets routing_cleanup and the kill switch serve both engines.
 
+# Xray's geodata, which a config's geoip: and geosite: read (a raw config from a panel nearly always names them):
+# geoip.dat and geosite.dat in the extra's share/xray, beside bin (tools/fetch-xray.sh; the bundle has them in the
+# same place). Xray looks next to its binary unless XRAY_LOCATION_ASSET says where: it is set to them when they are
+# there and nothing else set it. An Xray from elsewhere (XRAY=, /opt/mu300/bin, PATH) looks where it always did.
+xray_assets() {
+    [ -z "${XRAY_LOCATION_ASSET:-}" ] || return 0
+    _xa=${XRAY%/*}; _xa=${_xa%/*}/share/xray
+    if [ -r "$_xa/geoip.dat" ] && [ -r "$_xa/geosite.dat" ]; then XRAY_LOCATION_ASSET=$_xa; export XRAY_LOCATION_ASSET; fi
+    return 0
+}
+
 listening() { { ss -ltn 2>/dev/null || netstat -ltn 2>/dev/null; } | grep -q "127.0.0.1:$1 "; }
 
+# (splithttp is XHTTP's earlier name, which links still carry; h2 and http, the HTTP/2 transport, are gone from Xray
+# 25 and later. A TCP header other than none is http: its request path and Host, comma-separated lists in a link -
+# without it the server reads the client's VLESS header as a broken HTTP request. docs/FINDINGS.md 26o.)
 xray_stream_json() {
-    case "$TYPE" in tcp|raw) net=raw ;; ws|grpc|httpupgrade|xhttp) net=$TYPE ;;
+    case "$TYPE" in tcp|raw) net=raw ;; ws|grpc|httpupgrade|xhttp) net=$TYPE ;; splithttp) net=xhttp ;;
+        h2|http) echo "the link's transport is HTTP/2 (type=$TYPE), which Xray removed in 25.x: ask the server for an xhttp or ws link" >&2; exit 1 ;;
         *) echo "transport type '$TYPE' is not supported by this helper" >&2; exit 1 ;; esac
     printf '"streamSettings":{"network":"%s"' "$net"
-    case "$TYPE" in
+    case "$net" in
+        raw)
+            case $(param headerType) in
+                ''|none) ;;
+                http) printf ',"rawSettings":{"header":{"type":"http","request":{"path":%s' "$(json_list "${WSPATH:-/}")"
+                      [ -n "$WSHOST" ] && printf ',"headers":{"Host":%s}' "$(json_list "$WSHOST")"
+                      printf '}}}' ;;
+                *) echo "the link's TCP header (headerType) is not one Xray knows" >&2; exit 1 ;;
+            esac ;;
         ws) printf ',"wsSettings":{"path":%s' "$(json_str "${WSPATH:-/}")"; [ -n "$WSHOST" ] && printf ',"host":%s' "$(json_str "$WSHOST")"; printf '}' ;;
         grpc) printf ',"grpcSettings":{"serviceName":%s}' "$(json_str "$SVC")" ;;
-        httpupgrade) printf ',"httpupgradeSettings":{"path":%s' "$(json_str "${WSPATH:-/}")"; [ -n "$WSHOST" ] && printf ',"host":%s' "$(json_str "$WSHOST")"; printf '}' ;;
+        # (without the path's ?ed=: Xray 26's HTTPUpgrade client with early data never dialled the server, the
+        # connection waited for ever (FINDINGS 26o); the server takes ed off its own path, so the paths still match)
+        httpupgrade) path_ed "$WSPATH"
+                     printf ',"httpupgradeSettings":{"path":%s' "$(json_str "${ED_PATH:-/}")"; [ -n "$WSHOST" ] && printf ',"host":%s' "$(json_str "$WSHOST")"; printf '}' ;;
         xhttp) printf ',"xhttpSettings":{"path":%s' "$(json_str "${WSPATH:-/}")"; [ -n "$WSHOST" ] && printf ',"host":%s' "$(json_str "$WSHOST")"
                [ -n "$XMODE" ] && printf ',"mode":%s' "$(json_str "$XMODE")"; printf '}' ;;
     esac
@@ -155,6 +181,7 @@ gen_xray() {
     chmod 600 "$RUN/xray.json"
     xray_hev_yml
     printf '%s\n' "$SERVER_IP" > "$RUN/server-ip"
+    xray_assets
     "$XRAY" run -test -c "$RUN/xray.json" >/dev/null || { "$XRAY" run -test -c "$RUN/xray.json" >&2; exit 1; }
     echo "xray config OK ($RUN/xray.json), server $HOST -> $SERVER_IP"
 }
@@ -435,7 +462,16 @@ gen_xray_json() {
     xray_hev_yml
     # the resolved names and the addresses the config gave: rule 9002 keeps every one of them off the tunnel
     for _a in $_ips $_lits; do printf '%s\n' "$_a"; done > "$RUN/server-ip"
-    "$XRAY" run -test -c "$RUN/xray.json" >/dev/null || { "$XRAY" run -test -c "$RUN/xray.json" >&2; exit 1; }
+    xray_assets
+    if ! "$XRAY" run -test -c "$RUN/xray.json" >/dev/null; then
+        "$XRAY" run -test -c "$RUN/xray.json" >&2 || true
+        # (rules that name geoip: or geosite: need the geodata, which vpn-xray carries from v2.0.3 on)
+        if grep -qE 'geoip:|geosite:' "$RUN/xray.json" && [ -z "${XRAY_LOCATION_ASSET:-}" ]; then
+            echo "the config's rules need Xray's geodata (geoip.dat, geosite.dat), which is not beside $XRAY:" \
+                "mu300-vpn engine install xray brings it" >&2
+        fi
+        exit 1
+    fi
     echo "xray config OK ($RUN/xray.json)"
 }
 
@@ -480,6 +516,7 @@ drv_start() {
         case "$l" in *"peer cert is unrecognized (against pinnedPeerCertSha256)"*) : > "$RUN/pin-mismatch" ;; esac
         case "$l" in *"[Info]"*|*"[Debug]"*) ;; *) printf '%s\n' "$l" ;; esac
     done < "$RUN/xray.out" &
+    xray_assets
     "$XRAY" run -c "$RUN/xray.json" > "$RUN/xray.out" 2>&1 & XPID=$!
     HPID=; DRV_PIDS=$XPID
     n=0

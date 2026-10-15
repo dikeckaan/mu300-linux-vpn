@@ -81,6 +81,9 @@ class ShellTest(unittest.TestCase):
         # answers in the far end's place too (no, unless a test says otherwise: the tunnel is IPv4, as it was before
         # the question existed), so that no test fetches anything from the machine it runs on
         e['MU300_V6_PROBE'] = 'false'
+        # ... and watches the tunnel's exit in the background once it is up (exit_watch): not in the tests, unless
+        # one turns it on (it would fetch from the machine the test runs on, and keep the test's pipes open)
+        e['MU300_EXIT_WATCH'] = '0'
         e.update({k: str(v) for k, v in extra.items()})
         return e
 

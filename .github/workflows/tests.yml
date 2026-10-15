@@ -29,3 +29,18 @@ jobs:
           cd tests
           python3 -c 'import helpers; print("shells:", helpers.shells())'
           python3 -m unittest discover -s . -v
+
+  vless-matrix:
+    # tools/vless-matrix.sh: every VLESS variant a link can name, as the module writes it for sing-box and for Xray,
+    # against a real Xray server on loopback (docs/FINDINGS.md 26o). The pinned engines are linux/arm64.
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - name: engines
+        run: |
+          sudo apt-get install -y -qq jq curl openssl python3 unzip >/dev/null
+          mkdir -p "$RUNNER_TEMP/eng/bin"
+          sh tools/fetch-xray.sh "$RUNNER_TEMP/eng"
+          sh tools/fetch-sing-box.sh "$RUNNER_TEMP/eng/bin/sing-box"
+      - name: matrix
+        run: XRAY="$RUNNER_TEMP/eng/bin/xray" SING_BOX="$RUNNER_TEMP/eng/bin/sing-box" sh tools/vless-matrix.sh

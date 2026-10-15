@@ -2,12 +2,14 @@
 # Build the module's release files:
 #   tools/make-module.sh OUTDIR [TAG]    (TAG: vMAJOR.MINOR.PATCH, default v0.0.0-dev)
 #   OUTDIR/mu300-linux-vpn-core.tar.gz     the vpn extra: mu300-vpn, its library, services, hooks - no engine
-#   OUTDIR/mu300-linux-vpn-xray.tar.gz     vpn-xray: Xray-core and hev-socks5-tunnel (tools/fetch-xray.sh)
+#   OUTDIR/mu300-linux-vpn-xray.tar.gz     vpn-xray: Xray-core, the geodata its routing reads, and hev-socks5-tunnel
+#                                          (tools/fetch-xray.sh)
 #   OUTDIR/mu300-linux-vpn-singbox.tar.gz  vpn-singbox: sing-box (tools/fetch-sing-box.sh)
 #   OUTDIR/mu300-linux-vpn-mihomo.tar.gz   vpn-mihomo: mihomo and the geodata its rules read (tools/fetch-mihomo.sh)
 #   OUTDIR/mu300-linux-vpn-dae.tar.gz      vpn-dae: dae and its geodata (tools/fetch-dae.sh)
 #   OUTDIR/mu300-linux-vpn.tar.gz          the vpn extra as v1.0.0 had it: the core with xray, hev-socks5-tunnel and
-#                                          sing-box in it. The compatibility bundle: the mu300-extra and mu300-update
+#                                          sing-box in it (and, from v2.0.3, Xray's geodata). The compatibility
+#                                          bundle: the mu300-extra and mu300-update
 #                                          of mu300-linux releases from before the engine extras download this name
 #                                          as vpn and nothing else, and must get the engines they had along with it
 #   OUTDIR/VERSIONS                        extra, version, bytes, components (name ver,name ver), asset - TSV
@@ -40,18 +42,30 @@ FAKE=${MU300_VPN_FAKE_ENGINES:-}
 
 # the engines, once: $tmp/eng/{xray,singbox,mihomo,dae}
 e=$tmp/eng
-mkdir -p "$e/xray/bin" "$e/singbox/bin" "$e/mihomo/bin" "$e/mihomo/share/mihomo" "$e/dae/bin" "$e/dae/share/dae"
+mkdir -p "$e/xray/bin" "$e/xray/share/xray" "$e/singbox/bin" "$e/mihomo/bin" "$e/mihomo/share/mihomo" "$e/dae/bin" \
+    "$e/dae/share/dae"
 if [ "$FAKE" = 1 ]; then
     fake "$e/xray/bin/xray" xray; fake "$e/xray/bin/hev-socks5-tunnel" hev-socks5-tunnel
+    echo fake > "$e/xray/share/xray/geoip.dat"; echo fake > "$e/xray/share/xray/geosite.dat"
     fake "$e/singbox/bin/sing-box" sing-box; fake "$e/mihomo/bin/mihomo" mihomo; fake "$e/dae/bin/dae" dae
     echo fake > "$e/dae/share/dae/geoip.dat"; echo fake > "$e/dae/share/dae/geosite.dat"
     echo fake > "$e/mihomo/share/mihomo/Country.mmdb"; echo fake > "$e/mihomo/share/mihomo/GeoSite.dat"
+    # (tests/: a fake set without one of them, MU300_VPN_FAKE_MISSING=xray/share/xray/geoip.dat)
+    [ -z "${MU300_VPN_FAKE_MISSING:-}" ] || rm -f "$e/$MU300_VPN_FAKE_MISSING"
 else
-    sh "$TOP/tools/fetch-xray.sh" "$e/xray/bin" >&2
+    sh "$TOP/tools/fetch-xray.sh" "$e/xray" >&2
     sh "$TOP/tools/fetch-sing-box.sh" "$e/singbox/bin/sing-box" >&2
     sh "$TOP/tools/fetch-mihomo.sh" "$e/mihomo" >&2
     sh "$TOP/tools/fetch-dae.sh" "$e/dae" >&2
 fi
+# What each engine reads beside its binary, where its driver points it (xray_assets, mihomo_share, dae_assets): a
+# build without it is refused, here and in the release workflow, rather than an extra whose engine will not start.
+# No release before v2.0.3 had Xray's geodata, in vpn-xray or in the bundle (docs/FINDINGS.md 26o);
+# tests/test_module.py checks the same against the drivers.
+for _need in xray/share/xray/geoip.dat xray/share/xray/geosite.dat mihomo/share/mihomo/Country.mmdb \
+        mihomo/share/mihomo/GeoSite.dat dae/share/dae/geoip.dat dae/share/dae/geosite.dat; do
+    [ -s "$e/$_need" ] || { echo "the ${_need%%/*} engine's files lack ${_need#*/}" >&2; exit 1; }
+done
 
 # meta DIR NAME COMPONENTS...: the files every extra has
 meta() {
@@ -78,6 +92,8 @@ core() {
 c=$tmp/core; core "$c"; meta "$c" vpn "mu300-linux-vpn $TAG"
 b=$tmp/bundle; core "$b"
 cp "$e/xray/bin/xray" "$e/xray/bin/hev-socks5-tunnel" "$e/singbox/bin/sing-box" "$b/bin/"
+# (Xray in the bundle reads its geodata from there too: bin/../share/xray)
+mkdir -p "$b/share"; cp -R "$e/xray/share/xray" "$b/share/xray"
 meta "$b" vpn "mu300-linux-vpn $TAG" "xray $XRAY_VER" "hev-socks5-tunnel $HEV_VER" "sing-box $SB_VER"
 
 # ---- the engine extras ------------------------------------------------------------------------------------------
