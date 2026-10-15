@@ -2,10 +2,24 @@
 # straight after sourcing it). Nothing here runs anything: it only takes a link apart, writes JSON strings, and
 # stores a link or a JSON config in a profile.
 
-# json_str VALUE : JSON string literal
-json_str() { printf '"%s"' "$(printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g')"; }
-# json_list "a,b,c" : JSON array of strings
-json_list() { printf '%s' "$1" | awk -F, '{printf "["; for (i = 1; i <= NF; i++) { gsub(/"/, "\\\"", $i); printf "%s\"%s\"", (i > 1 ? "," : ""), $i } printf "]"}'; }
+# json_str VALUE : JSON string literal; json_list "a,b,c" : JSON array of strings (nothing for an empty VALUE).
+# Written by jq (--arg), which escapes everything JSON needs: a quote, a backslash, a control character. The configs
+# are built from link values with these, so they must not be hand-rolled: until v2.0.3 json_list did not escape a
+# backslash and json_str left a line break (from %0A) raw, so a crafted link could end a string and add keys to the
+# config (docs/FINDINGS.md 26o). jq is in every image; without it nothing is written, and the config check fails.
+# (no line break after it, as before: callers put these in the middle of a line)
+json_str() { _js=$(jq -cn --arg v "$1" '$v') || { echo "writing a config needs jq" >&2; return 1; }; printf '%s' "$_js"; }
+json_list() {
+    [ -n "$1" ] || return 0
+    _js=$(jq -cn --arg v "$1" '$v | split(",")') || { echo "writing a config needs jq" >&2; return 1; }
+    printf '%s' "$_js"
+}
+# config_json_ok FILE: a config this module wrote is one JSON object (the last line of defence against a value that
+# got into it unescaped); else a message and 1
+config_json_ok() {
+    jq -e 'type == "object"' "$1" >/dev/null 2>&1 ||
+        { echo "the config written for this link is not valid JSON: not started" >&2; return 1; }
+}
 hex2dec() { printf '%d' "0x$1"; }
 # busybox awk has no hex string conversion: decode %XX with printf instead
 urldecode() {
@@ -167,6 +181,35 @@ parse_link() {
         *) echo "not a vless, vmess, trojan, ss, hysteria2 or tuic link" >&2; return 1 ;;
     esac
     TYPE=${TYPE:-tcp}; SECURITY=${SECURITY:-none}
+    link_fields_ok
+}
+# link_fields_ok: the fields parse_link set hold what their protocol allows, before any of them is written into a
+# config: no control character anywhere (a %0A in a path is no path), and the fields with a defined form in it -
+# security, transport, flow, fingerprint, REALITY's public key and short id, XHTTP's mode, allowInsecure, vmess's
+# cipher. The message names the field, never its value (a link carries credentials).
+link_fields_ok() {
+    _lf=
+    for _f in $LINK_FIELDS; do eval "_lf=\"\$_lf\${$_f}\""; done
+    [ -z "$(printf '%s' "$_lf" | LC_ALL=C tr -d '\040-\176\200-\377')" ] ||
+        { _lf=; echo "the link has a control character in one of its fields" >&2; return 1; }
+    _lf=
+    _lfno() { echo "the link's $1 is not one this understands" >&2; return 1; }
+    case $SECURITY in none|tls|reality) ;; *) _lfno "security (none, tls or reality)"; return 1 ;; esac
+    case $TYPE in ''|*[!a-z0-9]*) _lfno "transport (type)"; return 1 ;; esac
+    case $FLOW in *[!a-z0-9-]*) _lfno "flow"; return 1 ;; esac
+    case $FP in *[!a-z0-9_]*) _lfno "TLS fingerprint (fp)"; return 1 ;; esac
+    case $PBK in *[!A-Za-z0-9_=+/-]*) _lfno "REALITY public key (pbk)"; return 1 ;; esac
+    case $SID in *[!0-9A-Fa-f]*|?????????????????*) _lfno "REALITY short id (sid: up to 16 hex digits)"; return 1 ;; esac
+    case $XMODE in *[!a-z-]*) _lfno "XHTTP mode"; return 1 ;; esac
+    case $INSECURE in ''|0|1|true|false) ;; *) _lfno "allowInsecure (0, 1, true or false)"; return 1 ;; esac
+    case $METHOD in *[!A-Za-z0-9-]*) _lfno "cipher (method)"; return 1 ;; esac
+    # (the protocols TLS can name here; a list of them)
+    case ,$ALPN, in *,,*) [ -z "$ALPN" ] || { _lfno "ALPN (h3, h2, http/1.1)"; return 1; } ;; esac
+    case $ALPN in *[!a-z0-9/.,]*) _lfno "ALPN (h3, h2, http/1.1)"; return 1 ;; esac
+    _ifs=$IFS; IFS=,; _bad=
+    for _a in $ALPN; do case $_a in h3|h2|http/1.1) ;; *) _bad=1 ;; esac; done
+    IFS=$_ifs
+    [ -z "$_bad" ] || { _lfno "ALPN (h3, h2, http/1.1)"; return 1; }
     return 0
 }
 # link_tag URI: the name a link gives itself (the #fragment, vmess's ps), for a profile imported without one

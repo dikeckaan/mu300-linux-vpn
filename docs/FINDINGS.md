@@ -519,6 +519,25 @@ What changed, all in `sb_vless` (lib/vpn/uri.sh), which the sing-box outbound is
 the refused links and what the refusal says (and that it names no secret), Xray's streamSettings for the variants
 above, `vless_on_sing_box` behind the kill switch, and `xray_assets`.
 
+**Config escaping (found by a security review of this change).** The xray and sing-box drivers write their JSON
+with printf, and every value from a link went through `json_str` or `json_list` (uri.sh). Those two were incomplete:
+`json_list` (ALPN, and the new TCP header's path and Host lists) did not escape a backslash, and `json_str` left
+control characters as they were. So a crafted link could end a string early and change the structure of the
+generated config, not just one value in it. Host and port were already checked (`link_hostport`), and dae writes
+links only after an allowlist of URL characters (`dae_link`), so dae and mihomo are not affected. The fix:
+* `json_str` and `json_list` are now written by jq (`--arg`), which escapes everything JSON needs.
+* `parse_link` checks every field before anything is written (`link_fields_ok`). It refuses a control character in
+  any field, and refuses a value outside its protocol's form in: security (none, tls or reality), transport, flow,
+  fp, pbk (base64), sid (up to 16 hex digits), XHTTP mode, allowInsecure, cipher, and ALPN (h3, h2, http/1.1). The
+  message names the field, never its value.
+* Before an engine reads a config the module generated, the config must be one JSON object (`config_json_ok`).
+
+`tests/test_vless_links.py` (`HostileLinks`) puts values with quotes, backslashes, braces, commas and control
+characters into each of the 21 fields a VLESS link names, URL-encoded and as they stand. It generates the whole
+config, Xray's and sing-box's. The test passes only if each such link is refused, or its config is valid JSON with
+exactly the key structure of the same link with a harmless value. A side note: `urldecode` already dropped a `%0A`
+(command substitution strips it), but a tab or another control character went through.
+
 **A tunnel that is up and carries nothing** said nothing in the log: sing-box logged at `warn`, and a server that
 drops the client is a connection that ends. Now a tunnel that comes up gets a watch beside it (`exit_watch`, every
 engine): the exit check `status` runs (`api.ipify.org`, an address and nothing else, so a captive portal's page does

@@ -150,6 +150,7 @@ gen_singbox() {
     printf '"final":"proxy","auto_detect_interface":true,"default_mark":%d,"default_domain_resolver":"bootstrap"}}\n' "$MARK"
     } > "$RUN/config.json"
     chmod 600 "$RUN/config.json"
+    config_json_ok "$RUN/config.json" || exit 1
     "$BIN" check -c "$RUN/config.json"
 }
 

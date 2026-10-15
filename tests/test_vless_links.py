@@ -245,3 +245,117 @@ class VlessLinks(ShellTest):
             # the engine goes: so does the watch, having said it once
             err = self.watch(shell, 'probe-portal', engine_for=1)
             self.assertEqual(len([l for l in err.splitlines() if 'nothing gets through' in l]), 1, err)
+
+
+def key_paths(o, pre=()):
+    """every path of keys in a JSON value, and the type at its end: its structure, without the values (a list's
+    items share one path: a comma-separated field - a TCP header's paths and hosts - is a list of any length)"""
+    out = {pre + (type(o).__name__,)}
+    if isinstance(o, dict):
+        for k, v in o.items():
+            out |= key_paths(v, pre + (k,))
+    elif isinstance(o, list):
+        for v in o:
+            out |= key_paths(v, pre + ('[]',))
+    return out
+
+
+# values that would end a JSON string and add keys, were they written unescaped: a quote, a backslash, braces, a
+# comma, a line break - URL-encoded (%22 ...) and, for the fields that are not decoded, as they stand
+HOSTILE = ['x%22%2C%22insecure%22%3Atrue%2C%22y%22%3A%22', 'x%5C', 'x%5C%22%7D%2C%7B%22a%22%3A%22',
+           'x%0A%22k%22%3A1', 'x"},{"type":"direct', 'x\\', 'x\\",\\"k\\":\\"']
+# (field, a link with the field as {v}, a harmless value for it): every field a VLESS link names
+FIELDS = [
+    ('uuid', 'vless://{v}@vpn.example:443?type=tcp&security=tls', '0a1b2c3d-1111-4222-8333-444455556666'),
+    ('sni', 'vless://u1@vpn.example:443?type=tcp&security=tls&sni={v}', 's.example'),
+    ('alpn', 'vless://u1@vpn.example:443?type=tcp&security=tls&alpn={v}', 'http%2F1.1'),
+    ('alpn on ws', 'vless://u1@vpn.example:443?type=ws&security=tls&alpn=http%2F1.1%2C{v}', 'h3'),
+    ('fp', 'vless://u1@vpn.example:443?type=tcp&security=tls&fp={v}', 'chrome'),
+    ('flow', 'vless://u1@vpn.example:443?type=tcp&security=tls&flow={v}', 'xtls-rprx-vision'),
+    ('ws path', 'vless://u1@vpn.example:443?type=ws&path={v}', '%2Fws'),
+    ('ws host', 'vless://u1@vpn.example:443?type=ws&path=%2Fws&host={v}', 'h.example'),
+    ('httpupgrade path', 'vless://u1@vpn.example:443?type=httpupgrade&path={v}', '%2Fhu'),
+    ('serviceName', 'vless://u1@vpn.example:443?type=grpc&serviceName={v}', 'svc'),
+    ('xhttp mode', 'vless://u1@vpn.example:443?type=xhttp&path=%2Fx&mode={v}', 'auto'),
+    ('header path', 'vless://u1@vpn.example:80?type=tcp&headerType=http&host=h.example&path={v}', '%2Fh'),
+    ('header host', 'vless://u1@vpn.example:80?type=tcp&headerType=http&path=%2Fh&host={v}', 'h.example'),
+    ('pbk', 'vless://u1@vpn.example:443?type=tcp&security=reality&sid=ab&pbk={v}', 'PUBKEY'),
+    ('sid', 'vless://u1@vpn.example:443?type=tcp&security=reality&pbk=K&sid={v}', 'ab12'),
+    ('spx', 'vless://u1@vpn.example:443?type=tcp&security=reality&pbk=K&sid=ab&spx={v}', '%2F'),
+    ('security', 'vless://u1@vpn.example:443?type=tcp&security={v}', 'tls'),
+    ('type', 'vless://u1@vpn.example:443?security=tls&type={v}', 'ws'),
+    ('allowInsecure', 'vless://u1@vpn.example:443?type=tcp&security=tls&allowInsecure={v}', '0'),
+    ('encryption', 'vless://u1@vpn.example:443?type=tcp&encryption={v}', 'none'),
+    ('remark', 'vless://u1@vpn.example:443?type=tcp&security=tls#{v}', 'name'),
+]
+
+
+class HostileLinks(ShellTest):
+    """A crafted link cannot change the structure of the config written from it (FINDINGS 26o): for every field of
+    a VLESS link and every value that would end a JSON string were it written unescaped, the link is refused, or the
+    whole config is valid JSON with exactly the keys the same link with a harmless value gives - for Xray
+    (gen_xray) and for sing-box (gen_singbox)."""
+
+    def setUp(self):
+        super().setUp()
+        self.conf = self.tmp / 'vpn.conf'
+        self.conf.write_text('ENABLE=0\nKILL_SWITCH=0\n')
+        (self.tmp / 'root/run/mu300').mkdir(parents=True)
+        (self.tmp / 'root/run/mu300/device').write_text('f50\n')
+        self.stub('ip', 'exit 0')
+        self.stub('nft', 'cat >/dev/null; exit 0')
+        self.stub('getent', 'echo "203.0.113.10    STREAM $2"')
+        self.stub('xray', 'exit 0')
+        self.stub('sing-box', 'exit 0')
+        self.stub('openssl', 'exit 1')
+
+    def gen(self, shell, engine, uri):
+        """the config ENGINE's generator writes for URI (None when it refuses it), and its stderr"""
+        run = self.tmp / 'run'
+        for f in ('xray.json', 'config.json'):
+            (run / f).unlink(missing_ok=True)
+        code = {'xray': f'PURI="$LINK"; load_driver xray; XRAY="{self.stubs}/xray"; gen_xray',
+                'sing-box': f'VLESS_URI="$LINK"; load_driver sing-box; BIN="{self.stubs}/sing-box"; '
+                            'UPSTREAM_HTTP_PROXY=; gen_singbox'}[engine]
+        r = self.sh(shell, f'. "{BIN}/mu300-vpn"; {code}', LINK=uri, MU300_LIB=1, MU300_VPN_CONF=self.conf,
+                    MU300_VPN_RUN=run, MU300_VPN_LIB=LIB, MU300_LAN_CONF=self.tmp / 'no', MU300_BIN=SYSBIN,
+                    MU300_SYSROOT=self.tmp / 'root', MU300_OPT=self.tmp / 'opt', MU300_DISK=self.tmp / 'disk')
+        if r.returncode != 0:
+            return None, r.stderr
+        f = run / ('xray.json' if engine == 'xray' else 'config.json')
+        return json.loads(f.read_text()), r.stderr
+
+    def test_no_link_field_changes_the_configs_structure(self):
+        shell = self.shells[0]
+        for engine in ('xray', 'sing-box'):
+            for field, form, harmless in FIELDS:
+                good, gerr = self.gen(shell, engine, form.format(v=harmless))
+                for bad in HOSTILE:
+                    with self.subTest(engine=engine, field=field, value=bad):
+                        cfg, err = self.gen(shell, engine, form.format(v=bad))
+                        if cfg is None:
+                            self.assertTrue(err.strip())
+                            continue
+                        self.assertIsNotNone(good, f'only the harmless link was refused: {gerr}')
+                        self.assertEqual(key_paths(cfg), key_paths(good))
+
+    def test_values_are_written_as_they_are(self):
+        uri = 'vless://u1@vpn.example:443?type=ws&security=tls&sni=a%5C%22b&path=%2Fw%5C&alpn=http%2F1.1%2Ch2'
+        for shell in self.each_shell():
+            cfg, err = self.gen(shell, 'xray', uri)
+            self.assertIsNotNone(cfg, err)
+            st = cfg['outbounds'][0]['streamSettings']
+            self.assertEqual(st['tlsSettings']['serverName'], 'a\\"b')
+            self.assertEqual(st['wsSettings']['path'], '/w\\')
+            self.assertEqual(st['tlsSettings']['alpn'], ['http/1.1', 'h2'])
+            cfg, err = self.gen(shell, 'sing-box', uri)
+            self.assertIsNotNone(cfg, err)
+            self.assertEqual(cfg['outbounds'][0]['tls']['alpn'], ['http/1.1'])
+            # an ALPN that is no protocol: refused
+            cfg, err = self.gen(shell, 'xray', uri.replace('http%2F1.1', 'x%5C'))
+            self.assertIsNone(cfg)
+            self.assertIn('ALPN', err)
+            # a control character in a field (a tab; urldecode drops a line break): refused, not written
+            cfg, err = self.gen(shell, 'sing-box', uri.replace('%2Fw%5C', '%2Fw%09x'))
+            self.assertIsNone(cfg)
+            self.assertIn('control character', err)

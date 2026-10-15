@@ -179,6 +179,7 @@ gen_xray() {
     printf '{"tag":"direct","protocol":"freedom","streamSettings":{"sockopt":{"mark":%d}}}]}\n' "$((MARK))"
     } > "$RUN/xray.json"
     chmod 600 "$RUN/xray.json"
+    config_json_ok "$RUN/xray.json" || exit 1
     xray_hev_yml
     printf '%s\n' "$SERVER_IP" > "$RUN/server-ip"
     xray_assets
