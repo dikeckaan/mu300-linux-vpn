@@ -142,8 +142,8 @@ VPN that is on uses a new value from its next `mu300-vpn restart`):
 
 | engine | for | where it comes from | licence |
 |---|---|---|---|
-| [Xray-core](https://github.com/XTLS/Xray-core) 26.3.27 + [hev-socks5-tunnel](https://github.com/heiher/hev-socks5-tunnel) 2.17.1 | VLESS, VMess, Trojan, Shadowsocks links, Xray JSON | `vpn-xray` (`mu300-linux-vpn-xray.tar.gz`) | MPL-2.0, MIT |
-| [sing-box](https://github.com/SagerNet/sing-box) 1.14.1 | VLESS links behind the kill switch (when installed), sing-box JSON | `vpn-singbox` (`mu300-linux-vpn-singbox.tar.gz`) | GPL-3.0-or-later |
+| [Xray-core](https://github.com/XTLS/Xray-core) 26.3.27 + its geodata (`geoip.dat`, `geosite.dat` from its release zip: what `geoip:` and `geosite:` rules read; from v2.0.3) + [hev-socks5-tunnel](https://github.com/heiher/hev-socks5-tunnel) 2.17.1 | VLESS, VMess, Trojan, Shadowsocks links, Xray JSON | `vpn-xray` (`mu300-linux-vpn-xray.tar.gz`; the compatibility bundle has Xray's geodata too) | MPL-2.0, MIT; CC-BY-SA-4.0, GPL-3.0 |
+| [sing-box](https://github.com/SagerNet/sing-box) 1.14.1 | VLESS links behind the kill switch (when installed; not those it cannot run, below), sing-box JSON | `vpn-singbox` (`mu300-linux-vpn-singbox.tar.gz`) | GPL-3.0-or-later |
 | [mihomo](https://github.com/MetaCubeX/mihomo) 1.19.32 + geodata (`Country.mmdb`, `GeoSite.dat`: what GEOIP and GEOSITE rules read, there before the tunnel is) | Clash/mihomo YAML | `vpn-mihomo` (`mu300-linux-vpn-mihomo.tar.gz`) | GPL-3.0; CC-BY-SA-4.0, GPL-3.0 |
 | [dae](https://github.com/daeuniverse/dae) 2.1.1 + v2fly geodata | dae configs, VLESS/VMess/Trojan/SS/Hysteria2/TUIC links and link subscriptions, as an eBPF transparent proxy; **kernels with BTF only** (mainline, not the 5.4 vendor kernel) | `vpn-dae` (`mu300-linux-vpn-dae.tar.gz`) | AGPL-3.0 |
 | WireGuard | `.conf` | the kernel's, with `wireguard-tools` (in the images; the 5.4 vendor kernel has no WireGuard, mainline does) | GPL-2.0 |
@@ -157,10 +157,20 @@ A VLESS link runs on Xray by default; with the kill switch it runs on sing-box w
 Xray through the resolve window, except a link that asks for allowInsecure), because Xray resolves the server's
 name and fetches its certificate (Xray 26 has no `allowInsecure`: the certificate is fetched once, pinned in the
 profile, and fetched again when the server renews it) before the tunnel exists, and the kill switch would drop both.
+Some VLESS links sing-box cannot run: VLESS Encryption (`encryption=` other than `none`), the XHTTP transport
+(`type=xhttp`, `splithttp`), an HTTP header on TCP (`headerType=http`), and HTTP/2 (`type=h2`, which Xray 25 removed
+too, so neither engine runs it). Such a link stays on Xray, behind the kill switch too (resolve window); with only
+sing-box installed it is not started, the kill switch stays up and the message says to install Xray. `mu300-vpn
+check` and adding the profile say so. Every other variant a link can name was run against an Xray server on both
+engines ([FINDINGS 26o](docs/FINDINGS.md), `tools/vless-matrix.sh`).
 Other types resolve their server's name through a short **resolve window** (only the device's DNS, only for
 seconds), so they all work behind the kill switch. sing-box, mihomo and dae look the name up themselves, at
 `BOOTSTRAP_DNS`; whether that resolver answers on this uplink is asked first (through the same window), and the
 uplink's own resolver takes its place when it does not ([FINDINGS 26i](docs/FINDINGS.md)).
+
+An Xray JSON profile's `geoip:` and `geosite:` rules read the `geoip.dat` and `geosite.dat` the `vpn-xray` extra
+carries from v2.0.3 on (`XRAY_LOCATION_ASSET` points Xray at the extra's `share/xray`; one set in the environment is
+kept). Before that no release carried them and such a config did not start.
 
 A mihomo profile's `GEOIP` and `GEOSITE` rules read the geodata the `vpn-mihomo` extra carries (copied to
 `/etc/mu300/vpn/cache/mihomo` when a config first needs it; the file's `geo-auto-update: true` has mihomo update it
@@ -255,6 +265,9 @@ The design: [docs/superpowers/specs](docs/superpowers/specs), and the measuremen
   [hev-socks5-tunnel](https://github.com/heiher/hev-socks5-tunnel) (MIT) and
   [mihomo](https://github.com/MetaCubeX/mihomo) (GPL-3.0). They are their projects' release builds, downloaded,
   pinned and checked by hash, not changed; their source is at those links.
+* The geodata in the `vpn-xray` extra and the bundle: the `geoip.dat` and `geosite.dat` of Xray-core's own release
+  zip (pinned with it by hash), which are [Loyalsoldier/v2ray-rules-dat](https://github.com/Loyalsoldier/v2ray-rules-dat)'s:
+  `geoip.dat` CC-BY-SA-4.0 (it includes GeoLite2 data created by MaxMind), `geosite.dat` GPL-3.0; not changed.
 * The geodata in the `vpn-mihomo` extra: `Country.mmdb` from [Loyalsoldier/geoip](https://github.com/Loyalsoldier/geoip)
   (CC-BY-SA-4.0; it includes GeoLite2 data created by MaxMind, available from https://www.maxmind.com) and
   `GeoSite.dat` from [Loyalsoldier/v2ray-rules-dat](https://github.com/Loyalsoldier/v2ray-rules-dat) (GPL-3.0), dated

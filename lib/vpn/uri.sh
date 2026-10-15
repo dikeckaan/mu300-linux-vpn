@@ -2,10 +2,24 @@
 # straight after sourcing it). Nothing here runs anything: it only takes a link apart, writes JSON strings, and
 # stores a link or a JSON config in a profile.
 
-# json_str VALUE : JSON string literal
-json_str() { printf '"%s"' "$(printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g')"; }
-# json_list "a,b,c" : JSON array of strings
-json_list() { printf '%s' "$1" | awk -F, '{printf "["; for (i = 1; i <= NF; i++) { gsub(/"/, "\\\"", $i); printf "%s\"%s\"", (i > 1 ? "," : ""), $i } printf "]"}'; }
+# json_str VALUE : JSON string literal; json_list "a,b,c" : JSON array of strings (nothing for an empty VALUE).
+# Written by jq (--arg), which escapes everything JSON needs: a quote, a backslash, a control character. The configs
+# are built from link values with these, so they must not be hand-rolled: until v2.0.3 json_list did not escape a
+# backslash and json_str left a line break (from %0A) raw, so a crafted link could end a string and add keys to the
+# config (docs/FINDINGS.md 26o). jq is in every image; without it nothing is written, and the config check fails.
+# (no line break after it, as before: callers put these in the middle of a line)
+json_str() { _js=$(jq -cn --arg v "$1" '$v') || { echo "writing a config needs jq" >&2; return 1; }; printf '%s' "$_js"; }
+json_list() {
+    [ -n "$1" ] || return 0
+    _js=$(jq -cn --arg v "$1" '$v | split(",")') || { echo "writing a config needs jq" >&2; return 1; }
+    printf '%s' "$_js"
+}
+# config_json_ok FILE: a config this module wrote is one JSON object (the last line of defence against a value that
+# got into it unescaped); else a message and 1
+config_json_ok() {
+    jq -e 'type == "object"' "$1" >/dev/null 2>&1 ||
+        { echo "the config written for this link is not valid JSON: not started" >&2; return 1; }
+}
 hex2dec() { printf '%d' "0x$1"; }
 # busybox awk has no hex string conversion: decode %XX with printf instead
 urldecode() {
@@ -167,6 +181,35 @@ parse_link() {
         *) echo "not a vless, vmess, trojan, ss, hysteria2 or tuic link" >&2; return 1 ;;
     esac
     TYPE=${TYPE:-tcp}; SECURITY=${SECURITY:-none}
+    link_fields_ok
+}
+# link_fields_ok: the fields parse_link set hold what their protocol allows, before any of them is written into a
+# config: no control character anywhere (a %0A in a path is no path), and the fields with a defined form in it -
+# security, transport, flow, fingerprint, REALITY's public key and short id, XHTTP's mode, allowInsecure, vmess's
+# cipher. The message names the field, never its value (a link carries credentials).
+link_fields_ok() {
+    _lf=
+    for _f in $LINK_FIELDS; do eval "_lf=\"\$_lf\${$_f}\""; done
+    [ -z "$(printf '%s' "$_lf" | LC_ALL=C tr -d '\040-\176\200-\377')" ] ||
+        { _lf=; echo "the link has a control character in one of its fields" >&2; return 1; }
+    _lf=
+    _lfno() { echo "the link's $1 is not one this understands" >&2; return 1; }
+    case $SECURITY in none|tls|reality) ;; *) _lfno "security (none, tls or reality)"; return 1 ;; esac
+    case $TYPE in ''|*[!a-z0-9]*) _lfno "transport (type)"; return 1 ;; esac
+    case $FLOW in *[!a-z0-9-]*) _lfno "flow"; return 1 ;; esac
+    case $FP in *[!a-z0-9_]*) _lfno "TLS fingerprint (fp)"; return 1 ;; esac
+    case $PBK in *[!A-Za-z0-9_=+/-]*) _lfno "REALITY public key (pbk)"; return 1 ;; esac
+    case $SID in *[!0-9A-Fa-f]*|?????????????????*) _lfno "REALITY short id (sid: up to 16 hex digits)"; return 1 ;; esac
+    case $XMODE in *[!a-z-]*) _lfno "XHTTP mode"; return 1 ;; esac
+    case $INSECURE in ''|0|1|true|false) ;; *) _lfno "allowInsecure (0, 1, true or false)"; return 1 ;; esac
+    case $METHOD in *[!A-Za-z0-9-]*) _lfno "cipher (method)"; return 1 ;; esac
+    # (the protocols TLS can name here; a list of them)
+    case ,$ALPN, in *,,*) [ -z "$ALPN" ] || { _lfno "ALPN (h3, h2, http/1.1)"; return 1; } ;; esac
+    case $ALPN in *[!a-z0-9/.,]*) _lfno "ALPN (h3, h2, http/1.1)"; return 1 ;; esac
+    _ifs=$IFS; IFS=,; _bad=
+    for _a in $ALPN; do case $_a in h3|h2|http/1.1) ;; *) _bad=1 ;; esac; done
+    IFS=$_ifs
+    [ -z "$_bad" ] || { _lfno "ALPN (h3, h2, http/1.1)"; return 1; }
     return 0
 }
 # link_tag URI: the name a link gives itself (the #fragment, vmess's ps), for a profile imported without one
@@ -183,6 +226,83 @@ link_tag() {
 parse_uri() {
     case "$VLESS_URI" in vless://*) ;; *) echo "VLESS_URI must start with vless://" >&2; exit 1 ;; esac
     parse_link "$VLESS_URI" || exit 1
+}
+
+# sb_vless: the VLESS link parse_link took apart, as sing-box can run it - or a refusal (stderr, 1) that says why it
+# cannot. Every variant a link can name was run against an Xray server (tools/vless-matrix.sh, docs/FINDINGS.md 26o):
+# what sing-box writes differently from Xray is translated here, and what it cannot write at all is refused, because
+# such a tunnel comes up and then every connection through it ends at once (the server drops what it cannot read).
+# Sets, for outbound_json: SB_FLOW (xtls-rprx-vision-udp443 is Xray's name for vision that lets UDP/443 through,
+# which sing-box's vision does anyway), SB_FP (the uTLS fingerprint: Xray's default chrome for REALITY, which sing-box
+# cannot do without one; Xray's randomizednoalpn, which sing-box does not have, is chrome, not sing-box's randomized,
+# whose hello Xray's TLS server turned away now and then), SB_ALPN (h3 never: VLESS here is TCP; h2 not on
+# WebSocket or HTTPUpgrade, where a server that accepts h2 takes the upgrade request for an HTTP/2 preface and closes),
+# SB_PATH and SB_ED (the WebSocket path without the ed=N that asks Xray for early data, and N: sing-box sends it in
+# the Sec-WebSocket-Protocol header, as Xray does; a path with ?ed= left in is not the server's path).
+# The message never repeats the link or its keys.
+SB_FINGERPRINTS='chrome firefox edge safari 360 qq ios android random randomized'
+# path_ed PATH: ED_PATH, the WebSocket or HTTPUpgrade PATH without an ed=N in its query (anywhere in it), and ED, the
+# N (empty without one); a value that is not a number of at most 5 digits is not early data and stays in the path
+path_ed() {
+    ED_PATH=$1; ED=
+    case $1 in *\?*) ;; *) return 0 ;; esac
+    _q=${1#*\?}; ED_PATH=${1%%\?*}; _keep=
+    _ifs=$IFS; IFS='&'; _glob=; case $- in *f*) ;; *) _glob=1; set -f ;; esac
+    for _kv in $_q; do
+        case $_kv in
+            ed=*[!0-9]*|ed=|ed=??????*) _keep=${_keep:+$_keep&}$_kv ;;
+            ed=*) ED=${_kv#ed=} ;;
+            *) _keep=${_keep:+$_keep&}$_kv ;;
+        esac
+    done
+    IFS=$_ifs; [ -z "$_glob" ] || set +f
+    [ -z "$_keep" ] || ED_PATH="$ED_PATH?$_keep"
+    return 0
+}
+sb_vless() {
+    _sbno() { echo "sing-box cannot run this link: $1" >&2; return 1; }
+    SB_FLOW=$FLOW; SB_FP=$FP; SB_PATH=$WSPATH; SB_ED=
+    _e=$(urldecode "$(param encryption)")
+    case ${_e:-none} in
+        none) ;;
+        *) _sbno "it asks for VLESS Encryption (encryption=${_e%%.*}...), which sing-box does not have; the server refuses a client without it" ; return 1 ;;
+    esac
+    case $TYPE in
+        tcp|raw)
+            case $(param headerType) in
+                ''|none) ;;
+                http) _sbno "its TCP transport has an HTTP header (headerType=http), which sing-box cannot send"; return 1 ;;
+                *) _sbno "its TCP transport has a header sing-box does not know (headerType)"; return 1 ;;
+            esac ;;
+        ws|httpupgrade)
+            # ?ed=N: early data, not part of the path. Xray takes it off the path on both ends, for both transports;
+            # sing-box has early data for WebSocket only, and an HTTPUpgrade server waits for none
+            path_ed "$WSPATH"; SB_PATH=$ED_PATH; SB_ED=$ED ;;
+        grpc) ;;
+        xhttp|splithttp) _sbno "sing-box has no XHTTP transport (type=$TYPE); Xray runs it"; return 1 ;;
+        h2|http) _sbno "its transport is HTTP/2 (type=$TYPE), which Xray removed in 25.x and mu300-vpn does not write for either engine; ask the server for an xhttp or ws link"; return 1 ;;
+        *) _sbno "sing-box has no '$TYPE' transport that speaks to Xray's"; return 1 ;;
+    esac
+    case $FLOW in
+        ''|xtls-rprx-vision) ;;
+        xtls-rprx-vision-udp443) SB_FLOW=xtls-rprx-vision ;;
+        *) _sbno "sing-box does not know its flow ($FLOW)"; return 1 ;;
+    esac
+    case $SECURITY in
+        tls|reality)
+            case $SB_FP in randomizednoalpn) SB_FP=chrome ;; esac
+            [ -n "$SB_FP" ] || [ "$SECURITY" != reality ] || SB_FP=chrome
+            if [ -n "$SB_FP" ]; then
+                case " $SB_FINGERPRINTS " in *" $SB_FP "*) ;; *)
+                    _sbno "sing-box does not know its TLS fingerprint (fp=$FP; it knows: $SB_FINGERPRINTS)"; return 1 ;; esac
+            fi
+            [ "$SECURITY" != reality ] || [ -n "$PBK" ] || { _sbno "a REALITY link without its public key (pbk)"; return 1; } ;;
+        none|'') ;;
+        *) _sbno "sing-box does not know its security ($SECURITY)"; return 1 ;;
+    esac
+    _drop=h3; case $TYPE in ws|httpupgrade) _drop='h3 h2' ;; esac
+    SB_ALPN=$(printf '%s' "$ALPN" | awk -F, -v drop=" $_drop " '{n = 0; for (i = 1; i <= NF; i++) if ($i != "" && index(drop, " " $i " ") == 0) printf "%s%s", (n++ ? "," : ""), $i}')
+    return 0
 }
 
 # link_need: VLESS_URI set to the link the drivers work from - the active profile's (PURI), or vpn.conf's where the

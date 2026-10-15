@@ -11,7 +11,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from helpers import SYSBIN, TOP, ShellTest
+from helpers import SYSBIN, TOP, ShellTest, shells
 
 MAKE = TOP / 'tools' / 'make-module.sh'
 
@@ -27,7 +27,9 @@ ASSETS = ['mu300-linux-vpn-core.tar.gz', 'mu300-linux-vpn.tar.gz', 'mu300-linux-
 EXTRA_OF = {'mu300-linux-vpn-core.tar.gz': 'vpn', 'mu300-linux-vpn.tar.gz': 'vpn',
             'mu300-linux-vpn-xray.tar.gz': 'vpn-xray', 'mu300-linux-vpn-singbox.tar.gz': 'vpn-singbox',
             'mu300-linux-vpn-mihomo.tar.gz': 'vpn-mihomo', 'mu300-linux-vpn-dae.tar.gz': 'vpn-dae'}
-ENGINE_FILES = {'vpn-xray': {'bin/xray', 'bin/hev-socks5-tunnel'}, 'vpn-singbox': {'bin/sing-box'},
+# (Xray's geodata, which raw configs' geoip: and geosite: rules read: v1.0.0 to v2.0.2 shipped without it, #202)
+XRAY_GEO = {'share/xray/geoip.dat', 'share/xray/geosite.dat'}
+ENGINE_FILES = {'vpn-xray': {'bin/xray', 'bin/hev-socks5-tunnel'} | XRAY_GEO, 'vpn-singbox': {'bin/sing-box'},
                 # (the geodata GEOIP and GEOSITE rules read: mihomo could download it only before the tunnel is up)
                 'vpn-mihomo': {'bin/mihomo', 'share/mihomo/Country.mmdb', 'share/mihomo/GeoSite.dat'},
                 'vpn-dae': {'bin/dae', 'share/dae/geoip.dat', 'share/dae/geosite.dat'}}
@@ -95,7 +97,7 @@ class Tarballs(unittest.TestCase):
         it must carry v1's three engines, where v1 had them"""
         m, data = self.members('mu300-linux-vpn.tar.gz')
         self.assertEqual({n[2:] for n, ti in m.items() if ti.isfile()},
-                         self.core_files() | {'bin/xray', 'bin/hev-socks5-tunnel', 'bin/sing-box'})
+                         self.core_files() | {'bin/xray', 'bin/hev-socks5-tunnel', 'bin/sing-box'} | XRAY_GEO)
         self.assertEqual(data['./name'], b'vpn\n')
         comp = data['./components'].decode().splitlines()
         self.assertEqual([c.split()[0] for c in comp], ['mu300-linux-vpn', 'xray', 'hev-socks5-tunnel', 'sing-box'])
@@ -119,6 +121,56 @@ class Tarballs(unittest.TestCase):
                 # a name and a version each: a release (1.19.32), or a geodata set's date (202610080033)
                 for line in data['./components'].decode().splitlines():
                     self.assertRegex(line, r'^[a-z0-9-]+ (\d+\.\d+\.\d+|\d{12})$')
+
+    def test_each_engine_finds_its_files_where_its_driver_looks(self):
+        """Every extra (and the bundle) unpacked where mu300-extra puts it: the driver of each engine it carries
+        points the engine at a directory that has the files the engine reads - Xray's XRAY_LOCATION_ASSET
+        (geoip.dat, geosite.dat), mihomo's share (Country.mmdb, GeoSite.dat), dae's DAE_LOCATION_ASSET (geoip.dat,
+        geosite.dat). Fails for a tarball that lacks them, as v2.0.2's vpn-xray did (#202)."""
+        need = {'xray': ('load_driver xray; pick_engines; xray_assets; echo "${XRAY_LOCATION_ASSET:-}"',
+                         {'geoip.dat', 'geosite.dat'}),
+                'mihomo': ('load_driver mihomo; mihomo_share', {'Country.mmdb', 'GeoSite.dat'}),
+                'dae': ('load_driver dae; dae_assets', {'geoip.dat', 'geosite.dat'})}
+        carries = {'mu300-linux-vpn.tar.gz': ['xray'], 'mu300-linux-vpn-xray.tar.gz': ['xray'],
+                   'mu300-linux-vpn-mihomo.tar.gz': ['mihomo'], 'mu300-linux-vpn-dae.tar.gz': ['dae']}
+        shell = (shells() or [['sh']])[0]
+        for name, engines in carries.items():
+            for engine in engines:
+                with self.subTest(tarball=name, engine=engine):
+                    root = Path(tempfile.mkdtemp(prefix='mu300-extra-', dir=self.tmp))
+                    disk = root / 'disk'
+                    # the core where mu300-extra puts vpn, the tarball where it puts its extra (the bundle is vpn)
+                    for tb, extra in (('mu300-linux-vpn-core.tar.gz', 'vpn'), (name, EXTRA_OF[name])):
+                        d = disk / 'extra' / extra
+                        d.mkdir(parents=True, exist_ok=True)
+                        with tarfile.open(self.out / tb) as t:
+                            t.extractall(d, filter='data') if hasattr(tarfile, 'data_filter') else t.extractall(d)
+                    code, files = need[engine]
+                    e = dict(os.environ, MU300_LIB='1', MU300_DISK=str(disk), MU300_OPT=str(root / 'opt'),
+                             MU300_VPN_CONF=str(root / 'vpn.conf'), MU300_VPN_RUN=str(root / 'run'),
+                             MU300_LAN_CONF=str(root / 'nolan'), MU300_BIN=str(SYSBIN),
+                             MU300_SYSROOT=str(root), MU300_VPN_LIB=str(disk / 'extra/vpn/lib/vpn'),
+                             PATH='/usr/bin:/bin')
+                    e.pop('XRAY_LOCATION_ASSET', None)
+                    (root / 'vpn.conf').write_text('')
+                    vpn = disk / 'extra/vpn/bin/mu300-vpn'
+                    r = subprocess.run(shell + ['-c', f'. "{vpn}"; {code}'], capture_output=True, text=True, env=e,
+                                       timeout=60)
+                    where = r.stdout.strip()
+                    self.assertTrue(where, f'{engine}: the driver points it nowhere ({r.stderr})')
+                    have = {p.name for p in Path(where).iterdir()} if Path(where).is_dir() else set()
+                    self.assertLessEqual(files, have, f'{name}: {where} lacks {sorted(files - have)}')
+                    self.assertTrue(Path(where).resolve().is_relative_to((disk / 'extra').resolve()), where)
+
+    def test_a_build_without_an_engines_files_is_refused(self):
+        """make-module.sh checks what the drivers need before it packs anything (MU300_VPN_FAKE_MISSING:
+        tests/, a fake engine set without one file)"""
+        for missing in ('xray/share/xray/geosite.dat', 'mihomo/share/mihomo/Country.mmdb', 'dae/share/dae/geoip.dat'):
+            with self.subTest(missing=missing):
+                r = build(self.tmp / 'nogeo', MU300_VPN_FAKE_MISSING=missing)
+                self.assertNotEqual(r.returncode, 0)
+                self.assertIn(missing.split('/', 1)[1], r.stderr)
+                self.assertFalse((self.tmp / 'nogeo' / 'SHA256SUMS').exists())
 
     def test_entries_modes_and_owner(self):
         for name in ASSETS:

@@ -386,6 +386,15 @@ hold the order of the nft and ip calls). curl's path of the question on a device
 run both paths against a server on `::1`). A relayed carrier prefix on the LAN. Xray behind the kill switch (a
 VLESS link runs on sing-box there).
 
+**The yes against a real server** (v2.0.2, measured by the reporter of mu300-linux issue 202 on mu300-linux
+v2026.10.22, OpenWrt 25.12.5, kernel 7.2.10; not on our devices): Xray with `IPV6=auto` and a VLESS server whose exit
+has IPv6. `status` said `IPv6: through the tunnel (probe: 2606:4700:4700::1111 answered through the tunnel)`, `curl
+-6` from a LAN client got the server's own IPv6 exit address, and the IPv4 exit stayed as it was. That is the first
+measurement of the "yes" outcome against a real IPv6 exit, and of Cloudflare's address answering over IPv6 through a
+tunnel. sing-box could not be measured against the same server then: every connection of its VLESS outbound was
+turned away (26o). (A restart loop of hev-socks5-tunnel reported with it was, by the reporter's own account, state
+left from switching profiles back and forth: a clean restart cured it.)
+
 **Left as it is.** dae: its "tunnel" is a dummy interface without an IPv6 address, the core has never routed IPv6
 into it with any setting, and its LAN side catches the LAN's packets itself: not asked, IPv4 as before. OpenVPN and
 WireGuard: their config's own address decides, as before. A server that gains or loses IPv6 while the tunnel is up
@@ -396,3 +405,153 @@ reach nothing. And sing-box without an IPv6 address adds `ip -6 rule 9000: from 
 v2.0.1 as now: the device's own IPv6 fails at once, but a LAN client's waits 8 s for nothing and the router's own
 IPv6 address does not answer the LAN while that tunnel is up - the guard's "rejected at once" does not hold for
 forwarded IPv6 on sing-box.
+
+### 26o. v2.0.2's two defects: Xray without its geodata, and VLESS links sing-box wrote differently from Xray
+Reported in mu300-linux issue 202 against the v2.0.2 pre-release (mu300-linux v2026.10.22, OpenWrt 25.12.5, kernel
+7.2.10): "v2.0.2 ships without geosite.dat/geoip.dat, xray fails to start until they are downloaded by hand", and
+"sing-box: tunnel up, every connection EOF; same server, UUID and port, xray works". Everything below was measured
+on a Mac, in containers and from the release assets; no device was used.
+
+**Packaging.** The release tarballs, listed (`tar tzvf`, every asset of v1.0.0 to v2.0.2):
+
+| release | `vpn-xray` | the bundle (`mu300-linux-vpn.tar.gz`) | `vpn-mihomo` share | `vpn-dae` share |
+|---|---|---|---|---|
+| v1.0.0 | (no engine extras) | bin/xray, hev-socks5-tunnel, sing-box - no geodata | (none) | - |
+| v2.0.0 | bin/xray, bin/hev-socks5-tunnel - no geodata | as v1.0.0 | **none** | geoip.dat, geosite.dat |
+| v2.0.1 | the same files, the same bytes | the same | Country.mmdb, GeoSite.dat (26j) | the same |
+| v2.0.2 | the same files, the same bytes | the same | the same | the same |
+
+So nothing changed between v2.0.1 and v2.0.2 in `vpn-xray` or the bundle (the same xray, 34209918 bytes, and
+hev-socks5-tunnel, 395416; the tarballs differ only in their metadata): **no release ever carried Xray's
+`geoip.dat` and `geosite.dat`**. `tools/fetch-xray.sh` took only the binary out of Xray's release zip
+(`unzip xray.zip xray`), which has both files beside it. A VLESS/VMess/Trojan/Shadowsocks link profile never
+needed them (the config the driver writes names no `geoip:` or `geosite:`), but an Xray JSON profile from a panel
+nearly always does (`geoip:private`, `geosite:category-ads-all`), and Xray refuses to start such a config without
+the files. Xray looks for them beside its binary (and in `/usr/share/xray`, `/usr/local/share/xray`) unless
+`XRAY_LOCATION_ASSET` says where. Why it looked like "share/ is gone" in v2.0.2: `mu300-extra install` replaces an
+extra's whole directory, so whatever was put into it by hand (or by an earlier experiment) is gone after every
+install of the extra - the files never came from a release.
+
+Fixed in v2.0.3: `fetch-xray.sh` takes `geoip.dat` and `geosite.dat` from the same zip (the same pinned hash) into
+`share/xray`; `vpn-xray` and the bundle carry them; the xray driver sets `XRAY_LOCATION_ASSET` to the extra's
+`share/xray` when both files are there and nothing else set it (`xray_assets`, before `xray run -test` and before
+the run); a raw config Xray rejects while it names `geoip:`/`geosite:` and no geodata was found says so.
+`tools/make-module.sh` refuses to build when an engine's files are missing (Xray: geoip.dat, geosite.dat; mihomo:
+Country.mmdb, GeoSite.dat; dae: geoip.dat, geosite.dat). `tests/test_module.py` unpacks every extra and the bundle
+where `mu300-extra` puts them and asks each driver where it points its engine (`xray_assets`, `mihomo_share`,
+`dae_assets`): a tarball without the files fails it, as v2.0.0's `vpn-mihomo` and every `vpn-xray` so far would
+have. The two files are Loyalsoldier's v2ray-rules-dat (its categories `GREATFIRE`, `WIN-SPY`, `GFW` are in
+geosite.dat), 30 MB together, 7.8 MB compressed: `vpn-xray` grows from 12.4 to about 20 MB.
+
+**The VLESS matrix.** `tools/vless-matrix.sh` runs every VLESS variant a share link can name against a real Xray
+server: a fresh CA and certificate, a UUID, REALITY and VLESS Encryption keys (all made for the run and thrown
+away), an Xray 26.3.27 server whose inbound is the variant, and for each engine the client config the module's own
+code writes from the link - the sing-box driver's `drv_check` and `outbound_json`, the xray driver's `drv_check` and
+`gen_xray` - run by the pinned sing-box 1.14.1 and Xray 26.3.27 behind a SOCKS port, and a page fetched through it.
+Everything on loopback, no TUN, no root: in a linux/arm64 Alpine container on an Apple silicon Mac (the pinned
+engines are arm64), and in CI on an arm64 runner (`tests.yml`, job `vless-matrix`). `ok`: the page came back;
+`refused`: the link was refused at check with a message; `FAIL`: the engine ran and nothing came back (with the
+server's and the client's last words).
+
+| case (link) | sing-box v2.0.2 | sing-box v2.0.3 | xray v2.0.2 | xray v2.0.3 |
+|---|---|---|---|---|
+| none, tcp | ok | ok | ok | ok |
+| none, tcp, `headerType=http` | FAIL: "unknown version: 72" | refused | FAIL: "invalid method" | ok |
+| none, ws | ok | ok | ok | ok |
+| none, ws, `path=/ws?ed=2048` | **FAIL**: server "failed to validate path, request:/ws?ed=2048, config:/ws", client EOF | ok | ok | ok |
+| none, ws, the server's path with `?ed=2048` too | **FAIL**: the same | ok | ok | ok |
+| none, grpc; grpc `mode=multi` | ok | ok | ok | ok |
+| none, httpupgrade | ok | ok | ok | ok |
+| none, httpupgrade, `path=/hu?ed=2048` (either server path) | **FAIL**: server "bad path" | ok | FAIL: never dialled | ok |
+| none, xhttp | refused ("not supported by this helper") | refused (no XHTTP in sing-box) | ok | ok |
+| none, `type=splithttp` | refused | refused | refused | ok |
+| none, tcp, VLESS Encryption (`encryption=mlkem768x25519plus...`) | **FAIL**: server "ML-KEM-768 handshake" | refused | ok | ok |
+| tls, tcp; with `fp=chrome`; with `alpn=h2,http/1.1` | ok | ok | ok | ok |
+| tls, tcp, `fp=randomizednoalpn` | FAIL: "unknown uTLS fingerprint" | ok (chrome) | ok | ok |
+| tls, tcp, `allowInsecure=1`, another SNI | ok | ok | ok | ok |
+| tls, ws (`fp=chrome`) | ok | ok | ok | ok |
+| tls, ws, `alpn=h2,http/1.1` | **FAIL**: server "http2: error reading preface ... bogus greeting GET /ws", client EOF | ok | ok | ok |
+| tls, ws, `path=/ws?ed=2048` | **FAIL**: "failed to validate path" | ok | ok | ok |
+| tls, ws, `fp=randomizednoalpn` | FAIL: "unknown uTLS fingerprint" | ok | ok | ok |
+| tls, ws, `fp=randomized` | FAIL: "tls: internal error" (now and then) | ok (this run) | ok | ok |
+| tls, grpc; with `alpn=h2,http/1.1` | ok | ok | ok | ok |
+| tls, httpupgrade | ok | ok | ok | ok |
+| tls, xhttp | refused | refused | ok | ok |
+| tls, `type=h2` | refused | refused | refused | refused |
+| tls, tcp, vision; vision + `packetEncoding=xudp` | ok | ok | ok | ok |
+| tls, tcp, `flow=xtls-rprx-vision-udp443` | FAIL: "unsupported flow" | ok | ok | ok |
+| tls, tcp, VLESS Encryption | **FAIL**: "ML-KEM-768 handshake" | refused | ok | ok |
+| reality, tcp (`fp=chrome`; `fp=firefox`, no `sid`) | ok | ok | ok | ok |
+| reality, tcp, no `fp` | FAIL: "uTLS is required by reality client" | ok (chrome) | ok | ok |
+| reality, vision; vision + `spx=/`; grpc | ok | ok | ok | ok |
+| reality, xhttp | refused | refused | ok | ok |
+
+v2.0.2: 14 of the 39 cases not as they should be (the table's expectations are v2.0.3's); v2.0.3: none. The cases in
+bold are the report's symptom exactly: the tunnel comes up (sing-box starts, its config checks), every connection
+reaches the server, the server drops it, the client sees EOF, and the same link works on Xray. The most common links
+of that shape are a WebSocket path with `?ed=2048` (panels add it for early data), `alpn=h2,http/1.1` on a WebSocket
+link, and VLESS Encryption.
+
+What changed, all in `sb_vless` (lib/vpn/uri.sh), which the sing-box outbound is now written from:
+* `?ed=N` on a ws or httpupgrade path is early data, not part of the path: Xray takes it off on both ends.
+  sing-box gets the path without it, and for ws `max_early_data: N` with `early_data_header_name:
+  Sec-WebSocket-Protocol`, which is how Xray's client sends it (httpupgrade: no early data; Xray's server waits for
+  none). Only `ed=` with a number of at most 5 digits counts, anywhere in the query; the rest of the query stays.
+* `h2` is taken out of the ALPN of a ws or httpupgrade link (an HTTP/1.1 upgrade: a server that accepts h2 reads
+  the request as an HTTP/2 preface and closes), as `h3` always was for every link; gRPC keeps h2.
+* `fp=randomizednoalpn` (Xray's; sing-box does not know it) is chrome; a REALITY link without `fp` gets chrome, which
+  is Xray's default too; `flow=xtls-rprx-vision-udp443` is vision (sing-box's vision lets UDP/443 through anyway).
+* Refused, at import and check of a sing-box profile and before any config is written, with a message that never
+  repeats the link's id or keys: VLESS Encryption (sing-box 1.14 has none), XHTTP and `splithttp`, `headerType=http`
+  on TCP, HTTP/2 (`type=h2`/`http`, removed from Xray 25 as well: the xray driver refuses it too), a flow or uTLS
+  fingerprint sing-box does not know, a REALITY link without `pbk`, a transport sing-box has none of for Xray.
+* **Behind the kill switch**, where a VLESS link of an xray profile runs on sing-box when sing-box is installed: a
+  link sing-box cannot run stays on Xray (the log says why), behind the kill switch through the resolve window as
+  on a device with only `vpn-xray`; with only sing-box installed it is not started, the kill switch stays up, and the
+  message says `mu300-vpn engine install xray`. `mu300-vpn check` and adding or editing such a profile print a note
+  that says the same (the link is fine for Xray, so it is not refused there).
+* Xray, found on the way: `headerType=http` on TCP is now written (`rawSettings.header`, with the link's path and
+  Host lists; v2.0.2 dropped it and the server read the VLESS header as a broken HTTP request), `type=splithttp` is
+  XHTTP, and an httpupgrade path loses its `?ed=` (Xray 26's HTTPUpgrade client with early data waited for ever and
+  never dialled).
+
+`tests/test_vless_links.py` holds the table as unit tests: links and the exact sing-box outbound JSON each gives,
+the refused links and what the refusal says (and that it names no secret), Xray's streamSettings for the variants
+above, `vless_on_sing_box` behind the kill switch, and `xray_assets`.
+
+**Config escaping (found by a security review of this change).** The xray and sing-box drivers write their JSON
+with printf, and every value from a link went through `json_str` or `json_list` (uri.sh). Those two were incomplete:
+`json_list` (ALPN, and the new TCP header's path and Host lists) did not escape a backslash, and `json_str` left
+control characters as they were. So a crafted link could end a string early and change the structure of the
+generated config, not just one value in it. Host and port were already checked (`link_hostport`), and dae writes
+links only after an allowlist of URL characters (`dae_link`), so dae and mihomo are not affected. The fix:
+* `json_str` and `json_list` are now written by jq (`--arg`), which escapes everything JSON needs.
+* `parse_link` checks every field before anything is written (`link_fields_ok`). It refuses a control character in
+  any field, and refuses a value outside its protocol's form in: security (none, tls or reality), transport, flow,
+  fp, pbk (base64), sid (up to 16 hex digits), XHTTP mode, allowInsecure, cipher, and ALPN (h3, h2, http/1.1). The
+  message names the field, never its value.
+* Before an engine reads a config the module generated, the config must be one JSON object (`config_json_ok`).
+
+`tests/test_vless_links.py` (`HostileLinks`) puts values with quotes, backslashes, braces, commas and control
+characters into each of the 21 fields a VLESS link names, URL-encoded and as they stand. It generates the whole
+config, Xray's and sing-box's. The test passes only if each such link is refused, or its config is valid JSON with
+exactly the key structure of the same link with a harmless value. A side note: `urldecode` already dropped a `%0A`
+(command substitution strips it), but a tab or another control character went through.
+
+**A tunnel that is up and carries nothing** said nothing in the log: sing-box logged at `warn`, and a server that
+drops the client is a connection that ends. Now a tunnel that comes up gets a watch beside it (`exit_watch`, every
+engine): the exit check `status` runs (`api.ipify.org`, an address and nothing else, so a captive portal's page does
+not count) is asked every 20 s until it answers - one fetch for a working tunnel - and after three in a row that got
+nothing the log gets one line:
+
+    sing-box: the tunnel is up, but nothing gets through it (3 checks in a row, exit IP unreachable). Most likely the server turns this client away: a link parameter it reads differently (transport, path, ALPN, flow, VLESS Encryption, fingerprint: mu300-vpn check), a wrong or expired id or password, the server's clock, or a server that is down or blocked on this uplink; or REMOTE_DNS (1.1.1.1) does not answer through it. The engine's own words: mu300-vpn logs sing-box -n 50
+
+then it asks once a minute and says so when something gets through; it ends with the engine.
+
+**Not measured.** All of the above is container-only: no device, no TUN, no real server. The matrix runs the
+outbound sing-box would use, not the whole config `gen_singbox` writes (TUN, DNS, routes are as v2.0.2 had them,
+and the reporter's tunnel came up); one Xray server version (26.3.27) and only Xray as the server (a sing-box or
+3x-ui server reads links its own way); `fp=randomized` failed now and then on sing-box with Xray's TLS server and
+has no expectation in the table. Which variant the reporter's link has is not known (no secrets were asked for):
+the bold rows are the candidates, and v2.0.3 either runs it or says why it does not. The exit watch's line was
+seen only in the unit tests.

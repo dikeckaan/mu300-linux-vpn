@@ -627,6 +627,25 @@ class KillSwitch(ShellTest):
             self.assertClosed(r.stderr)
             self.assertNotIn('engine sing-box run', self.events())
 
+    def test_a_link_sing_box_cannot_run_stays_on_xray(self):
+        """#202: a VLESS link sing-box cannot run (here XHTTP; VLESS Encryption, a TCP HTTP header...) is not moved
+        to sing-box behind the kill switch, where it would come up and carry nothing: it runs on xray (resolve
+        window), and where only sing-box is installed it is not started and the kill switch stays up"""
+        for shell in self.each_shell():
+            conf = self.conf_ks('xray').replace("type=tcp'", "type=xhttp&path=%2Fx'")
+            self.fresh(self.ENGINES)
+            r = self.run_vpn(shell, conf)
+            self.assertIn('sing-box cannot run this link: sing-box has no XHTTP transport', r.stderr)
+            self.assertIn('running it on xray', r.stderr)
+            self.assertClosed(r.stderr)
+            self.assertNotIn('engine sing-box run', self.events())
+            self.fresh(('sing-box',))
+            r = self.run_vpn(shell, conf)
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn('xray is not installed: not started (the kill switch stays up)', r.stderr)
+            self.assertClosed(r.stderr)
+            self.assertNotIn('engine sing-box run', self.events())
+
     def test_a_kill_switch_value_not_understood_is_on(self):
         for shell in self.each_shell():
             for v in ('yes', 'true', '', '2'):

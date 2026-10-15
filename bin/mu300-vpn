@@ -1189,6 +1189,19 @@ vless_on_sing_box() {
     case ${PURI:-} in vless://*) ;; *) return 0 ;; esac
     # (sing-box is chosen only where it is installed: vpn-xray alone runs the link on xray, below)
     if [ "$ENGINE" = sing-box ] && [ -x "$BIN" ]; then
+        # A link sing-box cannot run (sb_vless: VLESS Encryption, XHTTP, an HTTP header on TCP...) stays on xray
+        # when it is there - behind the kill switch through the resolve window, as below - and is not started at
+        # all without it: on sing-box it would come up and carry nothing (docs/FINDINGS.md 26o).
+        if ! _sbw=$( (parse_link "$PURI" && sb_vless) 2>&1 >/dev/null ); then
+            if [ -x "$XRAY" ] && [ -x "$HEV" ]; then
+                echo "${_sbw:-sing-box cannot run this link}: running it on xray" >&2
+                return 0
+            fi
+            _ks=; [ "$KILL_SWITCH" != 1 ] || _ks=' (the kill switch stays up)'
+            echo "${_sbw:-sing-box cannot run this link}, and xray is not installed: not started$_ks." \
+                "Install it: mu300-vpn engine install xray" >&2
+            return 1
+        fi
         if [ "$KILL_SWITCH" = 1 ]; then
             # Xray pins the certificate of a link that asks for allowInsecure; sing-box would not check it at all
             case "$PURI" in *[?\&]allowInsecure=1*|*[?\&]allowInsecure=true*)
@@ -1215,6 +1228,18 @@ vless_on_sing_box() {
     fi
 }
 
+# vless_sb_note: an xray profile with a VLESS link that sing-box cannot run (sb_vless) says so where it is added or
+# checked, with what that means: it runs on xray only - behind the kill switch too, where VLESS links otherwise go
+# to sing-box (vless_on_sing_box) - and where xray is not installed it is not started. The link itself is fine.
+vless_sb_note() {
+    [ "$PTYPE" = xray ] || return 0
+    case ${PURI:-} in vless://*) ;; *) return 0 ;; esac
+    _sbw=$( (parse_link "$PURI" && sb_vless) 2>&1 >/dev/null ) && return 0
+    echo "note: ${_sbw:-sing-box cannot run this link}. It runs on xray only, behind the kill switch too (where" \
+        "VLESS otherwise runs on sing-box); without xray installed it is not started (mu300-vpn engine install xray)" >&2
+    return 0
+}
+
 gen() {
     if [ -n "$PTYPE" ]; then load_driver "$PTYPE" || exit 1; fi
     drv_engines_ok || { engines_missing; exit 1; }
@@ -1223,12 +1248,60 @@ gen() {
     drv_gen
 }
 
+# ---- a tunnel that is up and carries nothing --------------------------------------------------------------------
+# exit_ip: the address the internet sees this device at, through whatever routes it now (status's exit IP); nothing
+# and 1 when nothing answered. (MU300_EXIT_PROBE: tests/, a command that answers in its place)
+exit_ip() {
+    if [ -n "${MU300_EXIT_PROBE:-}" ]; then _ei=$("$MU300_EXIT_PROBE" 2>/dev/null)
+    else _ei=$(wget -qO- -T 8 http://api.ipify.org 2>/dev/null || curl -s -m 8 http://api.ipify.org 2>/dev/null); fi
+    # (an address, and nothing else: a captive portal's page is not an exit)
+    case $_ei in ''|*[!0-9A-Fa-f.:]*) return 1 ;; esac
+    printf '%s\n' "$_ei"
+}
+# exit_watch ENGINE PID, in the background beside a tunnel that has just come up: a tunnel can come up and then carry
+# nothing - the server turns every connection away (a link parameter it reads differently, #202), DNS through it
+# fails - and every other sign says it is healthy. So the exit check status runs is asked every EXIT_EVERY seconds
+# until it answers - one fetch, for a tunnel that works, and no more - and after EXIT_CHECKS that did not, the log
+# gets one line that says so, names the engine and what most likely causes it. After that it asks every minute and
+# says so once something gets through. It ends with the engine (PID). (MU300_EXIT_WATCH=0, MU300_EXIT_EVERY: tests/)
+EXIT_CHECKS=3
+EXIT_EVERY=${MU300_EXIT_EVERY:-20}
+exit_watch() {
+    _ew_n=0; _ew_said=
+    while sleep "$EXIT_EVERY"; kill -0 "$2" 2>/dev/null; do
+        if [ -n "$(exit_ip 2>/dev/null)" ]; then
+            [ -z "$_ew_said" ] || echo "$1: connections get through the tunnel again" >&2
+            return 0
+        fi
+        _ew_n=$((_ew_n + 1))
+        if [ "$_ew_n" = "$EXIT_CHECKS" ]; then
+            echo "$1: the tunnel is up, but nothing gets through it ($EXIT_CHECKS checks in a row, exit IP" \
+                "unreachable). Most likely the server turns this client away: a link parameter it reads differently" \
+                "(transport, path, ALPN, flow, VLESS Encryption, fingerprint: mu300-vpn check), a wrong or expired id" \
+                "or password, the server's clock, or a server that is down or blocked on this uplink; or REMOTE_DNS" \
+                "($REMOTE_DNS) does not answer through it. The engine's own words: mu300-vpn logs $1 -n 50" >&2
+            _ew_said=1
+        fi
+        # (after the warning, once a minute)
+        [ -z "$_ew_said" ] || sleep $((EXIT_EVERY * 2))
+    done
+    return 0
+}
+# exit_watch_start ENGINE PID: exit_watch in the background (EW_PID), unless the tests turned it off
+exit_watch_start() {
+    EW_PID=
+    [ "${MU300_EXIT_WATCH:-1}" != 0 ] || return 0
+    ( trap - EXIT INT TERM HUP; exit_watch "$1" "$2" ) &
+    EW_PID=$!
+}
+
 # The service's tunnel for a driver that is not exec'd: started, routed, and watched until either end goes. Every
 # way out - a signal, an engine that exits, a failed start - goes through tunnel_down, which stops the engines and
 # takes the routing with them; the kill switch stays.
 run_tunnel() {
     tunnel_down() {
         trap - EXIT INT TERM HUP
+        [ -z "${EW_PID:-}" ] || kill "$EW_PID" 2>/dev/null || true
         drv_stop
         if [ "$DRV_ROUTES" = core ]; then routes_down; else tailscale_down; fi
         rm -f "$RUN/iface" "$RUN/since" "$RUN/ipv6"
@@ -1246,6 +1319,7 @@ run_tunnel() {
         else ip -6 addr flush dev "$TUN" scope global 2>/dev/null || true; fi
     else v6_record; fi
     ipv6_guard
+    exit_watch_start "$(type_engine "${DRIVER:-$PTYPE}")" $$
     while drv_alive; do
         sleep 2
         drv_poll || exit 1
@@ -1705,7 +1779,7 @@ profile_import() {
     _id=$(profile_new "$_type" "$_name") || return 1
     valid_id "$_id" || return 1
     # (subshells: a driver's parser may exit)
-    if ( PDIR=$PROFILES/$_id; drv_import "$_src" ) && ( profile_load "$_id"; ACTIVE=$_id; drv_check ) >&2; then
+    if ( PDIR=$PROFILES/$_id; drv_import "$_src" ) && ( profile_load "$_id"; ACTIVE=$_id; drv_check && vless_sb_note ) >&2; then
         echo "$_id"; return 0
     fi
     rm -rf "${PROFILES:?}/${_id:?}"
@@ -1721,7 +1795,7 @@ profile_edit() {
     _tmp=${PROFILES:?}/.edit.$$
     rm -rf "${_tmp:?}"
     ( umask 077; mkdir "$_tmp" ) && cp -p "$PROFILES/$1/meta" "$_tmp/meta" || { rm -rf "${_tmp:?}"; return 1; }
-    if ! { ( PDIR=$_tmp; drv_import "$2" ) && ( profile_load "$1" "$_tmp"; ACTIVE=$1; drv_check ) >&2; }; then
+    if ! { ( PDIR=$_tmp; drv_import "$2" ) && ( profile_load "$1" "$_tmp"; ACTIVE=$1; drv_check && vless_sb_note ) >&2; }; then
         rm -rf "${_tmp:?}"; echo "profile $1 not changed" >&2; return 1
     fi
     _new=
@@ -1963,7 +2037,7 @@ vpn_status() {
         if [ -n "$V6S_ON" ]; then echo "IPv6: through the tunnel ($V6S_BY: $V6S_WHY)"
         else echo "IPv6: not through the tunnel ($V6S_BY: $V6S_WHY)"; fi
         drv_status 2>/dev/null || true
-        printf 'exit IP: '; (wget -qO- -T 8 http://api.ipify.org 2>/dev/null || curl -s -m 8 http://api.ipify.org 2>/dev/null || echo unreachable); echo
+        echo "exit IP: $(exit_ip || echo unreachable)"
     else
         echo "tunnel: down"
     fi
@@ -2621,6 +2695,7 @@ case "${1:-status}" in
         [ -n "$PTYPE" ] || { echo "no active profile: mu300-vpn profile use ID" >&2; exit 1; }
         load_driver "$PTYPE" || exit 1
         drv_check || exit 1
+        vless_sb_note
         echo "profile ${_id:-$PTYPE}: OK" ;;
     run)
         [ "$ENABLE" = 1 ] || { echo "VPN disabled (ENABLE=0 in $CONF)"; killswitch_off; ipv6_guard_off; tailscale_down; exit 0; }
@@ -2680,6 +2755,8 @@ case "${1:-status}" in
         v6_asks || v6_record
         ipv6_guard
         echo "$TUN" > "$RUN/iface"; date +%s > "$RUN/since"
+        # (the engine is exec'd in this process: the watch ends when it does)
+        exit_watch_start "$(type_engine "${DRIVER:-$PTYPE}")" $$
         drv_start ;;
     # guard: before the modem's bearer comes up (mobile-data calls it), so a VPN with the kill switch is never
     # without it at boot, before the service has started
