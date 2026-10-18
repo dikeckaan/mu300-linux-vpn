@@ -6,6 +6,8 @@ import os
 import re
 import shutil
 import stat
+import subprocess
+import time
 import unittest
 
 from helpers import BIN, LIB, SYSBIN, ShellTest
@@ -490,6 +492,68 @@ class Contract(ShellTest):
             self.assertEqual((self.tmp / 'iface-up').read_text().strip(), 'xtun')
             self.assertEqual([l for l in self.rules.read_text().splitlines() if l.split()[1] >= '9000'], [])
             self.assertFalse((self.tmp / 'run/iface').exists())
+
+    def test_xray_clears_what_a_killed_run_left(self):
+        # mu300-linux #313: a stale xtun (held by an engine of a run that was killed, or persistent) made every
+        # hev-socks5-tunnel exit at once with 254, and the service restarted for ever. The engines such a run left
+        # are stopped and the TUN removed before hev starts, and the TUN goes again on the way out.
+        self.stub('ip', self.IP.replace('  "link show")',
+                                        '  "link delete") echo "link delete $3" >> "$STUBLOG/ip.log"; rm -f "$STUBLOG/tun" ;;\n'
+                                        '  "link show")'))
+        self.stub('nft', '[ "$1" = -f ] && cat > /dev/null; exit 0')
+        self.stub('ss', 'echo "LISTEN 0 4096 127.0.0.1:10808 0.0.0.0:*"')
+        self.stub('getent', '[ "$2" = vpn.example.com ] && echo "203.0.113.9     STREAM vpn.example.com"; exit 0')
+        # the leftover engine: a process pgrep finds by the hev command line of this run's directory
+        self.stub('pgrep', 'echo "$*" >> "$STUBLOG/pgrep.args"; [ -s "$STUBLOG/orphan" ] && cat "$STUBLOG/orphan"')
+        d = self.tmp / 'disk/extra/vpn/bin'
+        d.mkdir(parents=True)
+        (d / 'xray').write_text('#!/bin/sh\n[ "$2" = -test ] && exit 0\n'
+                                'n=0; until [ -e "$MU300_VPN_RUN/iface" ] || [ $n -gt 100 ]; do sleep 0.1; n=$((n+1)); done\n'
+                                'echo "[Warning] gone"\n')
+        # hev as it behaves (FINDINGS 26p): gone at once, 254, when its TUN is there already; else it makes it
+        (d / 'hev-socks5-tunnel').write_text('#!/bin/sh\n[ -e "$STUBLOG/tun" ] && exit 254\n'
+                                             ': > "$STUBLOG/tun"; : > "$STUBLOG/hev-ran"; exec sleep 30\n')
+        for n in ('xray', 'hev-socks5-tunnel'):
+            (d / n).chmod(0o755)
+        uri = 'vless://11111111-2222-3333-4444-555555555555@vpn.example.com:443?security=tls&type=tcp'
+        for shell in self.each_shell():
+            for p in ('ip.log', 'hev-ran', 'pgrep.args'):
+                (self.tmp / p).unlink(missing_ok=True)
+            (self.tmp / 'tun').write_text('')
+            # (an orphan, as it is on the device: init reaps it, so it is gone once killed, not a zombie of ours)
+            pid = int(subprocess.run(['sh', '-c', 'sleep 60 >/dev/null 2>&1 & echo $!'], capture_output=True,
+                                     text=True, check=True).stdout)
+            (self.tmp / 'orphan').write_text(f'{pid}\n')
+            self.conf.write_text(f"ENABLE=1\nENGINE=xray\nKILL_SWITCH=0\nVLESS_URI='{uri}'\n")
+            try:
+                r = self.script(shell, BIN / 'mu300-vpn', 'run', MU300_VPN_CONF=self.conf,
+                                MU300_VPN_RUN=self.tmp / 'run', MU300_VPN_LIB=LIB, MU300_LAN_CONF=self.tmp / 'no',
+                                MU300_BIN=SYSBIN, MU300_OPT=self.tmp / 'opt', MU300_DISK=self.tmp / 'disk')
+                for _ in range(50):
+                    try:
+                        os.kill(pid, 0)
+                    except ProcessLookupError:
+                        break
+                    time.sleep(0.1)
+                else:
+                    self.fail('the leftover engine is still running')
+            finally:
+                try:
+                    os.kill(pid, 9)
+                except ProcessLookupError:
+                    pass
+            self.assertIn(f'stopping an engine a previous run left running (pid {pid})', r.stderr)
+            self.assertIn('removed a stale xtun interface', r.stderr)
+            self.assertTrue((self.tmp / 'hev-ran').exists(), r.stderr)
+            self.assertIn('tunnel up on xtun', r.stdout)
+            self.assertIn('xray exited, tearing the tunnel down', r.stderr)
+            # once before the start, once on the way out (the stub's TUN, like a persistent one, outlives hev)
+            self.assertEqual((self.tmp / 'ip.log').read_text().splitlines(), ['link delete xtun'] * 2)
+            self.assertFalse((self.tmp / 'tun').exists())
+            run = str(self.tmp / 'run')
+            self.assertIn(f'-f ^[^ ]+ ({run}/hev\\.yml|run -c {run}/xray\\.json)$',
+                          (self.tmp / 'pgrep.args').read_text())
+            self.assertEqual([l for l in self.rules.read_text().splitlines() if l.split()[1] >= '9000'], [])
 
 
 VMESS = {"v": "2", "ps": "n", "add": "vm.example", "port": "8443", "id": "11111111-2222-3333-4444-555555555555",
