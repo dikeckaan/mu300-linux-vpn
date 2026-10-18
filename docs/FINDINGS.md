@@ -555,3 +555,35 @@ and the reporter's tunnel came up); one Xray server version (26.3.27) and only X
 has no expectation in the table. Which variant the reporter's link has is not known (no secrets were asked for):
 the bold rows are the candidates, and v2.0.3 either runs it or says why it does not. The exit watch's line was
 seen only in the unit tests.
+
+### 26p. hev-socks5-tunnel and a TUN that is already there: a restart every few seconds for ever
+Reported in mu300-linux issue 313 (mu300-linux v2026.10.17.4 after an OTA, module v2.0.3, an Xray profile):
+`hev-socks5-tunnel exited, tearing the tunnel down` after every `tunnel up on xtun`, a new start every 6-7 s, the exit
+IP unreachable; `ip link delete xtun` ended it. Measured on a U30 Air (OpenWrt 25.12.5, kernel 6.18), hev 2.17.1 on
+its own with a test interface name:
+
+| what is there under the TUN's name when hev starts | hev |
+|---|---|
+| nothing | runs, and the TUN goes with it |
+| a persistent plain TUN (`ip tuntap add mode tun`) | runs on it; the TUN stays afterwards |
+| a persistent multi-queue TUN | exits at once, 254, not a word |
+| a dummy interface | exits at once, 254 |
+| a TUN another hev holds | exits at once, 254 (the kernel's EBUSY) |
+
+The last row is what a run that is killed leaves: `kill -9` of the service's `mu300-vpn run` (as a service manager's
+KILL after its stop timeout would) leaves its Xray and hev running, hev holding xtun and Xray the SOCKS port. With
+v2.0.3, on the device, every start after that logged exactly the issue's lines: `until ip link show xtun` passed at
+once on the old xtun, "tunnel up", then the new hev's 254, five seconds' respawn, again, for as long as the orphans
+lived.
+
+Now the xray driver clears it before a start (`xray_leftovers`): an Xray or hev still running this run directory's
+config is stopped (TERM, KILL after 5 s), and an xtun that is still there is deleted; `drv_stop` deletes an xtun
+that outlived hev. On the same U30 with the fix, the loop above recovered at its next start ("stopping an engine a
+previous run left running", tunnel up, running); a persistent multi-queue xtun was removed ("removed a stale xtun
+interface") and the tunnel came up; a service stop left no xtun. Throughout - the loop, the kill -9, the cleanup,
+the restarts, with the device pinging and fetching outside meanwhile - the kill switch's table stayed in place and
+a postrouting counter for unmarked packets on `sipa_eth*` (NTP and neighbour discovery apart) stayed at 0 for the
+Xray profile, whose server was an address. (The only unmarked packets seen in any restart were sing-box's
+`BOOTSTRAP_DNS` lookups of its server's name on port 53, the resolve window as designed, 26i.)
+
+**Not known:** what killed the reporter's run after the OTA; the fix does not depend on it.

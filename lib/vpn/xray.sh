@@ -503,14 +503,50 @@ drv_import() {
 }
 drv_set() { link_opt_set "$1" "$2"; }
 
+# xray_leftovers: what a run that did not end cleanly leaves behind goes before a start - an Xray or
+# hev-socks5-tunnel still running this driver's config (their parent was killed before it could stop them, e.g. by
+# the service manager's KILL after its stop timeout) and the TUN. hev-socks5-tunnel exits at once, with 254 and not
+# a word, when $TUN exists and is held by another process or is not a plain TUN, and an Xray left running keeps the
+# SOCKS port, so the new one cannot listen there and the old one answers in its place: every start after it ended
+# the same way, a restart every few seconds for ever (mu300-linux #313). Behind the kill switch, which is up before
+# any of this and never comes down for it; no route leads into the tunnel at this point (routes_down, run).
+xray_leftovers() {
+    # (by the command lines drv_start gives them, whatever binary XRAY and HEV name)
+    _xl=$(pgrep -f "^[^ ]+ ($RUN/hev\.yml|run -c $RUN/xray\.json)\$" 2>/dev/null) || _xl=
+    if [ -n "$_xl" ]; then
+        echo "stopping an engine a previous run left running (pid $(echo $_xl))" >&2
+        # shellcheck disable=SC2086
+        kill $_xl 2>/dev/null || true
+        n=0
+        while [ "$n" -lt 5 ]; do
+            _xa=; for _p in $_xl; do kill -0 "$_p" 2>/dev/null && _xa="$_xa $_p"; done
+            [ -n "$_xa" ] || break
+            sleep 1; n=$((n + 1))
+        done
+        # shellcheck disable=SC2086
+        [ -z "$_xa" ] || kill -9 $_xa 2>/dev/null || true
+    fi
+    xray_tun_del && return 0
+    echo "a stale $TUN is in the way and cannot be removed (ip link delete $TUN)" >&2
+    return 1
+}
+# xray_tun_del: $TUN gone, if it is still there (a TUN hev made goes with it; one made persistent, or held by a
+# process of an earlier run, does not); 1 when it cannot be removed
+xray_tun_del() {
+    ip link show "$TUN" >/dev/null 2>&1 || return 0
+    ip link delete "$TUN" 2>/dev/null || return 1
+    echo "removed a stale $TUN interface" >&2
+}
+
 # Two processes and the routing between them, torn down together: if either dies the service exits, the routes
 # go with it and procd starts the whole thing again. Leaving rules behind with nothing at the other end is what
 # made sing-box's crashes look like a dead modem (routing_cleanup), so every way out of the core's run goes through
 # drv_stop and routes_down.
 drv_start() {
+    # (every step that can fail returns 1 itself: the core runs this without set -e, see load_driver)
+    xray_leftovers || return 1
     # Xray's output goes through a reader that passes it on and notes a pin mismatch, so a renewed server
     # certificate is noticed without polling the server
-    # (every step that can fail returns 1 itself: the core runs this without set -e, see load_driver)
     rm -f "$RUN/pin-mismatch" "$RUN/xray.out"
     mkfifo "$RUN/xray.out" || { echo "cannot create $RUN/xray.out" >&2; return 1; }
     while IFS= read -r l; do
@@ -548,6 +584,8 @@ drv_stop() {
     if [ -n "$XPID" ]; then kill "$XPID" 2>/dev/null || true; fi
     wait 2>/dev/null || true
     XPID=; HPID=; DRV_PIDS=
+    # and the TUN, so that the next start finds none (#313); routes_down comes after, the kill switch stays
+    xray_tun_del 2>/dev/null || true
     return 0
 }
 # every 2 s while it runs: a pin mismatch Xray reported means a renewed certificate - pinned again and restarted
